@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Hotfix / patch epochs (brief sections 10, 31).
+#
+# This project does NOT claim to know Blizzard's hotfix history. It retains
+# absolute run dates so the analyst can slice by mechanic version, and this
+# file lets a known change be labelled once it is identified.
+#
+# Every run is stamped with the epoch whose [start, end) window contains its
+# absolute start time. Runs before the first epoch get epoch "unclassified".
+# Analyses must never silently pool runs from different epochs.
+# ---------------------------------------------------------------------------
+
+# Times are UTC ISO-8601. `end: null` means "still current".
+epochs:
+  - name: unclassified
+    start: null
+    end: null
+    note: >-
+      Default bucket. Any run that does not fall inside an explicitly defined
+      epoch below lands here and is flagged in validation output. Add real
+      epochs as they become known.
+
+# Example of a real epoch, kept commented so it is never mistaken for fact:
+#
+#  - name: midnight-s2-start
+#    start: "2026-01-01T00:00:00Z"
+#    end: null
+#    affected_dungeons: []
+#    affected_abilities: []
+#    note: "Season 2 Mythic+ opening. DATE IS A PLACEHOLDER — verify before use."

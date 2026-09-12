@@ -1,0 +1,16 @@
+# Zone and encounter registry, used to fill in config/dungeons.yml from the
+# live API instead of hardcoding IDs (brief sections 33 and 54).
+query WorldZones($expansionID: Int) {
+  worldData {
+    expansions { id name }
+    zones(expansion_id: $expansionID) {
+      id
+      name
+      frozen
+      expansion { id name }
+      encounters { id name }
+      difficulties { id name sizes }
+      partitions { id name compactName default }
+    }
+  }
+}

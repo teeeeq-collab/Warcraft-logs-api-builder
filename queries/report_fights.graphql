@@ -1,0 +1,14 @@
+# Fights (Mythic+ runs are fights with keystone metadata).
+# __FIGHT_FIELDS__ is substituted with introspection-verified fields.
+query ReportFights($code: String!) {
+  reportData {
+    report(code: $code) {
+      code
+      startTime
+      endTime
+      fights {
+        __FIGHT_FIELDS__
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+# Report discovery via a known character (brief section 7).
+#
+# UNVERIFIED shape: `wclmplus recon --discovery` checks whether this field and
+# its arguments exist before any collection depends on it.
+query CharacterReports($name: String!, $server: String!, $region: String!, $limit: Int, $page: Int) {
+  characterData {
+    character(name: $name, serverSlug: $server, serverRegion: $region) {
+      id
+      name
+      recentReports(limit: $limit, page: $page) {
+        total
+        per_page
+        current_page
+        has_more_pages
+        data {
+          code
+          startTime
+          endTime
+          zone { id name }
+        }
+      }
+    }
+  }
+}

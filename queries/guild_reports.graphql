@@ -1,0 +1,19 @@
+# Report discovery via a known guild or team (brief section 7).
+# UNVERIFIED shape: confirmed by `wclmplus recon --discovery`.
+query GuildReports($guildID: Int, $limit: Int, $page: Int) {
+  reportData {
+    reports(guildID: $guildID, limit: $limit, page: $page) {
+      total
+      per_page
+      current_page
+      has_more_pages
+      data {
+        code
+        startTime
+        endTime
+        zone { id name }
+        owner { name }
+      }
+    }
+  }
+}

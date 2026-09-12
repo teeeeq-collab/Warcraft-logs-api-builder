@@ -1,0 +1,30 @@
+# Actor and ability dictionaries for a report.
+# Needed to resolve event `sourceID` / `targetID` / `abilityGameID` into
+# named NPCs, players, pets and abilities.
+query ReportMasterData($code: String!) {
+  reportData {
+    report(code: $code) {
+      code
+      masterData(translate: true) {
+        logVersion
+        gameVersion
+        lang
+        actors {
+          id
+          gameID
+          name
+          type
+          subType
+          icon
+          petOwner
+        }
+        abilities {
+          gameID
+          name
+          icon
+          type
+        }
+      }
+    }
+  }
+}

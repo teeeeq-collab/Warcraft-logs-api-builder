@@ -1,0 +1,36 @@
+# One page of events.
+#
+# The `data` field is JSON, so event shape is preserved verbatim rather than
+# forced into a fixed selection set -- exactly what a research dataset needs
+# (brief section 13: do not force every event into a lossy schema).
+#
+# `nextPageTimestamp` is the pagination cursor. Whether it is inclusive is
+# determined empirically by `wclmplus recon`; see src/wcl_mplus/paginate.py,
+# which is correct either way.
+query ReportEvents(
+  $code: String!
+  $startTime: Float!
+  $endTime: Float!
+  $dataType: EventDataType
+  $hostilityType: HostilityType
+  $limit: Int
+  $fightIDs: [Int]
+) {
+  reportData {
+    report(code: $code) {
+      events(
+        startTime: $startTime
+        endTime: $endTime
+        dataType: $dataType
+        hostilityType: $hostilityType
+        limit: $limit
+        fightIDs: $fightIDs
+        includeResources: true
+        translate: true
+      ) {
+        data
+        nextPageTimestamp
+      }
+    }
+  }
+}

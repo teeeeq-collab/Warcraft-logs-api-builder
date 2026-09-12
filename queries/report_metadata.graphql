@@ -1,0 +1,13 @@
+# Report-level metadata.
+#
+# __REPORT_FIELDS__ is substituted at runtime with the subset of desired
+# scalar fields that introspection confirmed exists on the Report type.
+# See src/wcl_mplus/querybuild.py -- a query is never sent naming a field
+# the live schema does not have.
+query ReportMetadata($code: String!) {
+  reportData {
+    report(code: $code) {
+      __REPORT_FIELDS__
+    }
+  }
+}

@@ -1,0 +1,24 @@
+# Dungeon pulls for one fight, with enemy NPC participation.
+#
+# WCL's own pull boundaries are authoritative for this project (brief
+# section 18); we do not invent a combat-gap detector.
+#
+# __PULL_FIELDS__ and __PULL_NPC_FIELDS__ are substituted with
+# introspection-verified fields. NPC instance identity fields matter most:
+# without them two copies of the same NPC species collapse into one timeline.
+query ReportDungeonPulls($code: String!, $fightIDs: [Int]) {
+  reportData {
+    report(code: $code) {
+      code
+      fights(fightIDs: $fightIDs) {
+        id
+        dungeonPulls {
+          __PULL_FIELDS__
+          enemyNPCs {
+            __PULL_NPC_FIELDS__
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# Hourly point budget. Field names here are verified by `wclmplus recon`;
+# see API_NOTES.md for the observed result.
+query RateLimit {
+  rateLimitData {
+    limitPerHour
+    pointsSpentThisHour
+    pointsResetIn
+  }
+}

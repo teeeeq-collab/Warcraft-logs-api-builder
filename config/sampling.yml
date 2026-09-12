@@ -1,0 +1,118 @@
+# ---------------------------------------------------------------------------
+# Sampling profiles — how runs are chosen, and which events are downloaded.
+# Editable without touching Python (brief sections 15, 44).
+# ---------------------------------------------------------------------------
+
+# Key-level strata. NOT hardcoded in source; change freely.
+key_brackets:
+  - { key: "7-8",   min: 7,  max: 8 }
+  - { key: "10",    min: 10, max: 10 }
+  - { key: "11-12", min: 11, max: 12 }
+  - { key: "13-14", min: 13, max: 14 }
+  - { key: "15+",   min: 15, max: null }
+
+# ---------------------------------------------------------------------------
+# Event collection profiles.
+#
+# `event_types` values are NOT yet validated against the live EventDataType
+# enum. `wclmplus recon` records the real enum, and `wclmplus config-check`
+# fails if a profile names a type the live schema does not accept.
+# ---------------------------------------------------------------------------
+event_profiles:
+  metadata:
+    description: "No events at all. Report, fight, pulls, pull NPCs, roster, master data."
+    event_types: []
+
+  mechanics:
+    description: "Default research profile: what a tank/healer experiences."
+    event_types:
+      - Casts
+      - Debuffs
+      - Buffs
+      - Interrupts
+      - Dispels
+      - Deaths
+      - Summons
+      - DamageTaken
+    include_combatant_info: true
+    # DamageTaken is player-side incoming damage; this is the tank/party danger signal.
+
+  full:
+    description: "Adds healing and full damage. Larger; justify before large samples."
+    event_types:
+      - Casts
+      - Debuffs
+      - Buffs
+      - Interrupts
+      - Dispels
+      - Deaths
+      - Summons
+      - DamageTaken
+      - DamageDone
+      - Healing
+      - Resources
+    include_combatant_info: true
+
+  raw-all:
+    description: "Every event. Validation samples only until cost is measured."
+    event_types: [All]
+    include_combatant_info: true
+
+# ---------------------------------------------------------------------------
+# Sample profiles.
+# ---------------------------------------------------------------------------
+sample_profiles:
+  pilot:
+    description: "Phase 1. 5-10 runs, one dungeon, trust-building."
+    event_profile: mechanics
+    runs_per_bracket: 2
+    max_runs_total: 10
+    brackets: ["7-8", "10", "13-14"]
+    require_timed: false          # untimed runs are research-relevant, not noise
+    deduplicate: true
+    restrict_to_current_hotfix_epoch: false
+
+  research:
+    description: "Phase 2. 50-100+ runs across brackets."
+    event_profile: mechanics
+    runs_per_bracket: 20
+    max_runs_total: 120
+    brackets: ["7-8", "10", "11-12", "13-14", "15+"]
+    require_timed: false
+    deduplicate: true
+    restrict_to_current_hotfix_epoch: true
+
+  validation:
+    description: "Tiny raw-all sample used to prove event semantics."
+    event_profile: raw-all
+    runs_per_bracket: 1
+    max_runs_total: 2
+    brackets: ["10"]
+    require_timed: false
+    deduplicate: false
+    restrict_to_current_hotfix_epoch: false
+
+# ---------------------------------------------------------------------------
+# Politeness. Conservative by default; raise only after measuring real cost.
+# ---------------------------------------------------------------------------
+api:
+  concurrency: 2
+  min_points_reserve: 200        # stop scheduling when hourly points left < this
+  max_retries: 5
+  timeout_seconds: 60
+  events_page_limit: 10000       # UNVERIFIED ceiling; recon probes the real max
+
+# ---------------------------------------------------------------------------
+# Known bias sources to record alongside every sample (brief section 8).
+# These are recorded, not corrected — the analyst reweights later.
+# ---------------------------------------------------------------------------
+tracked_biases:
+  - leaderboard_bias
+  - uploader_bias
+  - region_bias
+  - guild_bias
+  - repeated_group_bias
+  - composition_bias
+  - timed_only_bias
+  - hotfix_bias
+  - survivorship_bias

@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Dungeon registry — Midnight Season 2 Mythic+
+# ---------------------------------------------------------------------------
+# IMPORTANT: every numeric ID below is DELIBERATELY UNSET (null / []).
+#
+# Warcraft Logs zone IDs, encounter IDs and the exact season dungeon list are
+# NOT hardcoded from memory in this project (see brief section 33 and 54).
+# They are discovered from the live API and written back into this file by:
+#
+#     wclmplus discover-dungeons --write
+#
+# That command queries `worldData` for the current Mythic+ zone, lists its
+# encounters, and fills in `wcl_zone_id`, `encounter_ids` and `verified: true`.
+# Until then, any code path needing an ID must fail loudly rather than guess.
+#
+# `aliases` are matched case-insensitively by the CLI (`--dungeon "murder row"`),
+# so they work before IDs are known.
+# ---------------------------------------------------------------------------
+
+season:
+  id: midnight-s2
+  display_name: "Midnight Season 2"
+  # The WCL zone that contains the season's Mythic+ partition. Discovered, not assumed.
+  wcl_mplus_zone_id: null
+  expected_dungeon_count: 8
+  verified: false
+  notes: >-
+    Season composition is unverified in this repository. Four dungeons are named
+    in the research brief; the remaining slots must be filled from the live API
+    before any season-wide collection is attempted.
+
+dungeons:
+  # --- Named in the research brief (validation targets) ---
+  - key: murder-row
+    display_name: "Murder Row"
+    aliases: ["murder row", "murderrow", "mr"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: primary-pilot          # Phase 1 + Phase 2 target
+    validation_targets:
+      - npc: "Shivan Punisher"
+        npc_game_id: null
+        abilities:
+          - name: "Whirlwind"
+            ability_game_id: null
+            hypothesis: "trash AoE; recurrence and completion rate unknown"
+          - name: "Demonic Frenzy"
+            ability_game_id: null
+            hypothesis: >-
+              sub-50% execute-phase behaviour; unverified whether WCL exposes
+              enemy health transitions well enough to time the threshold
+
+  - key: ruby-life-pools
+    display_name: "Ruby Life Pools"
+    aliases: ["ruby life pools", "rlp", "ruby"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: cross-validation       # Phase 3 target
+    validation_targets:
+      - npc: "Thunderhead"
+        npc_game_id: null
+        abilities:
+          - name: "Rolling Thunder"
+            ability_game_id: null
+            hypothesis: >-
+              multi-target debuff with a damaging removal. Target count, aura
+              representation and dispel-vs-expiry distinction must be observed
+              empirically, NOT encoded in the collector.
+          - name: "Thunder Jaw"
+            ability_game_id: null
+            hypothesis: "overlap candidate against Rolling Thunder removals"
+
+  - key: the-blinding-vale
+    display_name: "The Blinding Vale"
+    aliases: ["the blinding vale", "blinding vale", "tbv"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: boss-timeline-validation
+    validation_targets:
+      - npc: "Lightwarden Ruia"
+        npc_game_id: null
+        abilities: []
+        hypothesis: >-
+          boss phase/timing validation case. External guides describe a highly
+          structured late phase; the log must be allowed to disagree with them.
+
+  - key: den-of-nalorakk
+    display_name: "Den of Nalorakk"
+    aliases: ["den of nalorakk", "nalorakk", "don"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: health-threshold-validation
+    validation_targets:
+      - npc: "Hoardmonger"
+        npc_game_id: null
+        abilities: []
+        hypothesis: >-
+          health-threshold / phase-change validation case, contingent on whether
+          enemy resource (health) data is reliably exposed in events.
+
+  # --- Remaining season slots: unknown, to be discovered ---
+  # `wclmplus discover-dungeons --write` appends the real season dungeon list
+  # here. Do not invent entries by hand.
