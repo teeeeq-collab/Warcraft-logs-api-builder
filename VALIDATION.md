@@ -2,17 +2,16 @@
 
 Mechanic test cases, expected evidence, observed evidence, and limitations.
 
-> **Overall status: machinery validated; game behaviour not yet.**
+> **Overall status: the instrument is validated; the game is next.**
 >
-> A live recon run on 2026-09-12 confirmed that every field the research design
-> needs exists in the API, and found two defects in this project (see
-> `API_NOTES.md` section 12), both fixed. It did **not** reach event data: the
-> run aborted at `report_metadata`, so no mechanic has been observed.
+> Four live runs completed Phase 0. The fourth ran all 16 steps with no
+> failures, confirming that every event shape the research design needs exists
+> and that pagination is lossless. **No mechanic has been measured yet** — that
+> is Phase 1 onward — but nothing now blocks it.
 >
-> 232 offline tests cover pagination completeness, NPC-instance separation,
-> secret redaction, cache integrity, error classification and both live
-> defects. That proves the collector behaves correctly on well-shaped input.
-> It proves nothing about the game.
+> 247 offline tests cover pagination, NPC-instance separation, secret
+> redaction, cache integrity, error classification and all seven defects the
+> live runs exposed.
 
 ## How to run validation
 
@@ -34,41 +33,34 @@ unsupported and every recast statistic in the project is invalid.
 
 | | |
 | --- | --- |
-| **Goal** | Two copies of one NPC species in one pull keep separate cast timelines. |
-| **Expected evidence** | (a) A pull whose `enemyNPCs` instance-ID range covers more than one copy. (b) Events carrying `sourceInstance` so each cast attributes to copy 1 or copy 2. |
-| **Observed (a)** | **CONFIRMED AVAILABLE.** All six identity fields exist on `ReportDungeonPullNPC`: `id`, `gameID`, `minimumInstanceID`, `maximumInstanceID`, `minimumInstanceGroupID`, `maximumInstanceGroupID`. |
-| **Observed (b)** | **STILL UNVERIFIED.** No event has been fetched. Encouraging sign: `Report.events` accepts `sourceInstanceID` and `targetInstanceID` as **filter arguments**, which implies per-instance data exists — but a filter argument is not proof the field is returned on each event. |
-| **Status** | HALF CONFIRMED — (a) yes, (b) pending the next recon run |
+| **Goal** | Two copies of one NPC species in one pull keep separate timelines. |
+| **Observed (a) pull level** | **CONFIRMED.** All six identity fields populate. One +10 Murder Row run yielded 20 duplicate-species pulls, the largest being **18 copies** of NPC 236085 in a single pull. |
+| **Observed (b) event level** | **CONFIRMED for Debuffs, DamageTaken, Interrupts, Buffs, Deaths, Summons.** Enemy actors carry `sourceInstance` (e.g. enemy 11 instance 2 applying a debuff); interrupts carry `targetInstance`; deaths carry `killerInstance`. |
+| **Observed (c) enemy casts** | **PENDING.** The Casts sample was unfiltered and returned 50 player casts. Players are not instanced, so it proved nothing either way. A `hostilityType: Enemies` probe now checks directly. |
+| **Status** | CONFIRMED except for enemy casts, which one short run settles |
 
-Automated support in place:
-
-- Recon reports `duplicate_npc_species_candidates` — pulls usable as this fixture.
-- Recon raises a limitation if no sampled event carries `sourceInstance` /
-  `targetInstance`.
-- `test_fingerprint_distinguishes_npc_instances` proves the paginator never
-  conflates two instances.
-- `test_duplicate_npc_species_pull_is_detected` proves detection works.
-
-**If (b) fails:** record that per-instance timing is not supported by the API.
-Do not infer instance identity from cast ordering — that would fabricate data.
+**If (c) fails:** record that per-instance cast timing is not supported by the
+API. Do not infer instance identity from cast ordering — that would fabricate
+data.
 
 ## V2 — Pagination completeness
 
 | | |
 | --- | --- |
-| **Goal** | Every event downloaded exactly once, across pages and across an interruption. |
-| **Expected evidence** | Cursor semantics classified; boundary-repeat count recorded; a full traversal terminating with a de-duplicated total. |
-| **Observed** | _pending_ (live). **Offline: PASSED** — 22 tests, both cursor semantics. |
-| **Status** | PARTIAL — machinery proven, live behaviour unverified |
+| **Goal** | Every event downloaded exactly once, across pages and an interruption. |
+| **Observed** | **PASSED LIVE.** Cursor is **exclusive**. 316 pages at a 25-event limit: 7,920 events returned, **7,920 emitted**, 0 boundary repeats dropped, 0 out-of-order timestamps, largest inter-event gap 17.8 s (pull downtime), no warnings. |
+| **Status** | PASSED |
 
-Offline cases proven: single page; multi-page; a full 10,000-event page;
-exact multiple of the page size; several events sharing one timestamp;
+Offline cases also proven: single page; multi-page; a full 10,000-event page;
+exact multiple of page size; several events sharing one timestamp;
 byte-identical events at one timestamp both kept; a timestamp holding more
 events than one page raises rather than looping; repeated cursor; backwards
 cursor; page ceiling; interruption and resume with no loss or duplication;
 transient failure propagating instead of truncating.
 
----
+Because the live cursor is exclusive, the multiset boundary matching never
+fires in practice. It stays: it costs nothing here, and it is what keeps the
+collector correct if the behaviour differs by event type or changes later.
 
 ## V3 — Murder Row: Shivan Punisher
 
@@ -204,32 +196,27 @@ written to disk.
 
 ## Known limitations (current)
 
-1. **No event data has been observed.** Event shape, pagination semantics and
-   per-instance identity in events remain unverified. (B1)
-2. **No pull data has been observed.** Field availability is confirmed;
-   interval contiguity, boss representation and event-assignment rates are not.
-3. **The season dungeon list is RESOLVED.** Midnight Season 2 is zone 55 with
-   eight encounters, confirmed from the API and by the project owner. Three
-   names are reused from earlier seasons and are resolved by two-pass matching,
-   never by name alone.
-4. **`Report.gameVersion` does not exist.** Unused by the research design.
-   **`User.avatar` is permission-gated** and is not available to this client;
-   it is excluded from queries.
-5. **Enemy health availability is unknown**, which would make execute-phase
-   duration (V3) and health-threshold phases (V6) unmeasurable.
-6. **Event-page cost is unmeasured.** Schema work costs ~2 points per recon, so
-   the budget will be dominated by event pages. No default profile can be
-   recommended for large samples yet.
-7. **Discovery reach is CONFIRMED BROAD.** `ReportData.reports` answers both
-   unscoped and zone-scoped with no guild or user seed, so representative
-   season-wide sampling is available rather than leaderboard-only. Note
-   `total` is `-1`, so sample size must be counted, not read.
-8. **No database exists.** Schema version 0. `DATA_DICTIONARY.md` is a design.
-9. **Report-code parsing is permissive** by design: any 8–32 character
-   alphanumeric token is accepted. Use `wclmplus report-list-check` first.
-10. **No hotfix epochs are declared.** Every run classifies as `unclassified`
-    until real dates are known. Absolute run dates are retained so epochs can
-    be applied retroactively.
+1. **Enemy-cast instance identity is unconfirmed.** Every other enemy event
+   type carries it. One probe settles it. (B1)
+2. **No mechanic has been measured.** Phase 1 onward.
+3. **`Report.gameVersion` does not exist** (unused). **`User.avatar` and
+   `User.battleTag` are permission-gated** and are not requested.
+4. **`ReportPagination.total` is `-1`** — not a usable denominator. Sample size
+   must be counted from what is fetched.
+5. **The real event page ceiling is untested.** 25 was used to force many pages.
+6. **Complete per-run event cost is unmeasured.** Points are demonstrably not
+   the constraint (~29 of 3600 for a full recon); time and bytes are.
+7. **Enemy health reconstruction is untested.** Player `hitPoints`/
+   `maxHitPoints` are on damage events; whether enemies expose the same as
+   damage *targets* needs a `DamageDone` sample.
+8. **Pull-interval behaviour is unmeasured**: overlaps, boss representation,
+   and the share of events falling outside every pull.
+9. **No database exists.** Schema version 0.
+10. **Report-code parsing is permissive** by design; use
+    `wclmplus report-list-check` first.
+11. **No hotfix epochs are declared.** Every run classifies as `unclassified`
+    until real dates are known; absolute dates are retained so epochs can be
+    applied retroactively.
 
 ## Unresolved questions
 

@@ -9,6 +9,62 @@ recorded here.
 
 ---
 
+## 0.1.4 — 2026-09-12 — **Gate A passed**
+
+Fourth live run: 16 of 16 steps, 0 failures. Pulls, NPC identity, event shapes,
+pagination and cost are now observed rather than assumed.
+
+- `software_version` 0.1.3 -> 0.1.4
+- `query_version` 3 -> 4 (enemy-cast probe added)
+
+### Verified against the live API
+
+- **Pagination cursor is EXCLUSIVE.** A 316-page traversal of one +10 fight
+  returned 7,920 events and emitted 7,920: nothing lost, nothing
+  double-counted, no out-of-order timestamps, no warnings. The multiset
+  boundary matching is therefore not load-bearing on this endpoint; it stays,
+  because it costs nothing under an exclusive cursor and is the difference
+  between correct and corrupt if that ever changes.
+- **NPC instance identity is real in events**: `sourceInstance` on Debuffs and
+  DamageTaken, `targetInstance` on Interrupts and Summons, `killerInstance` on
+  Deaths, both on Buffs. At pull level, one pull contained **18 copies** of NPC
+  236085 — merging those would have manufactured seventeen phantom recasts.
+- **Damage events carry more than the brief hoped for**: `maxHitPoints` (so
+  damage as a fraction of player health is reconstructible, no guessing),
+  `buffs` (aura IDs active on the target at the moment of the hit, so defensive
+  uptime is a lookup rather than a correlation), and `unmitigatedAmount`
+  alongside `mitigated` (separating what the mob swung for from what the tank
+  took).
+- `extraAbilityGameID` on interrupts and dispels names *what was interrupted*
+  and *what was removed*.
+- **Cost is not the constraint.** The whole run cost ~29 points of 3600/hour;
+  316 event pages ≈ 0.05 points each. Time and bandwidth bind first: 97 s and
+  3.3 MB. `min_points_reserve: 200` is over-cautious and can be revisited.
+- Timestamps are integer milliseconds relative to report start. `log_version`
+  17.
+- Report discovery confirmed across three runs; unscoped results carry
+  `zone: null`, so **zone-scoped discovery is the one to build sampling on**.
+
+### Added
+
+- **Enemy-cast probe.** The unfiltered Casts sample came back as 50 player
+  casts and not one enemy cast: five players out-cast the trash in raw event
+  count, and players are not instanced, so the sample could say nothing about
+  NPC cast timelines. Recon now samples `hostilityType: Enemies` separately and
+  counts how many events carry `sourceInstance`, raising a limitation if none
+  do — in which case per-instance recast timing is not supported by the API and
+  must be recorded as such rather than inferred from cast ordering.
+- Event samples now record `distinct_source_ids` and
+  `events_with_source_instance`, so a player-dominated sample is visible as
+  such instead of looking like an answer.
+
+### Note for collection
+
+An unfiltered event query is dominated by players. `hostilityType` is not an
+optimisation for this project; it is what makes the enemy side visible at all.
+
+---
+
 ## 0.1.3 — 2026-09-12
 
 Third live run. One more gated field, and a fix to the strategy rather than the

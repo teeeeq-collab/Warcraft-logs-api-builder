@@ -243,11 +243,14 @@ def test_full_traversal_recovers_every_event_exactly_once(recon_factory):
     recon, sim = recon_factory(sim)
     findings = recon.run(report_code=REPORT_CODE)
     probe = findings.steps["pagination_probe"]
-    assert probe["total_events_deduplicated"] == len(sim.cast_events)
+    # The probe paginates unfiltered Casts, which is friendly + enemy.
+    expected = len(sim.cast_events) + len(sim.friendly_cast_events)
+    assert probe["total_events_deduplicated"] == expected
 
 
 def test_single_page_probe_is_flagged_as_unproven(recon_factory):
     sim = WclSimulator(event_page_limit=1000, total_cast_events=3)
+    sim.friendly_cast_events = []  # keep the whole fight inside one page
     recon, _ = recon_factory(sim)
     findings = recon.run(report_code=REPORT_CODE)
     assert findings.steps["pagination_probe"]["status"] == "SINGLE_PAGE"
@@ -654,3 +657,57 @@ def test_blame_matching_edge_cases():
     # short names are matched strictly, or "invalid" would blame `id`
     assert _blamed_fields("The request was invalid", ["id"]) == set()
     assert _blamed_fields("Field 'id' is not allowed", ["id"]) == {"id"}
+
+
+# -- enemy cast identity (the project's decisive requirement) --------------
+
+
+def test_enemy_casts_are_sampled_separately(recon_factory):
+    """An unfiltered Casts sample cannot answer the core question.
+
+    The first live sample returned 50 casts, every one of them from a player,
+    because five players out-cast the trash in raw event count. Players are not
+    instanced, so it carried no `sourceInstance` and said nothing about whether
+    two copies of one NPC can be told apart.
+    """
+    recon, sim = recon_factory()
+    findings = recon.run(report_code=REPORT_CODE)
+    categories = findings.steps["event_samples"]["categories"]
+
+    assert "Casts_enemies" in categories, "enemy casts are probed separately"
+    enemy = categories["Casts_enemies"]
+    assert enemy["hostility_filter"] == "Enemies"
+    assert enemy["events_with_source_instance"] > 0
+    assert "sourceInstance" in enemy["observed_field_names"]
+
+    sent = [v for q, v in sim.queries_seen if v.get("hostilityType") == "Enemies"]
+    assert sent, "a hostility-filtered query was actually sent"
+
+
+def test_enemy_casts_without_instance_ids_raise_a_limitation(recon_factory):
+    """If enemy casts lack sourceInstance, say so instead of inferring it.
+
+    Per-instance recast timing would simply not be supported by the API, and
+    guessing instance identity from cast ordering would fabricate data.
+    """
+    sim = WclSimulator()
+    for event in sim.cast_events:
+        event.pop("sourceInstance", None)
+    recon, _ = recon_factory(sim)
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert (
+        findings.steps["event_samples"]["categories"]["Casts_enemies"][
+            "events_with_source_instance"
+        ]
+        == 0
+    )
+    assert any("NOT supported by the API" in x for x in findings.limitations)
+
+
+def test_empty_enemy_cast_sample_is_flagged(recon_factory):
+    sim = WclSimulator()
+    sim.cast_events = []
+    recon, _ = recon_factory(sim)
+    findings = recon.run(report_code=REPORT_CODE)
+    assert any("enemy-cast sample came back empty" in x for x in findings.limitations)

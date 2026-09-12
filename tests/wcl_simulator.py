@@ -197,6 +197,18 @@ class WclSimulator:
         self.queries_seen: list[tuple[str, dict[str, Any]]] = []
         self.points_spent = 100.0
         self.cast_events = self._build_cast_events(total_cast_events)
+        #: Player casts carry no sourceInstance -- players are not instanced.
+        self.friendly_cast_events = [
+            {
+                "timestamp": 10_000 + index * 400,
+                "type": "cast",
+                "sourceID": 3,
+                "targetID": 3,
+                "abilityGameID": 21562,
+                "fight": FIGHT_ID,
+            }
+            for index in range(40)
+        ]
 
     # -- data ------------------------------------------------------------
 
@@ -747,7 +759,20 @@ class WclSimulator:
         limit = min(limit, self.event_page_limit)
 
         if data_type in ("Casts", "All"):
-            pool = self.cast_events
+            hostility = variables.get("hostilityType")
+            if hostility == "Enemies":
+                pool = self.cast_events
+            elif hostility == "Friendlies":
+                pool = self.friendly_cast_events
+            else:
+                # Unfiltered Casts is dominated by the five players, exactly as
+                # observed live: the first real sample returned 50 player casts
+                # and not one enemy cast, so it could say nothing about NPC
+                # cast timelines.
+                pool = sorted(
+                    self.friendly_cast_events + self.cast_events,
+                    key=lambda e: e["timestamp"],
+                )
         elif data_type == "Deaths":
             pool = [
                 {

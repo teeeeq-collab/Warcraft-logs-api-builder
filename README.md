@@ -10,19 +10,23 @@ It is not a dungeon guide and not a web app. It is a collector plus a dataset
 detailed enough that new questions can be answered later **without
 re-downloading anything**.
 
-> **Current status: Phase 0 (reconnaissance), three live runs complete.**
+> **Current status: Phase 0 complete — Gate A passed.**
 >
-> Confirmed against the live API: **every field the research design needs
-> exists** (`ReportFight` 23/23, `ReportDungeonPull` 10/10,
-> `ReportDungeonPullNPC` 6/6, all 14 `EventDataType` values); **Midnight
-> Season 2 is zone 55** with all eight dungeons identified; and **report
-> discovery works without a guild or user scope**, so representative
-> season-wide sampling is possible rather than leaderboard-only.
+> Four live runs against the real API. The fourth completed all 16 checks with
+> no failures. Confirmed: every field the research design needs exists;
+> **pagination is lossless** (316 pages, 7,920 events in, 7,920 out); **NPC
+> instance identity is real** (one pull held 18 copies of a single NPC, and
+> enemy events carry the instance marker); **Midnight Season 2 is zone 55**
+> with all eight dungeons identified; and **report discovery works
+> season-wide**, so sampling is not confined to leaderboard logs.
 >
-> The runs also found seven bugs in this project, all fixed with regression
-> tests (see `API_NOTES.md` section 12). They have not yet reached event data,
-> so event shape, pagination semantics and per-instance NPC identity in events
-> remain unverified. One more run settles them.
+> The data also supports more than the brief assumed: damage events carry
+> `maxHitPoints` (damage as a share of player health), `buffs` (which
+> defensives were up at the moment of the hit) and `unmitigatedAmount`
+> (what the mob swung for, versus what the tank took).
+>
+> One item open: enemy *cast* instance identity, which one short run settles.
+> Then Phase 1 — the database and the Murder Row pilot.
 
 ---
 
@@ -247,7 +251,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-244 tests, all offline: no credentials, no network. Live smoke tests are
+247 tests, all offline: no credentials, no network. Live smoke tests are
 opt-in via `pytest -m live`.
 
 The suite covers secret redaction, OAuth failure modes, GraphQL error

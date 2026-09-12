@@ -669,8 +669,18 @@ class Recon:
             self.findings.record("event_samples", "SKIPPED", reason="fight has no time range")
             return {}
 
+        # Enemy casts are sampled separately. An unfiltered Casts sample is
+        # dominated by the five players, so it can answer nothing about the
+        # NPC cast timelines this project exists to measure -- the first live
+        # sample returned 50 player casts and not one enemy cast.
+        probes: list[tuple[str, str, str | None]] = [
+            (category, category, None) for category in categories
+        ]
+        if not enum_values or "Casts" in enum_values:
+            probes.append(("Casts_enemies", "Casts", "Enemies"))
+
         results: dict[str, dict[str, Any]] = {}
-        for category in categories:
+        for label, category, hostility in probes:
             variables = {
                 "code": report_code,
                 "startTime": float(start),
@@ -678,17 +688,17 @@ class Recon:
                 "dataType": category,
                 "limit": EVENT_SAMPLE_LIMIT,
                 "fightIDs": [fight.get("id")],
-                "hostilityType": None,
+                "hostilityType": hostility,
             }
             try:
                 data = self.client.execute(
                     load_query("report_events"),
                     variables,
-                    kind=f"events_sample_{category}",
+                    kind=f"events_sample_{label}",
                     report_code=report_code,
                 )
             except Exception as exc:  # noqa: BLE001
-                results[category] = {"status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
+                results[label] = {"status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
                 continue
             block = (((data.get("reportData") or {}).get("report")) or {}).get("events") or {}
             events = block.get("data") or []
@@ -700,15 +710,23 @@ class Recon:
                         event_types.get(str(event.get("type")), 0) + 1
                     )
                     keys.update(event)
-            results[category] = {
+            source_ids = {
+                e.get("sourceID") for e in events if isinstance(e, dict) and "sourceID" in e
+            }
+            results[label] = {
                 "status": "OK",
+                "hostility_filter": hostility,
                 "returned": len(events),
                 "next_page_timestamp": block.get("nextPageTimestamp"),
                 "event_type_counts": dict(sorted(event_types.items())),
                 "observed_field_names": sorted(keys),
+                "distinct_source_ids": sorted(i for i in source_ids if isinstance(i, int)),
+                "events_with_source_instance": sum(
+                    1 for e in events if isinstance(e, dict) and "sourceInstance" in e
+                ),
                 "first_event": events[0] if events else None,
             }
-            self._save_fixture(f"events_sample_{category.lower()}", data)
+            self._save_fixture(f"events_sample_{label.lower()}", data)
 
         self.findings.record("event_samples", "OK", categories=results)
 
@@ -727,6 +745,22 @@ class Recon:
                 "the core requirement of brief section 14. Re-check with a pull known "
                 "to contain duplicate NPCs before trusting per-instance timelines."
             )
+
+        # The decisive check: can one NPC copy's casts be told from another's?
+        enemy_casts = results.get("Casts_enemies") or {}
+        if enemy_casts.get("status") == "OK":
+            if not enemy_casts.get("returned"):
+                self.findings.limitation(
+                    "The enemy-cast sample came back empty, so per-NPC cast timelines "
+                    "are still unproven. Try a fight with more trash."
+                )
+            elif not enemy_casts.get("events_with_source_instance"):
+                self.findings.limitation(
+                    "Enemy cast events carried no sourceInstance. Two copies of one NPC "
+                    "species cannot be separated from cast events alone, so per-instance "
+                    "recast timing is NOT supported by the API. Record this rather than "
+                    "inferring instance identity from cast ordering."
+                )
         return results
 
     def step_pagination_probe(self, report_code: str, fight: dict[str, Any]) -> None:

@@ -11,14 +11,14 @@ from functools import lru_cache
 from pathlib import Path
 
 #: Software version. Bump on any behavioural change to collection.
-SOFTWARE_VERSION = "0.1.3"
+SOFTWARE_VERSION = "0.1.4"
 
 #: Normalizer version. Bump whenever raw -> normalized mapping changes, so a
 #: rebuild from raw cache is distinguishable from the original ingest.
 NORMALIZER_VERSION = 1
 
 #: GraphQL query-set version. Bump when files in queries/ change meaningfully.
-QUERY_VERSION = 3
+QUERY_VERSION = 4
 
 #: Database schema version. 0 = no schema implemented yet (Phase 0).
 SCHEMA_VERSION = 0

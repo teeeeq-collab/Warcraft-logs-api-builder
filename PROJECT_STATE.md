@@ -2,91 +2,90 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12 (after third live recon run)
-- **Software version:** 0.1.3
+- **Last updated:** 2026-09-12 (after fourth live recon run — Gate A)
+- **Software version:** 0.1.4
 - **Database schema version:** 0 (no schema implemented yet)
 - **Normalizer version:** 1
-- **Query set version:** 3
+- **Query set version:** 4
 
 ---
 
 ## Current milestone
 
-**Phase 0 — API reconnaissance. Three live runs done; one more needed.**
+**Phase 0 — API reconnaissance. COMPLETE. Gate A passed.**
 
-All three runs failed at the same step for *different* reasons, and every
-cause was a defect in this project rather than the API. All are fixed, with
-regression tests.
+The fourth live run finished all 16 steps with 0 failures and one recorded
+limitation (`Report.gameVersion` does not exist, and nothing needs it).
 
-### Gate A — API reconnaissance: **MOSTLY PASSED**
+### Gate A — API reconnaissance: **PASSED**
 
-| Gate A question | Status |
+| Gate A question | Answer |
 | --- | --- |
-| Are the required fields available? | **YES.** ReportFight 23/23, ReportDungeonPull 10/10, ReportDungeonPullNPC 6/6, Report 11/12 (`gameVersion` absent, unused). EventDataType all 14 values. |
-| How can reports be discovered? | **YES, broadly.** `ReportData.reports` answers both unscoped and zone-scoped with no guild or user seed. Representative season-wide sampling is possible — the most consequential finding for the research design. `total` is `-1`, so sample size must be counted, not read. |
-| Are dungeon pulls sufficiently detailed? | **Fields yes; content still unknown.** No pull fetched yet. |
-| What is the observed API cost? | **Cheap.** 22 requests ≈ 23 points of 3600/hour. Event-page cost still unmeasured. |
-| Are there access limitations? | **Detectable.** `archiveStatus` exposes `isArchived`/`isAccessible`. One real limitation found: `User.avatar` is permission-gated. |
-| How does pagination work? | **Still unknown.** Blocked by the defects below, both now fixed. |
+| Are the required fields available? | **Yes.** ReportFight 23/23, ReportDungeonPull 10/10, ReportDungeonPullNPC 6/6, Report 11/12. All 14 `EventDataType` values. |
+| How does pagination work? | **Measured.** Cursor is **exclusive**. A 316-page traversal returned 7,920 events and emitted 7,920 — nothing lost, nothing double-counted, no out-of-order timestamps, no warnings. |
+| How can reports be discovered? | **Broadly.** `ReportData.reports` answers unscoped *and* zone-scoped with no guild or user seed. Zone-scoped is the one to build on: it returns exactly the Season 2 population. |
+| What is the observed API cost? | **Measured, and not the constraint.** The whole run cost ~29 points of 3600/hour; 316 event pages ≈ 0.05 points each. Time and bytes bind first: 97 s and 3.3 MB. |
+| Are there access limitations? | **Yes, and detectable.** `archiveStatus` works; `User.avatar` and `User.battleTag` are permission-gated and are no longer requested. |
+| Are dungeon pulls sufficiently detailed? | **Yes.** 13 pulls on one +10 run, each with its enemy NPC list, coordinates, bounding box and map. |
 
-### Season identified
+### What the data turned out to support
 
-**Midnight Season 2 is WCL zone 55** (expansion 7, partition S2, not frozen).
-All eight dungeons confirmed from the API *and* independently by the project
-owner: Altar of Fangs (12993), Den of Nalorakk (12825), Kings' Rest (61762),
-Murder Row (12813), Ruby Life Pools (112521), Temple of Sethraliss (61877),
-The Blinding Vale (12859), Voidscar Arena (12923).
+Three findings materially exceed what the brief assumed possible:
 
-Three of those names are reused from earlier seasons, so name-only matching is
-not safe — see `API_NOTES.md` section 9.
+- **`maxHitPoints` is on every damage event**, so damage as a fraction of
+  player health is directly reconstructible. The brief said not to guess at
+  this; no guessing is needed.
+- **`buffs` is on every damage event** — the aura IDs active on the target at
+  the moment of the hit. "Was a defensive up for this tankbuster" becomes a
+  lookup rather than a correlation across timelines.
+- **`unmitigatedAmount` alongside `mitigated`** separates what the mob swung
+  for from what the tank actually took — the difference between measuring
+  danger and measuring mitigation.
 
-### Defects the live runs found — all fixed
+Plus `extraAbilityGameID` on both interrupts and dispels, naming *what was
+interrupted* and *what was removed* — the two links the brief's interrupt and
+dispel questions depend on.
 
-| # | Defect | Fix |
-| --- | --- | --- |
-| 1 | Composite fields selected without a sub-selection (`archiveStatus`) | Sub-selections derived from introspection, not a hardcoded map |
-| 2 | Mythic+ dungeons matched against zone names → 0 of 4 | Encounters searched first; season zone inferred |
-| 3 | Expansion list truncated from the wrong end, hiding the current expansion | Sorted by ID descending, nothing dropped |
-| 4 | Auto-expansion picked up permission-gated `User.avatar` | Deny-list for observed-gated fields, plus drop-and-retry for unanticipated ones |
-| 5 | Reused dungeon names left unresolved | Two-pass matching: infer the season zone, then resolve within it |
-| 6 | A *second* gated field (`User.battleTag`); the retry never fired because it matched `battleTag` against prose reading "battle tag" | Identity-first expansion makes gated extras unreachable; blame matching normalized, most-specific match only |
-| 7 | Cache keyed on query name, not query text, so a narrowed query could reuse a stale answer | Rendered query hash is part of the cache key |
+### The one open item
 
-**244 tests pass**, including regression tests for all seven. The simulator now
-enforces the server's sub-selection rule, gates `avatar` the way the live API
-does, models reused dungeon names across seasons, gates `battleTag` behind a
-prose error message, and returns expansions newest first — so none of these
-can regress silently.
+The Casts sample returned 50 events, **every one from a player**. Five players
+out-cast the trash in raw event count, and players are not instanced, so it
+carried no `sourceInstance` and said nothing about NPC cast timelines.
+
+Enemy instance identity is confirmed on Debuffs, DamageTaken, Interrupts,
+Buffs, Deaths and Summons, so the expectation for casts is strong — but
+expectation is not evidence, and per-NPC recast timing is the fact this
+project's headline statistics rest on. Recon now samples enemy casts separately
+with `hostilityType: Enemies`; one short run closes it.
+
+**Lesson carried into Phase 1:** an unfiltered event query is dominated by
+players. `hostilityType` is not an optimisation here; it is what makes the
+enemy side visible at all.
 
 ---
 
 ## Blockers
 
-### B1 — Third recon run needed (open, requires user action)
-
-Everything after `report_metadata` remains unverified: pull content, NPC
-event-level identity, event shape, pagination semantics, event-page cost.
-
-The user re-runs, after updating to the current code:
+### B1 — Confirm enemy-cast instance identity (open, one short run)
 
 ```
 .venv\Scripts\wclmplus.exe recon --report "<PUBLIC_MYTHIC_PLUS_REPORT_URL>"
-.venv\Scripts\wclmplus.exe discover-dungeons --write
 ```
+
+Look for `Casts_enemies` in the findings with
+`events_with_source_instance > 0`. If it is zero, per-instance recast timing is
+**not supported by the API** and must be recorded as such rather than inferred
+from cast ordering.
 
 ### B2 — Season dungeon list — **RESOLVED**
 
-All eight dungeons and the season zone (55) are identified, and
-`discover-dungeons --write` has been run successfully: IDs are persisted in
-`config/dungeons.discovered.yml` on the user's machine. Nothing is hardcoded
-in source.
+Zone 55, all eight dungeons, persisted to `config/dungeons.discovered.yml`.
 
 ### B3 — Live verification cannot be done in this environment (permanent)
 
 No credentials, and egress to `warcraftlogs.com` is denied by the build
-environment's proxy (403 on CONNECT; control hosts returned 200). All live
-evidence comes from the user's machine, by design — their Client Secret never
-leaves it.
+environment's proxy. All live evidence comes from the user's machine, by
+design — their Client Secret never leaves it.
 
 ---
 
@@ -147,23 +146,25 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 | Case | Status |
 | --- | --- |
-| V1 NPC instance identity | **Half confirmed.** All 6 pull-NPC identity fields exist. Event-level `sourceInstance` unverified; `Report.events` accepts `sourceInstanceID`/`targetInstanceID` filters, which suggests it exists. |
-| V2 Pagination completeness | Offline PASSED (22 tests, both cursor semantics). Live unverified. |
-| V3–V6 Mechanic timelines | NOT STARTED — needs event data. |
-| V7 Priority interrupt | NOT STARTED. |
-| V8 CC stop inference | NOT STARTED. |
+| V1 NPC instance identity | **Confirmed for Debuffs, DamageTaken, Interrupts, Buffs, Deaths, Summons.** Pull level confirmed on a real fixture: 18 copies of NPC 236085 in one pull. Enemy *casts* pending one probe. |
+| V2 Pagination completeness | **PASSED live.** Exclusive cursor; 316 pages, 7,920 in, 7,920 out, no warnings. Plus 22 offline tests covering both cursor semantics. |
+| V3-V6 Mechanic timelines | Ready to attempt — every event shape they need is confirmed present. |
+| V7 Priority interrupt | **Reconstructible.** `interrupt` events carry `extraAbilityGameID` (what was interrupted) and `targetInstance` (which copy). |
+| V8 CC stop inference | Ready to attempt; still needs the confidence-scored inference rules. |
 | V9 Event-to-pull assignment | NOT STARTED — Phase 1. |
-| V10 Credential safety | **PASSED** across two live runs: no credential appeared in any output, report or fixture. The user pasted full terminal output safely. |
+| V10 Credential safety | **PASSED** across four live runs. No credential in any output, report or fixture. |
 
 ## Next actions
 
-1. **User:** update to the current code, re-run `recon --report <CODE>`, then
-   `discover-dungeons --write`. Send back `recon_findings.json`.
-2. **Coordinator:** confirm event-level NPC instance identity, pagination
-   semantics and event-page cost; fill in `API_NOTES.md` sections 5–7 and 11.
-3. **Coordinator:** close Gate A.
-4. **Then Phase 1:** SQLite schema and migrations, ingestion, pull assignment,
-   checkpoint/resume, dedupe, validation report — 5–10 Murder Row runs.
+1. **User:** one more `recon` run to confirm enemy-cast instance identity (B1).
+2. **Coordinator:** close B1 in `API_NOTES.md` and `VALIDATION.md`.
+3. **Phase 1 — can begin in parallel**, since the event shapes that determine
+   the storage schema are confirmed:
+   - SQLite schema and migrations, built against the *observed* event fields
+   - Ingestion: report → run → pulls → NPC instances → events
+   - Event-to-pull assignment with diagnostics
+   - Checkpoint/resume, idempotent re-ingest, duplicate-run detection
+   - Validation report, then 5-10 Murder Row runs
 
-Phase 1 must not start before step 3. The storage schema depends on the real
-event field names, still the biggest unknown.
+Phase 1's schema design no longer rests on guesses: `DATA_DICTIONARY.md` can be
+rewritten against real field lists.

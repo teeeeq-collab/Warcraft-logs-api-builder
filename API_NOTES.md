@@ -2,17 +2,23 @@
 
 Verified Warcraft Logs v2 API behaviour.
 
-**Evidence:** live recon runs 2026-09-12 19:21 and 19:56 UTC, retail
-`www.warcraftlogs.com/api/v2/client`. Second run: 22 requests, 110 KB, 5.9 s,
-~23 points of 3600. Raw evidence: `data/exports/recon/recon_findings.json`.
+**Evidence:** four live recon runs on 2026-09-12, retail
+`www.warcraftlogs.com/api/v2/client`, against a public Murder Row report.
+Fourth run: 16/16 steps OK, 355 requests, 3.3 MB, 97 s, **~29 points of 3600**.
+Raw evidence: `data/exports/recon/recon_findings.json`.
 
 Status tags: `VERIFIED` (observed live, evidence cited) · `CORRECTED`
 (observed to differ from the hypothesis) · `HYPOTHESIS` (not yet observed).
 
-> **Three recon runs so far, all partial.** Each failed at `report_metadata`
-> for a *different* reason, and every cause was a defect in this project, not
-> the API (sections 12.1, 12.3, 12.5). All are fixed. Sections 5–7 and 11 stay
-> unverified until a run reaches event data.
+> **Fourth run completed in full: 16 steps, 0 failures.** Pulls, NPC identity,
+> event shape, pagination semantics and cost are all now observed rather than
+> assumed. The three earlier runs each failed at `report_metadata` for a
+> different reason, every cause a defect in this project rather than the API
+> (sections 12.1, 12.3, 12.5).
+>
+> One gap remains: the Casts sample was unfiltered and came back entirely
+> player casts, so *enemy* cast instance identity is inferred rather than seen.
+> A hostility-filtered probe now closes it (section 6).
 
 ---
 
@@ -83,66 +89,160 @@ open questions.
 
 ---
 
-## 5. Dungeon pulls — fields VERIFIED, content UNVERIFIED
+## 5. Dungeon pulls — VERIFIED
 
-All 10 wanted fields exist on `ReportDungeonPull`: `id`, `name`, `startTime`,
-`endTime`, `encounterID`, `kill`, `x`, `y`, `boundingBox`
-`ReportMapBoundingBox`, `maps` `[ReportMap]`.
+All 10 wanted fields exist and return data: `id`, `name`, `startTime`,
+`endTime`, `encounterID`, `kill`, `x`, `y`, `boundingBox`, `maps`.
 
-No pull data has been fetched yet (the run aborted first), so pull *content* —
-interval contiguity, whether bosses appear as pulls, what share of events fall
-outside every pull — is still unknown.
+Observed on one +10 Murder Row run: **13 pulls**, each with an `enemyNPCs`
+list. The fight itself carried `npcCountMap` with 25 distinct NPC game IDs and
+their counts, which is a useful cross-check on pull composition.
 
----
+WCL's own pull boundaries are the source of truth for this project. No
+combat-gap detector is implemented, by design.
 
-## 6. NPC instance identity — fields VERIFIED, event-level UNVERIFIED
+**Still unmeasured:** whether pull intervals ever overlap, whether bosses
+appear as pulls, and what share of events fall outside every pull. Those are
+Phase 1 diagnostics, not schema questions.
 
-All 6 fields exist on `ReportDungeonPullNPC`: `id`, `gameID`,
+## 6. NPC instance identity — VERIFIED (the project's core requirement)
+
+**Pull level.** All six fields exist and populate: `id`, `gameID`,
 `minimumInstanceID`, `maximumInstanceID`, `minimumInstanceGroupID`,
-`maximumInstanceGroupID`. **The pull-level half of the project's core
-requirement is confirmed available.**
+`maximumInstanceGroupID`.
 
-The event-level half is not yet confirmed: whether individual events carry
-`sourceInstance` / `targetInstance` so a cast can be attributed to copy 1 vs
-copy 2. `Report.events` does accept **`sourceInstanceID` and
-`targetInstanceID` as filter arguments**, which strongly suggests per-instance
-data exists, but a filter argument is not proof that the field is returned on
-each event. The next recon run settles it.
+One +10 Murder Row run gave 20 pulls-with-duplicates, including:
 
-If it fails, per-instance mechanic timing is unsupported by the API and must be
-recorded as such rather than inferred from cast ordering.
+| Pull | NPC game ID | Copies (instance span) |
+| --- | --- | --- |
+| 1 | 236085 | **18** |
+| 4 | 253324 | 16 |
+| 5 | 255050 | 11 |
+| 3 | 253324 | 8 |
 
----
+Eighteen copies of one species in a single pull. Merging those into one
+timeline would have manufactured seventeen phantom "recasts".
 
-## 7. Events — enum VERIFIED, shape UNVERIFIED
+**Event level — instance identity is present on enemy events:**
 
-**`EventDataType` — all 14 values exist, exactly as hypothesised:**
-`All`, `Buffs`, `Casts`, `CombatantInfo`, `DamageDone`, `DamageTaken`,
-`Deaths`, `Debuffs`, `Dispels`, `Healing`, `Interrupts`, `Resources`,
-`Summons`, `Threat`. Every event profile in `config/sampling.yml` validates.
+| Category | Instance fields observed |
+| --- | --- |
+| Buffs | `sourceInstance`, `targetInstance` |
+| Debuffs | `sourceInstance` (e.g. enemy 11, instance 2) |
+| DamageTaken | `sourceInstance` (e.g. enemy 12, instance 1) |
+| Interrupts | `targetInstance` (which copy was interrupted) |
+| Deaths | `killerInstance` |
+| Summons | `targetInstance` |
 
-**`HostilityType`:** `Friendlies`, `Enemies`.
+So a debuff application, a damage hit, an interrupt and a death can each be
+attributed to a specific copy of an NPC.
 
-**`Report.events` arguments — 28, far more than assumed:**
-`abilityID`, `dataType`, `death`, `difficulty`, `encounterID`, `endTime`,
-`fightIDs`, `filterExpression`, `hostilityType`, `includeResources`,
-`killType`, `limit`, `sourceAurasAbsent`, `sourceAurasPresent`, `sourceClass`,
-`sourceID`, `sourceInstanceID`, `startTime`, `targetAurasAbsent`,
-`targetAurasPresent`, `targetClass`, `targetID`, `targetInstanceID`,
-`translate`, `useAbilityIDs`, `useActorIDs`, `viewOptions`, `wipeCutoff`.
+**The one gap, now probed.** The Casts sample returned 50 events, *every one
+from a player*. Five players out-cast the trash in raw event count, and
+players are not instanced, so the sample carried no `sourceInstance` and could
+say nothing about NPC cast timelines. Recon now samples enemy casts separately
+with `hostilityType: Enemies` and records how many carry `sourceInstance`.
 
-Several are directly useful later: `filterExpression` and the aura-presence
-filters could answer overlap questions server-side, and `useAbilityIDs` /
-`useActorIDs` affect whether IDs or names come back. **None is used yet** —
-server-side filtering would discard the raw stream this project exists to
-preserve, so it stays a Phase-5 optimisation, not an ingestion shortcut.
+Enemy actors demonstrably carry `sourceInstance` on other event types, so the
+expectation is strong — but expectation is not evidence, and this is the single
+fact the project's recast statistics rest on.
 
-Event *shape* (field names per event type, timestamp units, page ceiling) is
-still unverified.
+**Lesson for collection:** an unfiltered event query is dominated by players.
+`hostilityType: Enemies` is not an optimisation here, it is what makes the
+enemy-side data visible at all.
 
----
+## 7. Events — VERIFIED
 
-## 8. Report discovery — arguments VERIFIED, behaviour BEING PROBED
+**`EventDataType`** — all 14 values exist, as hypothesised. Every event profile
+in `config/sampling.yml` validates. **`HostilityType`**: `Friendlies`,
+`Enemies`.
+
+Timestamps are **integer milliseconds relative to report start** (a fight ran
+91,929 → 1,749,021, about 27.6 minutes). `log_version` 17, `game_version` 1.
+
+### Observed event shapes
+
+`Report.events(...).data` is raw JSON, so shape is preserved verbatim.
+
+| Category | Event types seen | Notable fields |
+| --- | --- | --- |
+| Casts | `cast`, `begincast` | `abilityGameID`, `targetInstance`, plus full resource block when `includeResources: true` |
+| Debuffs | `applydebuff`, `removedebuff` | `sourceInstance`, `targetID` |
+| Buffs | `applybuff`, `refreshbuff`, `removebuff`, `applybuffstack`, `removebuffstack` | `stack`, both instance fields |
+| Interrupts | `interrupt`, `applydebuff` | `abilityGameID` (the interrupt), `extraAbilityGameID` (**what was interrupted**), `targetInstance` |
+| Dispels | `dispel` | `abilityGameID` (the dispel), `extraAbilityGameID` (**what was removed**), `isBuff` |
+| Deaths | `death` | `killerID`, `killerInstance`, `killingAbilityGameID` |
+| Summons | `summon` | `targetInstance` |
+| DamageTaken | `damage` | see below |
+
+`Interrupts` returns `applydebuff` events alongside `interrupt` — the
+interrupt-lockout debuff. Worth knowing before counting rows as interrupts.
+
+### DamageTaken carries more than hoped
+
+`amount`, `absorbed`, `absorb`, `blocked`, `mitigated`, **`unmitigatedAmount`**,
+`hitType`, **`isAoE`**, `tick`, `sourceInstance`, `hitPoints`,
+**`maxHitPoints`**, `armor`, `attackPower`, `spellPower`, `versatility`,
+`avoidance`, `classResources`, `x`, `y`, `facing`, `mapID`, **`buffs`**.
+
+Three of these settle open questions from the brief:
+
+- **`maxHitPoints` is present**, so damage as a fraction of player health *is*
+  reconstructible. The brief said not to guess at this; no guessing needed.
+- **`buffs`** is a dot-separated list of aura IDs active on the target at the
+  moment of the hit (`"384072.386208.132404."`). Defensive uptime can be read
+  straight off a damage event rather than reconstructed by correlating aura
+  timelines — which makes "was a defensive up for this tankbuster" a direct
+  lookup.
+- **`unmitigatedAmount` alongside `mitigated`** separates what the mob swung
+  for from what the tank actually took. That is the difference between
+  measuring danger and measuring mitigation.
+
+### Arguments
+
+28 on `Report.events`, including `sourceInstanceID`, `targetInstanceID`,
+`filterExpression`, `sourceAurasPresent`/`Absent`, `useAbilityIDs`,
+`useActorIDs`, `wipeCutoff`. Only `hostilityType` is used so far, and only to
+make enemy events visible. Server-side filtering stays a Phase-5 optimisation:
+it would discard the raw stream this project exists to preserve.
+
+**Page limit:** 25 was requested for the probe; the documented 10,000 ceiling
+is still untested.
+
+### Pagination semantics — MEASURED, NOT ASSUMED
+
+The brief forbids guessing this. It was measured, on a full traversal of one
++10 Murder Row fight:
+
+| | |
+| --- | --- |
+| **Cursor** | **Exclusive** — `nextPageTimestamp` is past the last timestamp of the previous page |
+| Boundary events repeated | **0** |
+| Pages traversed | 316, at a deliberately tiny 25-event limit |
+| Events returned by API | 7,920 |
+| Events emitted after de-duplication | **7,920** |
+| Boundary repeats dropped | 0 |
+| Out-of-order timestamps | 0 |
+| Largest gap between events | 17.8 s (downtime between pulls; under the 60 s warning threshold) |
+| Warnings | none |
+
+Returned equals emitted: nothing lost, nothing double-counted, across 316
+page boundaries.
+
+**The multiset boundary matching is therefore not load-bearing on this
+endpoint** — an exclusive cursor never re-sends an event. It stays in place
+anyway. It costs nothing when the cursor is exclusive, it is the difference
+between correct and corrupt if the behaviour ever changes or differs by event
+type, and its cost was one design decision rather than an ongoing tax. The
+paginator was built correct under either semantics precisely so this answer
+could be a *measurement* rather than a prerequisite.
+
+Still untested: the real page ceiling (25 was used to force many pages), and
+whether a single timestamp can hold more events than one page — the one case
+that would make pagination genuinely impossible, which the paginator detects
+and raises on rather than silently truncating.
+
+## 8. Report discovery — VERIFIED
 
 Every probed path exists:
 
@@ -243,17 +343,26 @@ encountered yet, so the handling paths are implemented but unexercised.
 
 ---
 
-## 11. Observed API cost — PARTIALLY MEASURED
+## 11. Observed API cost — MEASURED
 
-| Operation | Requests | Points | Bytes |
-| --- | --- | --- | --- |
-| Full schema recon (introspection, zones, discovery probes) | 17 | ~2 | 105 KB |
-| Report metadata / fights / pulls / events | — | not yet measured | — |
+| Operation | Requests | Points | Bytes | Seconds |
+| --- | --- | --- | --- | --- |
+| Full recon incl. 316-page event traversal | 355 | **~29** of 3600/hour | 3.3 MB | 97 |
+| One `report_fights` query | 1 | ≤ 2 (incl. two budget reads) | — | — |
+| Schema-only recon (no report) | 17 | ~2 | 105 KB | 5 |
 
-Event-page cost is the figure that decides the default profile for large
-samples, and it is still unknown.
+**Points are not the binding constraint.** 316 event pages cost roughly 0.05
+points each; the hourly budget of 3600 is nowhere near threatened by event
+collection. The real limits are **wall-clock time and bandwidth**: 97 seconds
+and 3.3 MB for what was still only a sample of one fight.
 
----
+That reverses the planning assumption. `min_points_reserve: 200` is
+over-cautious and can be revisited. What Phase 2 must budget for is runtime and
+disk, not quota — which makes the raw cache more valuable, not less, since a
+re-parse costs nothing while a re-download costs minutes.
+
+**Not yet measured:** the cost and size of a *complete* event download for one
+run at each profile. That is the number that sizes Phase 2.
 
 ## 12. Defects this recon run found in *this project*
 
@@ -363,18 +472,26 @@ now part of the cache key; `query_version` remains a coarse manual override.
 
 ## 13. Open questions
 
-Answered since the first run: the season dungeon list (section 9) and whether
-`ReportData.reports` works unscoped (section 8).
+Answered by the four live runs: field availability, rate-limit shape and cost,
+the season dungeon list, report discovery reach, pull detail, event shapes,
+pagination semantics, and whether max player HP is reconstructible (it is —
+`maxHitPoints` is on every damage event).
 
-1. Do events carry `sourceInstance` / `targetInstance`? *(the project's core
-   requirement; filter arguments suggest yes, unproven)*
-2. Is the event pagination cursor inclusive, and what is the real page ceiling?
-3. Is `keystoneLevel` non-null a reliable Mythic+ marker?
-4. Is `hostilityType` required to retrieve enemy casts?
-5. What does an event page cost in points, by category?
-6. Do pull intervals overlap, and do bosses appear as pulls?
-7. Can enemy health be reconstructed well enough to time an execute phase?
-8. What does `allowUnlisted` change, and does it stay within v1's
-   public-only scope?
-9. Why did unscoped `reports` return `zone: null`? If unscoped results skip
-   Mythic+ reports, zone-scoped discovery is the one to build sampling on.
+Remaining:
+
+1. **Do enemy *cast* events carry `sourceInstance`?** Every other enemy event
+   type does, and a hostility-filtered probe now checks it directly. This is
+   the one fact the project's recast statistics rest on.
+2. What is the real event page ceiling? 10,000 is documented, untested.
+3. What does a *complete* event download cost per run, per profile? This sizes
+   Phase 2, and points are demonstrably not the constraint — time and bytes are.
+4. Do pull intervals overlap, and do bosses appear as `dungeonPulls`?
+5. What share of events falls outside every pull, and what are they?
+6. Can enemy health be reconstructed well enough to time an execute phase?
+   Player `hitPoints`/`maxHitPoints` are present on damage events; whether the
+   same holds for enemies as *targets* of player damage is untested
+   (`DamageDone` was not sampled).
+7. What does `allowUnlisted` change, and does it stay within v1's public-only
+   scope?
+8. Is `keystoneLevel` non-null a reliable Mythic+ marker? It held on this
+   report (13 of 15 fights, levels 8 and 10), but one report is one report.
