@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 #: Software version. Bump on any behavioural change to collection.
-SOFTWARE_VERSION = "0.1.1"
+SOFTWARE_VERSION = "0.1.2"
 
 #: Normalizer version. Bump whenever raw -> normalized mapping changes, so a
 #: rebuild from raw cache is distinguishable from the original ingest.

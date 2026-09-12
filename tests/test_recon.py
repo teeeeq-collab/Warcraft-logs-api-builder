@@ -477,3 +477,89 @@ def test_reports_probe_with_no_usable_scope_raises_a_limitation(recon_factory):
     assert probe["status"] == "NO_USABLE_SCOPE"
     assert probe["attempts"]["zone_scoped"]["status"] == "SKIPPED"
     assert any("without a guild or user scope" in x for x in findings.limitations)
+
+
+# -- permission-gated nested field (live failure regression) --------------
+
+
+def test_known_gated_leaf_never_reaches_the_api(recon_factory):
+    """Regression for the second live recon failure.
+
+    Auto-expanding `owner` to every scalar on `User` picked up `avatar`, which
+    is permission-gated. The live API answered "You do not have permission to
+    view the avatar for this user." with partial data, and the whole report
+    step failed.
+
+    `avatar` is now on the deny-list, so it is never requested and the query
+    succeeds first time -- no retry needed.
+    """
+    recon, sim = recon_factory(WclSimulator(avatar_is_gated=True))
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert findings.steps["report_metadata"]["status"] == "OK", findings.steps[
+        "report_metadata"
+    ].get("error")
+
+    metadata_queries = [q for q, _ in sim.queries_seen if "ReportMetadata" in q]
+    assert len(metadata_queries) == 1, "no retry was needed"
+    assert "avatar" not in metadata_queries[0]
+    assert "owner {" in metadata_queries[0], "owner is still expanded, just without avatar"
+
+
+def test_unknown_gated_leaf_is_dropped_and_the_query_retried(recon_factory):
+    """A gated field the deny-list does not cover must self-heal.
+
+    The deny-list can only hold fields we have already seen fail. This is the
+    general mechanism: any leaf the server names in an error is dropped and the
+    query retried, so an unanticipated permission-gated field costs one extra
+    request rather than a whole round trip with the user.
+    """
+    recon, sim = recon_factory(WclSimulator(avatar_is_gated=False, gated_leaf="compactName"))
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert findings.steps["report_metadata"]["status"] == "OK", findings.steps[
+        "report_metadata"
+    ].get("error")
+
+    metadata_queries = [q for q, _ in sim.queries_seen if "ReportMetadata" in q]
+    assert len(metadata_queries) >= 2, "the query was retried"
+    assert "compactName" in metadata_queries[0], "the first attempt included it"
+    assert "compactName" not in metadata_queries[-1], "the retry dropped it"
+
+    assert findings.steps["report_metadata"]["dropped_fields"] == ["compactName"]
+    assert any("permission-gated" in x for x in findings.limitations)
+
+
+def test_risky_leaves_are_excluded_from_auto_expansion(recon_factory):
+    """Known-gated media fields are not requested in the first place."""
+    from wcl_mplus.schema import SchemaIntrospector
+
+    assert "avatar" in SchemaIntrospector.RISKY_LEAF_NAMES
+
+    recon, sim = recon_factory(WclSimulator(avatar_is_gated=True))
+    recon.introspector.type_info("Report")
+    leaves = recon.introspector.leaf_fields("User")
+    assert "avatar" not in leaves
+    assert "name" in leaves and "id" in leaves
+
+
+def test_a_non_field_error_is_not_retried_forever(recon_factory):
+    """An error naming no selected field fails immediately."""
+    import httpx
+
+    base = WclSimulator()
+
+    def handler(request):
+        import json as _json
+
+        body = _json.loads(request.content.decode())
+        query = body.get("query", "")
+        if "ReportMetadata" in query:
+            return httpx.Response(200, json={"errors": [{"message": "Internal server weirdness"}]})
+        return base.handler(request)
+
+    recon, _ = recon_factory()
+    recon.client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    findings = recon.run(report_code=REPORT_CODE)
+    assert findings.steps["report_metadata"]["status"] == "FAILED"
+    assert "Internal server weirdness" in findings.steps["report_metadata"]["error"]

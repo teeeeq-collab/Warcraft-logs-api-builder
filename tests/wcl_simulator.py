@@ -113,6 +113,16 @@ EVENT_DATA_TYPES = [
 ]
 
 
+def _strip_comments(query: str) -> str:
+    """Drop `#` comment lines.
+
+    A real server parses the document and never sees them, and this project's
+    query files document their own arguments in prose that mentions field
+    names.
+    """
+    return "\n".join(line for line in query.splitlines() if not line.lstrip().startswith("#"))
+
+
 def _type_ref(rendered: str) -> dict[str, Any]:
     """Build an introspection type reference from an SDL-ish string."""
     if rendered.endswith("!"):
@@ -157,6 +167,8 @@ class WclSimulator:
         missing_types: set[str] | None = None,
         event_data_types: list[str] | None = None,
         unscoped_reports_allowed: bool = True,
+        avatar_is_gated: bool = True,
+        gated_leaf: str | None = None,
     ) -> None:
         self.drop_fields = drop_fields or {}
         self.event_page_limit = event_page_limit
@@ -168,6 +180,11 @@ class WclSimulator:
         #: Whether ReportData.reports answers without a guild/user scope.
         #: The live behaviour is unverified, so both outcomes are testable.
         self.unscoped_reports_allowed = unscoped_reports_allowed
+        #: Whether selecting User.avatar fails, as it does live.
+        self.avatar_is_gated = avatar_is_gated
+        #: An extra permission-gated leaf, for exercising the drop-and-retry
+        #: path with a field the deny-list does not already cover.
+        self.gated_leaf = gated_leaf
         self.queries_seen: list[tuple[str, dict[str, Any]]] = []
         self.points_spent = 100.0
         self.cast_events = self._build_cast_events(total_cast_events)
@@ -433,7 +450,10 @@ class WclSimulator:
                     {"isArchived": "Boolean!", "isAccessible": "Boolean!", "archiveDate": "Int"}
                 )
             },
-            "User": {"fields": _fields({"id": "Int!", "name": "String!"})},
+            # `avatar` is permission-gated on the live API: selecting it makes
+            # the server answer "You do not have permission to view the avatar
+            # for this user." and fail the whole query.
+            "User": {"fields": _fields({"id": "Int!", "name": "String!", "avatar": "String"})},
             "Region": {
                 "fields": _fields(
                     {"id": "Int!", "compactName": "String!", "name": "String!", "slug": "String!"}
@@ -837,15 +857,16 @@ class WclSimulator:
                         "name": "Mythic+ Season 2",
                         "frozen": False,
                         "expansion": {"id": 7, "name": "Midnight"},
+                        # The real Season 2 encounter list, observed live.
                         "encounters": [
-                            {"id": 12801, "name": "Murder Row"},
-                            {"id": 12802, "name": "Ruby Life Pools"},
-                            {"id": 12803, "name": "The Blinding Vale"},
-                            {"id": 12804, "name": "Den of Nalorakk"},
-                            {"id": 12805, "name": "Fifth Dungeon"},
-                            {"id": 12806, "name": "Sixth Dungeon"},
-                            {"id": 12807, "name": "Seventh Dungeon"},
-                            {"id": 12808, "name": "Eighth Dungeon"},
+                            {"id": 12993, "name": "Altar of Fangs"},
+                            {"id": 12825, "name": "Den of Nalorakk"},
+                            {"id": 61762, "name": "Kings' Rest"},
+                            {"id": 12813, "name": "Murder Row"},
+                            {"id": 112521, "name": "Ruby Life Pools"},
+                            {"id": 61877, "name": "Temple of Sethraliss"},
+                            {"id": 12859, "name": "The Blinding Vale"},
+                            {"id": 12923, "name": "Voidscar Arena"},
                         ],
                         "difficulties": [{"id": 10, "name": "Mythic+", "sizes": [5]}],
                         "partitions": [
@@ -862,6 +883,29 @@ class WclSimulator:
                         "partitions": [
                             {"id": 1, "name": "Season 1", "compactName": "S1", "default": False}
                         ],
+                    },
+                    {
+                        "id": 37,
+                        "name": "Mythic+ Season 4",
+                        "frozen": True,
+                        "expansion": {"id": 5, "name": "Dragonflight"},
+                        # Reused dungeon name -- the reason name-only matching
+                        # is not enough.
+                        "encounters": [{"id": 62521, "name": "Ruby Life Pools"}],
+                        "difficulties": [{"id": 10, "name": "Mythic+", "sizes": [5]}],
+                        "partitions": [],
+                    },
+                    {
+                        "id": 20,
+                        "name": "Mythic+ Dungeons",
+                        "frozen": True,
+                        "expansion": {"id": 3, "name": "Battle for Azeroth"},
+                        "encounters": [
+                            {"id": 11762, "name": "Kings' Rest"},
+                            {"id": 11877, "name": "Temple of Sethraliss"},
+                        ],
+                        "difficulties": [{"id": 10, "name": "Mythic+", "sizes": [5]}],
+                        "partitions": [],
                     },
                     {
                         "id": 42,
@@ -889,7 +933,7 @@ class WclSimulator:
         "boundingBox": "ReportMapBoundingBox",
     }
 
-    def _validate_selections(self, query: str) -> str | None:
+    def _validate_selections(self, query: str) -> str | None:  # noqa: D401
         """Mimic the server's "must have a sub selection" validation.
 
         The live API rejected a bare `archiveStatus` with
@@ -918,6 +962,26 @@ class WclSimulator:
             problem = self._validate_selections(query)
             if problem:
                 return httpx.Response(200, json={"errors": [{"message": problem}]})
+            # Permission-gated field. The live API returns partial data
+            # alongside the error, which is why the client rejects the whole
+            # response rather than treating half an answer as complete.
+            gated = [f for f in ("avatar" if self.avatar_is_gated else None, self.gated_leaf) if f]
+            body_no_comments = _strip_comments(query)
+            hit = next((f for f in gated if f in body_no_comments), None)
+            if hit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {"reportData": {"report": None}},
+                        "errors": [
+                            {
+                                "message": (
+                                    f"You do not have permission to view the {hit} for this user."
+                                )
+                            }
+                        ],
+                    },
+                )
 
         if "__schema" in query:
             return httpx.Response(200, json={"data": self._type_list()})

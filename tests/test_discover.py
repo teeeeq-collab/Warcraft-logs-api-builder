@@ -82,13 +82,18 @@ def test_dungeons_are_matched_as_encounters_not_zones(settings):
         "ruby-life-pools",
         "the-blinding-vale",
         "den-of-nalorakk",
+        "altar-of-fangs",
+        "voidscar-arena",
+        "temple-of-sethraliss",
+        "kings-rest",
     }
     assert result["unmatched"] == []
+    assert result["ambiguous"] == {}
 
     murder_row = result["matched"]["murder-row"]
     assert murder_row["match_kind"] == "encounter"
     assert murder_row["wcl_zone_id"] == 44, "the season zone containing it"
-    assert murder_row["encounter_ids"] == [12801], "its own encounter ID"
+    assert murder_row["encounter_ids"] == [12813], "its own encounter ID"
     assert murder_row["wcl_zone_name"] == "Mythic+ Season 2"
 
 
@@ -114,7 +119,7 @@ def test_encounter_match_wins_over_zone_match():
     """
     zones = [
         {"id": 10, "name": "Murder Row", "encounters": []},
-        {"id": 44, "name": "Mythic+ Season 2", "encounters": [{"id": 12801, "name": "Murder Row"}]},
+        {"id": 44, "name": "Mythic+ Season 2", "encounters": [{"id": 12813, "name": "Murder Row"}]},
     ]
     result = match_zones(fake_registry("Murder Row"), zones)
     assert result["matched"]["murder-row"]["match_kind"] == "encounter"
@@ -165,7 +170,7 @@ def test_aliases_hitting_the_same_encounter_are_not_ambiguous():
             )()
         ]
 
-    zones = [{"id": 44, "name": "M+ S2", "encounters": [{"id": 12801, "name": "Murder Row"}]}]
+    zones = [{"id": 44, "name": "M+ S2", "encounters": [{"id": 12813, "name": "Murder Row"}]}]
     result = match_zones(Reg(), zones)
     assert result["matched"]["murder-row"]["wcl_zone_id"] == 44
     assert result["ambiguous"] == {}
@@ -200,7 +205,16 @@ def test_write_produces_a_mergeable_overlay(settings, tmp_path):
     assert "GENERATED FILE" in text
     parsed = yaml.safe_load(text)
     keys = {entry["key"] for entry in parsed["dungeons"]}
-    assert keys == {"murder-row", "ruby-life-pools", "the-blinding-vale", "den-of-nalorakk"}
+    assert keys == {
+        "murder-row",
+        "ruby-life-pools",
+        "the-blinding-vale",
+        "den-of-nalorakk",
+        "altar-of-fangs",
+        "voidscar-arena",
+        "temple-of-sethraliss",
+        "kings-rest",
+    }
     assert all(entry["verified"] for entry in parsed["dungeons"])
     assert parsed["season"]["wcl_mplus_zone_id"] == 44
     assert parsed["season"]["verified"] is True
@@ -214,9 +228,71 @@ def test_season_not_verified_while_a_dungeon_is_missing():
 
 
 def test_season_verified_when_every_dungeon_matches():
-    zones = [{"id": 44, "name": "M+ S2", "encounters": [{"id": 12801, "name": "Murder Row"}]}]
+    zones = [{"id": 44, "name": "M+ S2", "encounters": [{"id": 12813, "name": "Murder Row"}]}]
     registry = fake_registry("Murder Row")
     result = match_zones(registry, zones)
     overlay = build_overlay(result, registry)
     assert overlay["season"]["verified"] is True
     assert overlay["season"]["wcl_mplus_zone_id"] == 44
+
+
+# -- reused dungeon names (live ambiguity regression) ---------------------
+
+
+def test_reused_dungeon_names_resolve_to_the_current_season(settings):
+    """Three Season 2 dungeons share a name with an older season.
+
+    Live data: Ruby Life Pools also exists in Dragonflight S1 (zone 32) and S4
+    (zone 37); Kings' Rest and Temple of Sethraliss also exist in Battle for
+    Azeroth (zone 20). Name-only matching reported them as ambiguous and
+    refused to resolve, which is safe but unhelpful. Two-pass matching infers
+    the season zone from the dungeons unique to it, then resolves the rest
+    inside that zone.
+    """
+    registry = DungeonRegistry.load()
+    result = discover_dungeons(build_client(settings, WclSimulator()), registry)
+
+    assert result["ambiguous"] == {}
+    assert result["season_zone_id"] == 44
+    assert result["season_zone_source"] == "inferred"
+
+    for key, expected_encounter in (
+        ("ruby-life-pools", 112521),
+        ("kings-rest", 61762),
+        ("temple-of-sethraliss", 61877),
+    ):
+        item = result["matched"][key]
+        assert item["wcl_zone_id"] == 44, f"{key} must resolve to the season zone"
+        assert item["encounter_ids"] == [expected_encounter]
+        assert item["resolved_via_season_zone"] is True
+
+    assert set(result["resolved_via_season_zone"]) == {
+        "ruby-life-pools",
+        "kings-rest",
+        "temple-of-sethraliss",
+    }
+
+
+def test_configured_season_zone_overrides_inference():
+    """An explicit config pin wins over inference."""
+    zones = [
+        {"id": 32, "name": "Old", "encounters": [{"id": 1, "name": "Ruby Life Pools"}]},
+        {"id": 55, "name": "New", "encounters": [{"id": 2, "name": "Ruby Life Pools"}]},
+    ]
+    registry = fake_registry("Ruby Life Pools")
+    registry.wcl_mplus_zone_id = 32
+    result = match_zones(registry, zones)
+    assert result["season_zone_source"] == "config"
+    assert result["matched"]["ruby-life-pools"]["encounter_ids"] == [1]
+
+
+def test_ambiguity_survives_when_no_season_zone_can_be_inferred():
+    """With nothing to anchor on, the name stays ambiguous rather than guessed."""
+    zones = [
+        {"id": 32, "name": "Old", "encounters": [{"id": 1, "name": "Ruby Life Pools"}]},
+        {"id": 55, "name": "New", "encounters": [{"id": 2, "name": "Ruby Life Pools"}]},
+    ]
+    result = match_zones(fake_registry("Ruby Life Pools"), zones)
+    assert result["matched"] == {}
+    assert result["ambiguous"] == {"ruby-life-pools": [32, 55]}
+    assert result["season_zone_id"] is None

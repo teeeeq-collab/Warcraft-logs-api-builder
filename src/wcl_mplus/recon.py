@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .client import ApiError, GraphQLClient
+from .client import ApiError, GraphQLClient, GraphQLError
 from .configs import ProjectConfig
 from .paginate import EventPaginator, PageResult, event_timestamp
 from .querybuild import (
@@ -42,7 +43,7 @@ from .querybuild import (
     render,
 )
 from .sanitize import sanitize_payload
-from .schema import SchemaIntrospector
+from .schema import SchemaIntrospector, Selection
 from .settings import Settings
 from .version import provenance
 
@@ -132,8 +133,14 @@ class Recon:
 
     # -- helpers ----------------------------------------------------------
 
-    def _selection(self, type_name: str, wanted: list[str]) -> str | None:
-        """Introspection-derived selection set, or None if nothing is usable.
+    def _selection(
+        self,
+        type_name: str,
+        wanted: list[str],
+        *,
+        exclude_leaves: frozenset[str] = frozenset(),
+    ) -> Selection | None:
+        """Introspection-derived selection, or None if nothing is usable.
 
         Warnings (a composite field with no selectable leaves, a field that
         vanished from the schema) become recorded limitations rather than an
@@ -142,10 +149,80 @@ class Recon:
         present = self.introspector.present_fields(type_name, wanted)
         if not present:
             return None
-        selection, warnings = self.introspector.build_selection(type_name, present)
-        for warning in warnings:
+        selection = self.introspector.build_selection(
+            type_name, present, exclude_leaves=exclude_leaves
+        )
+        for warning in selection.warnings:
             self.findings.limitation(warning)
-        return selection or None
+        return selection if selection.text else None
+
+    def _execute_with_leaf_retry(
+        self,
+        *,
+        template: str,
+        placeholder: str,
+        type_name: str,
+        wanted: list[str],
+        variables: dict[str, Any],
+        kind: str,
+        report_code: str | None = None,
+        max_attempts: int = 3,
+    ) -> tuple[dict[str, Any] | None, list[str], str | None]:
+        """Run a query, dropping any nested field the server objects to.
+
+        Some fields are permission-gated in a way introspection does not
+        reveal. Selecting `User.avatar` made the live API answer
+        `You do not have permission to view the avatar for this user.` and
+        fail the entire report query -- costing a whole round trip to discover
+        one unusable field.
+
+        So a field-specific complaint is treated as information: any leaf name
+        mentioned in the error is dropped and the query retried once more.
+        Dropped fields are returned and recorded, never silently swallowed.
+
+        Returns (data, dropped_leaf_names, error). `data` is None on failure.
+        """
+        excluded: set[str] = set()
+        last_error: str | None = None
+
+        for _ in range(max_attempts):
+            selection = self._selection(type_name, wanted, exclude_leaves=frozenset(excluded))
+            if selection is None:
+                return None, sorted(excluded), "no usable fields remain after exclusions"
+            try:
+                data = self.client.execute(
+                    render(template, {placeholder: selection.text}),
+                    variables,
+                    kind=kind,
+                    report_code=report_code,
+                )
+            except GraphQLError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                message = str(exc)
+                # Any leaf we asked for that the server names is a candidate
+                # to drop. Word-boundary match: the complaint is prose, not a
+                # structured field reference.
+                blamed = {
+                    leaf
+                    for leaf in selection.leaves
+                    if leaf not in excluded
+                    and re.search(rf"\b{re.escape(leaf)}\b", message, re.IGNORECASE)
+                }
+                if not blamed:
+                    return None, sorted(excluded), last_error
+                excluded |= blamed
+                logger.warning(
+                    "%s: server objected to %s; dropping and retrying",
+                    kind,
+                    sorted(blamed),
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                return None, sorted(excluded), f"{type(exc).__name__}: {exc}"
+            else:
+                return data, sorted(excluded), None
+
+        return None, sorted(excluded), last_error
 
     def _save_fixture(self, name: str, payload: Any) -> None:
         """Write a sanitized fixture for offline tests."""
@@ -295,20 +372,29 @@ class Recon:
 
     def step_report_metadata(self, report_code: str) -> dict[str, Any] | None:
         fields = self.introspector.present_fields("Report", WANTED_REPORT_FIELDS)
-        selection = self._selection("Report", WANTED_REPORT_FIELDS)
-        if not selection:
+        if not fields:
             self.findings.record("report_metadata", "SKIPPED", reason="no Report fields verified")
             return None
-        try:
-            data = self.client.execute(
-                render("report_metadata", {"REPORT_FIELDS": selection}),
-                {"code": report_code},
-                kind="report_metadata",
-                report_code=report_code,
+
+        data, dropped, error = self._execute_with_leaf_retry(
+            template="report_metadata",
+            placeholder="REPORT_FIELDS",
+            type_name="Report",
+            wanted=WANTED_REPORT_FIELDS,
+            variables={"code": report_code},
+            kind="report_metadata",
+            report_code=report_code,
+        )
+        if dropped:
+            self.findings.limitation(
+                f"Report metadata: nested field(s) {dropped} were rejected by the API "
+                "(typically permission-gated) and dropped from the query. They are not "
+                "available to this client."
             )
-        except Exception as exc:  # noqa: BLE001
-            self.findings.record("report_metadata", "FAILED", error=f"{type(exc).__name__}: {exc}")
+        if data is None:
+            self.findings.record("report_metadata", "FAILED", error=error, dropped_fields=dropped)
             return None
+
         report = ((data.get("reportData") or {}).get("report")) or {}
         if not report:
             self.findings.record(
@@ -322,10 +408,12 @@ class Recon:
                 "the code may be wrong. Private reports are out of scope for v1."
             )
             return None
+
         self.findings.record(
             "report_metadata",
             "OK",
             requested_fields=fields,
+            dropped_fields=dropped,
             returned_keys=sorted(report),
             archive_status=report.get("archiveStatus"),
             visibility=report.get("visibility"),
@@ -345,12 +433,12 @@ class Recon:
     def step_fights(self, report_code: str) -> list[dict[str, Any]]:
         fields = self.introspector.present_fields("ReportFight", WANTED_FIGHT_FIELDS)
         selection = self._selection("ReportFight", WANTED_FIGHT_FIELDS)
-        if not selection:
+        if selection is None:
             self.findings.record("fights", "SKIPPED", reason="no ReportFight fields verified")
             return []
         try:
             data = self.client.execute(
-                render("report_fights", {"FIGHT_FIELDS": selection}),
+                render("report_fights", {"FIGHT_FIELDS": selection.text}),
                 {"code": report_code},
                 kind="report_fights",
                 report_code=report_code,
@@ -388,7 +476,7 @@ class Recon:
         )
         pull_selection = self._selection("ReportDungeonPull", WANTED_PULL_FIELDS)
         npc_selection = self._selection("ReportDungeonPullNPC", WANTED_PULL_NPC_FIELDS)
-        if not pull_selection or not npc_selection:
+        if pull_selection is None or npc_selection is None:
             self.findings.record(
                 "dungeon_pulls",
                 "SKIPPED",
@@ -401,7 +489,10 @@ class Recon:
             data = self.client.execute(
                 render(
                     "report_dungeon_pulls",
-                    {"PULL_FIELDS": pull_selection, "PULL_NPC_FIELDS": npc_selection},
+                    {
+                        "PULL_FIELDS": pull_selection.text,
+                        "PULL_NPC_FIELDS": npc_selection.text,
+                    },
                 ),
                 {"code": report_code, "fightIDs": [fight_id]},
                 kind="report_dungeon_pulls",
@@ -713,12 +804,12 @@ class Recon:
     def step_query_cost(self, report_code: str) -> None:
         """Measure the point cost of a representative query."""
         selection = self._selection("ReportFight", WANTED_FIGHT_FIELDS)
-        if not selection:
+        if selection is None:
             self.findings.record("query_cost", "SKIPPED", reason="fight fields unverified")
             return
         try:
             measurement = self.client.measure_query_cost(
-                render("report_fights", {"FIGHT_FIELDS": selection}),
+                render("report_fights", {"FIGHT_FIELDS": selection.text}),
                 {"code": report_code},
                 kind="cost_probe_report_fights",
             )

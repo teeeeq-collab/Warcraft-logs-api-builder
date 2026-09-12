@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .client import GraphQLClient
@@ -150,6 +150,19 @@ class TypeInfo:
             "fields": {n: self.field_type(n) for n in sorted(self.fields)},
             "enum_values": self.enum_values,
         }
+
+
+class Selection(NamedTuple):
+    """A rendered selection set plus what went into it.
+
+    `leaves` lists the nested field names requested inside auto-expanded
+    sub-selections, so a caller that gets a field-specific error from the
+    server can drop the offending name and rebuild.
+    """
+
+    text: str
+    warnings: list[str]
+    leaves: frozenset[str]
 
 
 @dataclass
@@ -301,6 +314,16 @@ class SchemaIntrospector:
     #: Type kinds that require a sub-selection in a GraphQL query.
     COMPOSITE_KINDS = frozenset({"OBJECT", "INTERFACE", "UNION"})
 
+    #: Leaf fields never requested inside an auto-expanded sub-selection.
+    #:
+    #: These are **observed** problems, not guesses. `User.avatar` is
+    #: permission-gated: selecting it made the live API answer
+    #: `You do not have permission to view the avatar for this user.` and fail
+    #: the whole report query. The rest are media/URL fields of no research
+    #: value that carry the same risk. Anything not anticipated here is caught
+    #: by the drop-and-retry in recon.
+    RISKY_LEAF_NAMES = frozenset({"avatar", "icon", "image", "thumbnail", "logo", "url", "banner"})
+
     def field_kind(self, type_name: str, field_name: str) -> str | None:
         """Introspected kind of a field's underlying named type."""
         info = self.type_info(type_name)
@@ -311,18 +334,29 @@ class SchemaIntrospector:
             return None
         return unwrap_type_kind(raw.get("type"))
 
-    def leaf_fields(self, type_name: str) -> list[str]:
+    def leaf_fields(
+        self, type_name: str, *, exclude: frozenset[str] | set[str] = frozenset()
+    ) -> list[str]:
         """Scalar and enum fields of a type, usable as a sub-selection.
 
-        Fields taking arguments are excluded: a required argument we cannot
-        supply would make the query invalid, and an optional one changes
-        semantics we have not verified.
+        Three kinds of field are left out:
+
+        * fields taking arguments -- a required argument we cannot supply would
+          make the query invalid, and an optional one changes semantics we have
+          not verified;
+        * `RISKY_LEAF_NAMES`, which are observed to be permission-gated or are
+          media fields of no research value;
+        * anything in `exclude`, which is how recon drops a field the server
+          complained about and retries.
         """
         info = self.type_info(type_name)
         if info is None:
             return []
+        skip = self.RISKY_LEAF_NAMES | set(exclude)
         leaves: list[str] = []
         for name in sorted(info.fields):
+            if name in skip:
+                continue
             raw = info.fields[name]
             if raw.get("args"):
                 continue
@@ -331,8 +365,13 @@ class SchemaIntrospector:
         return leaves
 
     def build_selection(
-        self, type_name: str, field_names: list[str], *, indent: str = "        "
-    ) -> tuple[str, list[str]]:
+        self,
+        type_name: str,
+        field_names: list[str],
+        *,
+        indent: str = "        ",
+        exclude_leaves: frozenset[str] | set[str] = frozenset(),
+    ) -> Selection:
         """Render a GraphQL selection set for `field_names` on `type_name`.
 
         Whether a field needs a sub-selection is decided by **introspection**,
@@ -341,14 +380,16 @@ class SchemaIntrospector:
         with `Field "archiveStatus" ... must have a sub selection`.
 
         A composite field is expanded to its scalar and enum fields, one level
-        deep. A composite whose type exposes no usable leaves is skipped and
-        named in the returned warnings, because a field selected without a
-        sub-selection would make the whole query invalid.
+        deep, minus `RISKY_LEAF_NAMES` and `exclude_leaves`. A composite whose
+        type exposes no usable leaves is skipped and named in the warnings,
+        because selecting it bare would invalidate the whole query.
 
-        Returns (selection text, warnings).
+        The returned `leaves` are the nested field names actually requested,
+        which lets a caller drop one the server objects to and retry.
         """
         parts: list[str] = []
         warnings: list[str] = []
+        leaves_used: set[str] = set()
         for name in field_names:
             kind = self.field_kind(type_name, name)
             if kind is None:
@@ -360,12 +401,18 @@ class SchemaIntrospector:
             parent = self.type_info(type_name)
             raw = parent.fields.get(name) if parent else None
             named = unwrap_type_name(raw.get("type")) if raw else None
-            leaves = self.leaf_fields(named) if named else []
+            leaves = self.leaf_fields(named, exclude=exclude_leaves) if named else []
             if not leaves:
                 warnings.append(
                     f"{type_name}.{name}: type {named!r} is composite but exposes no "
-                    "scalar fields to select; skipped rather than sending an invalid query"
+                    "usable scalar fields to select; skipped rather than sending an "
+                    "invalid query"
                 )
                 continue
             parts.append(f"{name} {{ {' '.join(leaves)} }}")
-        return ("\n" + indent).join(parts), warnings
+            leaves_used.update(leaves)
+        return Selection(
+            text=("\n" + indent).join(parts),
+            warnings=warnings,
+            leaves=frozenset(leaves_used),
+        )

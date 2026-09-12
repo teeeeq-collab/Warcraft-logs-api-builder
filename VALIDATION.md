@@ -208,19 +208,22 @@ written to disk.
    per-instance identity in events remain unverified. (B1)
 2. **No pull data has been observed.** Field availability is confirmed;
    interval contiguity, boss representation and event-assignment rates are not.
-3. **The season dungeon list is still unknown.** 44 zones were counted but
-   their names were not recorded by the first run. Recon now saves a full
-   `zone_inventory`.
+3. **The season dungeon list is RESOLVED.** Midnight Season 2 is zone 55 with
+   eight encounters, confirmed from the API and by the project owner. Three
+   names are reused from earlier seasons and are resolved by two-pass matching,
+   never by name alone.
 4. **`Report.gameVersion` does not exist.** Unused by the research design.
+   **`User.avatar` is permission-gated** and is not available to this client;
+   it is excluded from queries.
 5. **Enemy health availability is unknown**, which would make execute-phase
    duration (V3) and health-threshold phases (V6) unmeasurable.
 6. **Event-page cost is unmeasured.** Schema work costs ~2 points per recon, so
    the budget will be dominated by event pages. No default profile can be
    recommended for large samples yet.
-7. **Discovery reach is being probed.** `ReportData.reports` accepts
-   `zoneID`/`gameZoneID` with guild and user optional, which may allow broad
-   sampling; a probe now makes the real call. `ManualReportSource` works
-   regardless.
+7. **Discovery reach is CONFIRMED BROAD.** `ReportData.reports` answers both
+   unscoped and zone-scoped with no guild or user seed, so representative
+   season-wide sampling is available rather than leaderboard-only. Note
+   `total` is `-1`, so sample size must be counted, not read.
 8. **No database exists.** Schema version 0. `DATA_DICTIONARY.md` is a design.
 9. **Report-code parsing is permissive** by design: any 8–32 character
    alphanumeric token is accepted. Use `wclmplus report-list-check` first.

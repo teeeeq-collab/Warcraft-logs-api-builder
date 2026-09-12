@@ -9,6 +9,70 @@ recorded here.
 
 ---
 
+## 0.1.2 — 2026-09-12
+
+Second live run. Two more defects found and fixed; the season is identified and
+broad report discovery is confirmed.
+
+- `software_version` 0.1.1 → 0.1.2
+- `query_version` unchanged at 2
+- `schema_version` unchanged at 0
+
+### Fixed
+
+- **A permission-gated field inside an auto-expanded selection.** Expanding
+  every composite to *all* its scalar fields pulled in `User.avatar`, which is
+  permission-gated in a way introspection does not reveal. The API returned
+  partial data plus `You do not have permission to view the avatar for this
+  user.`, and the client correctly refused to treat half an answer as
+  complete — so the report step failed again, on a new cause.
+
+  Two layers: a deny-list of observed-gated and media field names
+  (`SchemaIntrospector.RISKY_LEAF_NAMES`), and `Recon._execute_with_leaf_retry`,
+  which drops any leaf the server names in an error and retries. The deny-list
+  can only hold what is already known to fail; the retry covers the rest, so an
+  unanticipated gated field costs one extra request rather than a whole round
+  trip. Dropped fields are recorded as limitations.
+
+- **Reused dungeon names were reported as unresolvable.** Ruby Life Pools also
+  exists in Dragonflight S1 and S4; Kings' Rest and Temple of Sethraliss also
+  exist in Battle for Azeroth. Name-only matching refused to choose — safe, but
+  it left season dungeons unidentified. `match_zones` now runs two passes:
+  match the dungeons unique to the season, infer the season zone from where
+  they agree (or read `season.wcl_mplus_zone_id` from config), then resolve the
+  reused names inside that zone. All eight now resolve with no ambiguity, and a
+  name still ambiguous after pass 2 is reported rather than guessed.
+
+### Changed
+
+- `config/dungeons.yml` now lists all **eight** Midnight Season 2 dungeons,
+  using Warcraft Logs' exact spellings with alternatives as aliases (notably
+  `Kings' Rest`). Every numeric ID stays `null`: IDs come from
+  `discover-dungeons --write`, never from source.
+
+### Verified against the live API
+
+- **Midnight Season 2 is zone 55** (expansion 7, partition S2, not frozen),
+  with eight encounters: Altar of Fangs (12993), Den of Nalorakk (12825),
+  Kings' Rest (61762), Murder Row (12813), Ruby Life Pools (112521), Temple of
+  Sethraliss (61877), The Blinding Vale (12859), Voidscar Arena (12923).
+  Confirmed independently by the project owner.
+- **Report discovery works without a guild or user scope**, both unscoped and
+  zone-scoped, with `has_more_pages: true`. Representative season-wide sampling
+  is therefore possible — the most consequential finding for the research
+  design, since it removes the forced leaderboard and single-guild bias.
+- `ReportPagination.total` is **`-1`**: not a usable denominator. Sample size
+  must be counted from what is actually fetched.
+- Eight expansions, newest first, Midnight (7) current.
+- Cost: 22 requests ≈ 23 points of 3600 per hour.
+
+### Still unverified
+
+Event shape, pagination semantics, per-instance identity *in events*, pull
+content and event-page cost. All need one more recon run.
+
+---
+
 ## 0.1.1 — 2026-09-12
 
 First live API contact. Two defects found and fixed, plus one reporting bug.

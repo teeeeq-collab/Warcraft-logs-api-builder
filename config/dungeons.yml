@@ -1,36 +1,44 @@
 # ---------------------------------------------------------------------------
 # Dungeon registry — Midnight Season 2 Mythic+
 # ---------------------------------------------------------------------------
-# IMPORTANT: every numeric ID below is DELIBERATELY UNSET (null / []).
+# The eight dungeons below were confirmed from the LIVE Warcraft Logs API on
+# 2026-09-12 (zone 55, "Mythic+ Season 2", expansion 7 "Midnight"), and
+# independently confirmed by the project owner.
 #
-# Warcraft Logs zone IDs, encounter IDs and the exact season dungeon list are
-# NOT hardcoded from memory in this project (see brief section 33 and 54).
-# They are discovered from the live API and written back into this file by:
+# Numeric IDs are still DELIBERATELY UNSET here. They are not hardcoded in
+# this project (brief sections 33 and 54); they are written to the generated
+# overlay `config/dungeons.discovered.yml` by:
 #
 #     wclmplus discover-dungeons --write
 #
-# That command queries `worldData` for the current Mythic+ zone, lists its
-# encounters, and fills in `wcl_zone_id`, `encounter_ids` and `verified: true`.
-# Until then, any code path needing an ID must fail loudly rather than guess.
+# which is merged over this file at load time. `display_name` uses the exact
+# Warcraft Logs spelling, because matching is by that name; common alternative
+# spellings go in `aliases`.
 #
-# `aliases` are matched case-insensitively by the CLI (`--dungeon "murder row"`),
-# so they work before IDs are known.
+# THREE OF THESE DUNGEON NAMES ARE REUSED FROM EARLIER SEASONS:
+#   Ruby Life Pools      also Dragonflight S1 (zone 32) and S4 (zone 37)
+#   Kings' Rest          also Battle for Azeroth (zone 20)
+#   Temple of Sethraliss also Battle for Azeroth (zone 20)
+# A name alone is therefore not enough to identify a dungeon. `match_zones`
+# infers the current season zone from the dungeons that are unique to it, then
+# resolves the reused names inside that zone. Pin `wcl_mplus_zone_id` below if
+# you ever need to override that inference.
 # ---------------------------------------------------------------------------
 
 season:
   id: midnight-s2
   display_name: "Midnight Season 2"
-  # The WCL zone that contains the season's Mythic+ partition. Discovered, not assumed.
+  # Observed live as 55. Left null so the value comes from discovery, not from
+  # source. Set it explicitly only to override the inference.
   wcl_mplus_zone_id: null
   expected_dungeon_count: 8
   verified: false
   notes: >-
-    Season composition is unverified in this repository. Four dungeons are named
-    in the research brief; the remaining slots must be filled from the live API
-    before any season-wide collection is attempted.
+    Dungeon list confirmed from the live API and by the project owner on
+    2026-09-12. Zone and encounter IDs come from `discover-dungeons --write`.
 
 dungeons:
-  # --- Named in the research brief (validation targets) ---
+  # --- Validation targets named in the research brief ---
   - key: murder-row
     display_name: "Murder Row"
     aliases: ["murder row", "murderrow", "mr"]
@@ -58,6 +66,9 @@ dungeons:
     encounter_ids: []
     verified: false
     role: cross-validation       # Phase 3 target
+    notes: >-
+      Name reused from Dragonflight S1/S4. Resolved to the current season zone
+      by two-pass matching; never match this one on name alone.
     validation_targets:
       - npc: "Thunderhead"
         npc_game_id: null
@@ -102,6 +113,45 @@ dungeons:
           health-threshold / phase-change validation case, contingent on whether
           enemy resource (health) data is reliably exposed in events.
 
-  # --- Remaining season slots: unknown, to be discovered ---
-  # `wclmplus discover-dungeons --write` appends the real season dungeon list
-  # here. Do not invent entries by hand.
+  # --- The remaining four, confirmed from the live API 2026-09-12 ---
+  - key: altar-of-fangs
+    display_name: "Altar of Fangs"
+    aliases: ["altar of fangs", "aof", "altar"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: season-coverage
+    validation_targets: []
+
+  - key: voidscar-arena
+    display_name: "Voidscar Arena"
+    aliases: ["voidscar arena", "voidscar", "va"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: season-coverage
+    validation_targets: []
+
+  - key: temple-of-sethraliss
+    display_name: "Temple of Sethraliss"
+    aliases: ["temple of sethraliss", "sethraliss", "tos"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: season-coverage
+    notes: >-
+      Name reused from Battle for Azeroth (zone 20). Resolved to the current
+      season zone by two-pass matching.
+    validation_targets: []
+
+  - key: kings-rest
+    display_name: "Kings' Rest"
+    aliases: ["kings' rest", "king's rest", "kings rest", "kr"]
+    wcl_zone_id: null
+    encounter_ids: []
+    verified: false
+    role: season-coverage
+    notes: >-
+      Warcraft Logs spells this "Kings' Rest" (apostrophe after the s); other
+      spellings are aliases. Name reused from Battle for Azeroth (zone 20).
+    validation_targets: []
