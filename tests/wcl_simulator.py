@@ -17,6 +17,7 @@ wins" is tested.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -155,6 +156,7 @@ class WclSimulator:
         total_cast_events: int = 60,
         missing_types: set[str] | None = None,
         event_data_types: list[str] | None = None,
+        unscoped_reports_allowed: bool = True,
     ) -> None:
         self.drop_fields = drop_fields or {}
         self.event_page_limit = event_page_limit
@@ -163,6 +165,9 @@ class WclSimulator:
         self.event_data_types = (
             event_data_types if event_data_types is not None else list(EVENT_DATA_TYPES)
         )
+        #: Whether ReportData.reports answers without a guild/user scope.
+        #: The live behaviour is unverified, so both outcomes are testable.
+        self.unscoped_reports_allowed = unscoped_reports_allowed
         self.queries_seen: list[tuple[str, dict[str, Any]]] = []
         self.points_spent = 100.0
         self.cast_events = self._build_cast_events(total_cast_events)
@@ -237,6 +242,15 @@ class WclSimulator:
             ("Character", "OBJECT"),
             ("GuildData", "OBJECT"),
             ("Guild", "OBJECT"),
+            ("ReportArchiveStatus", "OBJECT"),
+            ("User", "OBJECT"),
+            ("Region", "OBJECT"),
+            ("GameZone", "OBJECT"),
+            ("ReportMap", "OBJECT"),
+            ("ReportMapBoundingBox", "OBJECT"),
+            ("Expansion", "OBJECT"),
+            ("Difficulty", "OBJECT"),
+            ("Partition", "OBJECT"),
         ]
         return {
             "__schema": {
@@ -409,6 +423,36 @@ class WclSimulator:
                         "characterData": "CharacterData",
                         "guildData": "GuildData",
                         "rateLimitData": "RateLimitData",
+                    }
+                )
+            },
+            # Composite types reachable from the field wish-lists. Each needs a
+            # sub-selection -- which the live API taught us the hard way.
+            "ReportArchiveStatus": {
+                "fields": _fields(
+                    {"isArchived": "Boolean!", "isAccessible": "Boolean!", "archiveDate": "Int"}
+                )
+            },
+            "User": {"fields": _fields({"id": "Int!", "name": "String!"})},
+            "Region": {
+                "fields": _fields(
+                    {"id": "Int!", "compactName": "String!", "name": "String!", "slug": "String!"}
+                )
+            },
+            "GameZone": {"fields": _fields({"id": "Int!", "name": "String"})},
+            "ReportMap": {"fields": _fields({"id": "Int!"})},
+            "ReportMapBoundingBox": {
+                "fields": _fields({"minX": "Int!", "minY": "Int!", "maxX": "Int!", "maxY": "Int!"})
+            },
+            "Expansion": {"fields": _fields({"id": "Int!", "name": "String!"})},
+            "Difficulty": {"fields": _fields({"id": "Int!", "name": "String!"})},
+            "Partition": {
+                "fields": _fields(
+                    {
+                        "id": "Int!",
+                        "name": "String!",
+                        "compactName": "String!",
+                        "default": "Boolean!",
                     }
                 )
             },
@@ -763,18 +807,45 @@ class WclSimulator:
         }
 
     def _world_zones(self) -> dict[str, Any]:
+        """Zones as the live API shapes them.
+
+        Two details are modelled from the real response, both of which broke
+        an earlier version of this project:
+
+        * **Expansions come back newest first.** Reporting code that took the
+          last six entries printed the six OLDEST expansions and hid the
+          current one entirely.
+        * **A Mythic+ season is one zone whose encounters are the dungeons**,
+          not one zone per dungeon. Matching dungeon names against zone names
+          therefore matches nothing at all.
+        """
         return {
             "worldData": {
-                "expansions": [{"id": 6, "name": "Dragonflight"}, {"id": 7, "name": "Midnight"}],
+                "expansions": [
+                    {"id": 7, "name": "Midnight"},
+                    {"id": 6, "name": "The War Within"},
+                    {"id": 5, "name": "Dragonflight"},
+                    {"id": 4, "name": "Shadowlands"},
+                    {"id": 3, "name": "Battle for Azeroth"},
+                    {"id": 2, "name": "Legion"},
+                    {"id": 1, "name": "Warlords of Draenor"},
+                    {"id": 0, "name": "Mists of Pandaria"},
+                ],
                 "zones": [
                     {
                         "id": 44,
-                        "name": "Murder Row",
+                        "name": "Mythic+ Season 2",
                         "frozen": False,
                         "expansion": {"id": 7, "name": "Midnight"},
                         "encounters": [
-                            {"id": 12801, "name": "Boss One"},
-                            {"id": 12802, "name": "Boss Two"},
+                            {"id": 12801, "name": "Murder Row"},
+                            {"id": 12802, "name": "Ruby Life Pools"},
+                            {"id": 12803, "name": "The Blinding Vale"},
+                            {"id": 12804, "name": "Den of Nalorakk"},
+                            {"id": 12805, "name": "Fifth Dungeon"},
+                            {"id": 12806, "name": "Sixth Dungeon"},
+                            {"id": 12807, "name": "Seventh Dungeon"},
+                            {"id": 12808, "name": "Eighth Dungeon"},
                         ],
                         "difficulties": [{"id": 10, "name": "Mythic+", "sizes": [5]}],
                         "partitions": [
@@ -782,15 +853,24 @@ class WclSimulator:
                         ],
                     },
                     {
-                        "id": 45,
-                        "name": "Ruby Life Pools",
-                        "frozen": False,
+                        "id": 43,
+                        "name": "Mythic+ Season 1",
+                        "frozen": True,
                         "expansion": {"id": 7, "name": "Midnight"},
-                        "encounters": [{"id": 12811, "name": "Melidrussa Chillworn"}],
+                        "encounters": [{"id": 12701, "name": "Some Old Dungeon"}],
                         "difficulties": [{"id": 10, "name": "Mythic+", "sizes": [5]}],
                         "partitions": [
-                            {"id": 2, "name": "Season 2", "compactName": "S2", "default": True}
+                            {"id": 1, "name": "Season 1", "compactName": "S1", "default": False}
                         ],
+                    },
+                    {
+                        "id": 42,
+                        "name": "A Raid Tier",
+                        "frozen": False,
+                        "expansion": {"id": 7, "name": "Midnight"},
+                        "encounters": [{"id": 12601, "name": "Some Raid Boss"}],
+                        "difficulties": [{"id": 5, "name": "Mythic", "sizes": [20]}],
+                        "partitions": [],
                     },
                 ],
             }
@@ -798,12 +878,46 @@ class WclSimulator:
 
     # -- transport -------------------------------------------------------
 
+    #: Composite field name -> its type, for the validation check below.
+    COMPOSITE_FIELDS = {
+        "archiveStatus": "ReportArchiveStatus",
+        "zone": "Zone",
+        "gameZone": "GameZone",
+        "owner": "User",
+        "region": "Region",
+        "maps": "ReportMap",
+        "boundingBox": "ReportMapBoundingBox",
+    }
+
+    def _validate_selections(self, query: str) -> str | None:
+        """Mimic the server's "must have a sub selection" validation.
+
+        The live API rejected a bare `archiveStatus` with
+        `Field "archiveStatus" of type "ReportArchiveStatus" must have a sub
+        selection.`, which aborted recon partway through. Enforcing the same
+        rule here keeps that class of bug caught offline.
+        """
+        # Strip `#` comments first: a real server parses the document and
+        # never sees them, and the project's queries document their own
+        # arguments in comments that mention field names in prose.
+        body = "\n".join(line for line in query.splitlines() if not line.lstrip().startswith("#"))
+        for field, type_name in self.COMPOSITE_FIELDS.items():
+            if re.search(rf"\b{field}\b(?!\s*(?:\{{|\(|:))", body):
+                return f'Field "{field}" of type "{type_name}" must have a sub selection.'
+        return None
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
         query = body.get("query") or ""
         variables = body.get("variables") or {}
         self.queries_seen.append((query, variables))
         self.points_spent += 1.0
+
+        # Introspection queries name types, not fields, so skip the check.
+        if "__schema" not in query and "__type(" not in query:
+            problem = self._validate_selections(query)
+            if problem:
+                return httpx.Response(200, json={"errors": [{"message": problem}]})
 
         if "__schema" in query:
             return httpx.Response(200, json={"data": self._type_list()})
@@ -824,6 +938,36 @@ class WclSimulator:
             )
         if "worldData" in query:
             return httpx.Response(200, json={"data": self._world_zones()})
+        if "ReportsProbe" in query:
+            if not self.unscoped_reports_allowed and not variables.get("zoneID"):
+                return httpx.Response(
+                    200,
+                    json={"errors": [{"message": "You must specify a guildID or userID."}]},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "reportData": {
+                            "reports": {
+                                "total": 812,
+                                "per_page": 3,
+                                "current_page": 1,
+                                "has_more_pages": True,
+                                "data": [
+                                    {
+                                        "code": f"Probe{index:012d}",
+                                        "startTime": 1_768_000_000_000 + index,
+                                        "endTime": 1_768_002_000_000 + index,
+                                        "zone": {"id": 44, "name": "Mythic+ Season 2"},
+                                    }
+                                    for index in range(3)
+                                ],
+                            }
+                        }
+                    }
+                },
+            )
         if "masterData" in query:
             return httpx.Response(200, json={"data": self._master_data()})
         if "events(" in query:

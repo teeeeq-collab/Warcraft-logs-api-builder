@@ -9,6 +9,86 @@ recorded here.
 
 ---
 
+## 0.1.1 — 2026-09-12
+
+First live API contact. Two defects found and fixed, plus one reporting bug.
+
+- `software_version` 0.1.0 → 0.1.1
+- `query_version` 1 → 2 (report metadata, fights and pull queries now carry
+  introspection-derived sub-selections; a new discovery probe query was added)
+- `schema_version` unchanged at 0
+- `normalizer_version` unchanged at 1
+
+### Fixed
+
+- **Composite fields were selected without a sub-selection.** The live API
+  rejected the report query with `Field "archiveStatus" of type
+  "ReportArchiveStatus" must have a sub selection.`, aborting recon before
+  fights, pulls, events, pagination and cost were probed.
+
+  Root cause: sub-selections came from a hardcoded map of field names *assumed*
+  to be objects, which is exactly the guessing this project forbids.
+  `SchemaIntrospector.build_selection` now asks introspection for each field's
+  type kind and expands any composite to its scalar and enum fields. A
+  composite offering no scalars is skipped and recorded rather than sent bare.
+  Classification reads the kind from the field's own type reference rather than
+  the schema type list, since built-in scalars are not reliably enumerated
+  there.
+
+- **Mythic+ dungeons were matched against zone names.** `discover-dungeons`
+  matched 0 of 4 configured dungeons against the live API. A Mythic+ season is
+  **one zone whose `encounters` are the dungeons**, not one zone per dungeon.
+  `match_zones` now searches encounters first, falls back to zone names,
+  records which way each match was found, derives the season zone when all
+  dungeons agree, and reports a name appearing in two seasons as ambiguous
+  instead of resolving it.
+
+- **The expansion list was truncated from the wrong end.** The API returns
+  expansions newest first; reporting took the last six entries and so printed
+  the six *oldest*, hiding the current expansion and making the season look
+  absent from the API. Now sorted by ID descending with nothing dropped.
+
+### Added
+
+- `recon`: a `reports_probe` step that makes real unscoped and zone-scoped
+  `ReportData.reports` calls. Introspection showed `guildID` and `userID` are
+  optional alongside `zoneID`/`gameZoneID`, so broad sampling may be possible —
+  but argument presence is not behaviour, and representative sampling is a
+  stated research requirement.
+- `recon`: `zone_inventory` in the findings — every zone with its encounter
+  names, so a season's dungeon list can be identified without a second run.
+- `queries/discover_reports_probe.graphql`.
+- Regression tests for all three defects. The simulator now enforces the
+  server's sub-selection rule and models a Mythic+ season as one zone with
+  dungeon encounters, so these cannot regress silently. 216 → 232 tests.
+
+### Verified against the live API
+
+- Auth, and a token lifetime of **360 days**, not the assumed hour.
+- Rate limiting: `limitPerHour` 3600, `pointsSpentThisHour`, `pointsResetIn` —
+  all hypothesised names correct. A 17-request recon cost **~2 points**.
+- `ReportFight` 23/23 wanted fields, including every Mythic+ field
+  (`keystoneLevel`, `keystoneAffixes`, `keystoneTime`, `countReached`,
+  `countRequired`, `averageItemLevel`, `npcCountMap`, `gameZone`).
+  `rating` is `Float`, not `Int`.
+- `ReportDungeonPull` 10/10 and `ReportDungeonPullNPC` 6/6 — the pull-level
+  half of the NPC-instance-identity requirement is available.
+- `EventDataType`: all 14 hypothesised values exist.
+- `Report.gameVersion` does not exist (unused).
+- `Report.events` accepts 28 arguments including `sourceInstanceID`,
+  `targetInstanceID`, `filterExpression` and the aura-presence filters. None is
+  used yet: server-side filtering would discard the raw stream this project
+  exists to preserve.
+- No credential appeared anywhere in live output, reports or fixtures.
+
+### Still unverified
+
+Event shape, pagination semantics, per-instance identity *in events*, pull
+content, event-page cost, and the eight Season 2 dungeon identities. All need
+one more recon run.
+
+---
+
 ## 0.1.0 — 2026-09-12
 
 First commit. Phase 0 (API reconnaissance) implementation.

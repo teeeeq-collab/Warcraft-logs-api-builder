@@ -132,6 +132,21 @@ class Recon:
 
     # -- helpers ----------------------------------------------------------
 
+    def _selection(self, type_name: str, wanted: list[str]) -> str | None:
+        """Introspection-derived selection set, or None if nothing is usable.
+
+        Warnings (a composite field with no selectable leaves, a field that
+        vanished from the schema) become recorded limitations rather than an
+        invalid query.
+        """
+        present = self.introspector.present_fields(type_name, wanted)
+        if not present:
+            return None
+        selection, warnings = self.introspector.build_selection(type_name, present)
+        for warning in warnings:
+            self.findings.limitation(warning)
+        return selection or None
+
     def _save_fixture(self, name: str, payload: Any) -> None:
         """Write a sanitized fixture for offline tests."""
         if not self.write_fixtures:
@@ -280,12 +295,13 @@ class Recon:
 
     def step_report_metadata(self, report_code: str) -> dict[str, Any] | None:
         fields = self.introspector.present_fields("Report", WANTED_REPORT_FIELDS)
-        if not fields:
+        selection = self._selection("Report", WANTED_REPORT_FIELDS)
+        if not selection:
             self.findings.record("report_metadata", "SKIPPED", reason="no Report fields verified")
             return None
         try:
             data = self.client.execute(
-                render("report_metadata", {"REPORT_FIELDS": fields}),
+                render("report_metadata", {"REPORT_FIELDS": selection}),
                 {"code": report_code},
                 kind="report_metadata",
                 report_code=report_code,
@@ -328,12 +344,13 @@ class Recon:
 
     def step_fights(self, report_code: str) -> list[dict[str, Any]]:
         fields = self.introspector.present_fields("ReportFight", WANTED_FIGHT_FIELDS)
-        if not fields:
+        selection = self._selection("ReportFight", WANTED_FIGHT_FIELDS)
+        if not selection:
             self.findings.record("fights", "SKIPPED", reason="no ReportFight fields verified")
             return []
         try:
             data = self.client.execute(
-                render("report_fights", {"FIGHT_FIELDS": fields}),
+                render("report_fights", {"FIGHT_FIELDS": selection}),
                 {"code": report_code},
                 kind="report_fights",
                 report_code=report_code,
@@ -369,7 +386,9 @@ class Recon:
         npc_fields = self.introspector.present_fields(
             "ReportDungeonPullNPC", WANTED_PULL_NPC_FIELDS
         )
-        if not pull_fields or not npc_fields:
+        pull_selection = self._selection("ReportDungeonPull", WANTED_PULL_FIELDS)
+        npc_selection = self._selection("ReportDungeonPullNPC", WANTED_PULL_NPC_FIELDS)
+        if not pull_selection or not npc_selection:
             self.findings.record(
                 "dungeon_pulls",
                 "SKIPPED",
@@ -382,7 +401,7 @@ class Recon:
             data = self.client.execute(
                 render(
                     "report_dungeon_pulls",
-                    {"PULL_FIELDS": pull_fields, "PULL_NPC_FIELDS": npc_fields},
+                    {"PULL_FIELDS": pull_selection, "PULL_NPC_FIELDS": npc_selection},
                 ),
                 {"code": report_code, "fightIDs": [fight_id]},
                 kind="report_dungeon_pulls",
@@ -693,13 +712,13 @@ class Recon:
 
     def step_query_cost(self, report_code: str) -> None:
         """Measure the point cost of a representative query."""
-        fields = self.introspector.present_fields("ReportFight", WANTED_FIGHT_FIELDS)
-        if not fields:
+        selection = self._selection("ReportFight", WANTED_FIGHT_FIELDS)
+        if not selection:
             self.findings.record("query_cost", "SKIPPED", reason="fight fields unverified")
             return
         try:
             measurement = self.client.measure_query_cost(
-                render("report_fights", {"FIGHT_FIELDS": fields}),
+                render("report_fights", {"FIGHT_FIELDS": selection}),
                 {"code": report_code},
                 kind="cost_probe_report_fights",
             )
@@ -761,7 +780,16 @@ class Recon:
             )
 
     def step_zones(self) -> None:
-        """Fetch the zone/encounter registry so dungeon IDs never get guessed."""
+        """Fetch the zone/encounter registry so dungeon IDs are never guessed.
+
+        Matching is delegated to `discover.match_zones` so recon and
+        `discover-dungeons` cannot disagree. That matters: the first live run
+        of this step matched dungeon names against *zone* names and found
+        nothing, because Warcraft Logs models a Mythic+ season as one zone
+        whose **encounters** are the dungeons.
+        """
+        from .discover import match_zones
+
         try:
             data = self.client.execute(
                 load_query("world_zones"), {"expansionID": None}, kind="world_zones"
@@ -769,36 +797,152 @@ class Recon:
         except Exception as exc:  # noqa: BLE001
             self.findings.record("world_zones", "FAILED", error=f"{type(exc).__name__}: {exc}")
             return
+
         world = data.get("worldData") or {}
         zones = [z for z in (world.get("zones") or []) if isinstance(z, dict)]
         expansions = [e for e in (world.get("expansions") or []) if isinstance(e, dict)]
-        wanted_names = set()
-        if self.config is not None:
-            for entry in self.config.dungeons.dungeons:
-                wanted_names.add(entry.display_name.lower())
-                wanted_names.update(a.lower() for a in entry.aliases)
-        matches = [
-            {"id": z.get("id"), "name": z.get("name"), "expansion": z.get("expansion")}
-            for z in zones
-            if str(z.get("name") or "").lower() in wanted_names
+        # Newest first, by ID: the API's own ordering is not guaranteed, and
+        # slicing it cost us the current expansion once already.
+        ordered_expansions = sorted(
+            ({"id": e.get("id"), "name": e.get("name")} for e in expansions),
+            key=lambda e: (e["id"] is None, e["id"]),
+            reverse=True,
+        )
+
+        result = match_zones(self.config.dungeons, zones) if self.config is not None else {}
+
+        # The full zone/encounter inventory, so the season's real composition
+        # can be read straight out of the findings without a second run.
+        inventory = [
+            {
+                "id": zone.get("id"),
+                "name": zone.get("name"),
+                "frozen": zone.get("frozen"),
+                "expansion": zone.get("expansion"),
+                "encounters": [
+                    {"id": e.get("id"), "name": e.get("name")}
+                    for e in (zone.get("encounters") or [])
+                    if isinstance(e, dict)
+                ],
+                "partitions": zone.get("partitions"),
+            }
+            for zone in zones
         ]
+
         self.findings.record(
             "world_zones",
             "OK" if zones else "EMPTY",
-            expansions=[{"id": e.get("id"), "name": e.get("name")} for e in expansions][-6:],
+            expansions=ordered_expansions,
+            newest_expansion=ordered_expansions[0] if ordered_expansions else None,
             zone_count=len(zones),
-            configured_dungeon_matches=matches,
+            configured_dungeon_matches=list((result.get("matched") or {}).values()),
+            ambiguous=result.get("ambiguous") or {},
+            unmatched=result.get("unmatched") or [],
+            season_zone_id=result.get("season_zone_id"),
+            zone_inventory=inventory,
             note=(
-                "Use `wclmplus discover-dungeons --write` to persist verified IDs into "
-                "config/dungeons.yml."
+                "zone_inventory lists every zone with its encounter names. In WCL a "
+                "Mythic+ season is one zone whose encounters are the dungeons, so the "
+                "season's dungeon list is an encounter list, not a zone list. Persist "
+                "verified IDs with `wclmplus discover-dungeons --write`."
             ),
         )
         self._save_fixture("world_zones", data)
-        if self.config is not None and len(matches) < len(self.config.dungeons.dungeons):
+
+        if self.config is not None:
+            unmatched = result.get("unmatched") or []
+            if unmatched:
+                self.findings.limitation(
+                    f"{len(unmatched)} of {len(self.config.dungeons.dungeons)} configured "
+                    f"dungeon name(s) matched no live zone or encounter: {unmatched}. "
+                    "Check them against zone_inventory in this report and correct "
+                    "config/dungeons.yml."
+                )
+            if result.get("ambiguous"):
+                self.findings.limitation(
+                    f"Ambiguous dungeon name(s) {sorted(result['ambiguous'])}: the same "
+                    "name appears in more than one zone (usually an earlier season). "
+                    "Disambiguate by hand before collecting."
+                )
+
+    def step_reports_probe(self, season_zone_id: int | None = None) -> None:
+        """Test whether unscoped report discovery actually works.
+
+        Introspection shows `ReportData.reports` takes `zoneID`, `gameZoneID`,
+        `startTime`, `endTime`, `limit` and `page`, with `guildID` and
+        `userID` **optional**. Whether the API honours a query with no guild
+        or user scope decides how representative any sample can be: if it
+        does, runs can be drawn broadly; if it does not, sampling is confined
+        to seeded scopes and every bias that implies (brief section 8).
+
+        Presence of the arguments proves nothing -- only a real call does.
+        """
+        info = self.introspector.type_info("ReportData")
+        if info is None or not info.has("reports"):
+            self.findings.record("reports_probe", "SKIPPED", reason="ReportData.reports is absent")
+            return
+
+        attempts: dict[str, Any] = {}
+        for label, variables in (
+            ("unscoped", {"zoneID": None, "gameZoneID": None, "limit": 3, "page": 1}),
+            (
+                "zone_scoped",
+                {"zoneID": season_zone_id, "gameZoneID": None, "limit": 3, "page": 1},
+            ),
+        ):
+            if label == "zone_scoped" and season_zone_id is None:
+                attempts[label] = {
+                    "status": "SKIPPED",
+                    "reason": "no season zone ID resolved yet",
+                }
+                continue
+            try:
+                data = self.client.execute(
+                    load_query("discover_reports_probe"),
+                    variables,
+                    kind=f"reports_probe_{label}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A rejection here is a finding, not a crash: it tells us the
+                # scope is required.
+                attempts[label] = {
+                    "status": "REJECTED",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "variables": variables,
+                }
+                continue
+            block = ((data.get("reportData") or {}).get("reports")) or {}
+            rows = [r for r in (block.get("data") or []) if isinstance(r, dict)]
+            attempts[label] = {
+                "status": "OK",
+                "variables": variables,
+                "total": block.get("total"),
+                "per_page": block.get("per_page"),
+                "has_more_pages": block.get("has_more_pages"),
+                "returned": len(rows),
+                "example_codes": [r.get("code") for r in rows[:3]],
+                "example_zones": [r.get("zone") for r in rows[:3]],
+            }
+
+        usable = [k for k, v in attempts.items() if v.get("status") == "OK" and v.get("returned")]
+        self.findings.record(
+            "reports_probe",
+            "OK" if usable else "NO_USABLE_SCOPE",
+            attempts=attempts,
+            usable_scopes=usable,
+            note=(
+                "A working unscoped or zone-scoped query means broad sampling is "
+                "possible. If both are rejected, discovery is limited to seeded "
+                "scopes (character, guild) or a manual report list, and the "
+                "resulting bias must be recorded with every sample."
+            ),
+        )
+        if not usable:
             self.findings.limitation(
-                f"Only {len(matches)} of {len(self.config.dungeons.dungeons)} configured "
-                "dungeon names matched a live zone name. Season dungeon identities are "
-                "still unverified."
+                "Report discovery returned nothing usable without a guild or user "
+                "scope. Representative season-wide sampling is therefore not "
+                "available through this path; use --report-list or seeded sources, "
+                "and record uploader/guild bias."
             )
 
     # -- orchestration ----------------------------------------------------
@@ -816,6 +960,9 @@ class Recon:
         self.step_field_verification()
         self.step_discovery()
         self.step_zones()
+        self.step_reports_probe(
+            (self.findings.steps.get("world_zones") or {}).get("season_zone_id")
+        )
 
         if report_code is None:
             self.findings.record(

@@ -87,6 +87,24 @@ def unwrap_type_name(type_ref: dict[str, Any] | None) -> str | None:
     return None
 
 
+def unwrap_type_kind(type_ref: dict[str, Any] | None) -> str | None:
+    """Kind ("OBJECT", "SCALAR", "ENUM", ...) of a reference's named type.
+
+    Read from the type reference itself rather than looked up in the schema's
+    type list. Built-in scalars are not always enumerated there, and a lookup
+    miss would misclassify an ordinary String field as unknown.
+    """
+    current = type_ref
+    depth = 0
+    while isinstance(current, dict) and depth < 10:
+        if current.get("name"):
+            kind = current.get("kind")
+            return str(kind) if kind else None
+        current = current.get("ofType")
+        depth += 1
+    return None
+
+
 def render_type(type_ref: dict[str, Any] | None) -> str:
     """Render a type reference roughly as it appears in SDL."""
     if not isinstance(type_ref, dict):
@@ -277,3 +295,77 @@ class SchemaIntrospector:
     def enum_values(self, type_name: str) -> list[str]:
         info = self.type_info(type_name)
         return list(info.enum_values) if info else []
+
+    # -- selection building ------------------------------------------------
+
+    #: Type kinds that require a sub-selection in a GraphQL query.
+    COMPOSITE_KINDS = frozenset({"OBJECT", "INTERFACE", "UNION"})
+
+    def field_kind(self, type_name: str, field_name: str) -> str | None:
+        """Introspected kind of a field's underlying named type."""
+        info = self.type_info(type_name)
+        if info is None:
+            return None
+        raw = info.fields.get(field_name)
+        if raw is None:
+            return None
+        return unwrap_type_kind(raw.get("type"))
+
+    def leaf_fields(self, type_name: str) -> list[str]:
+        """Scalar and enum fields of a type, usable as a sub-selection.
+
+        Fields taking arguments are excluded: a required argument we cannot
+        supply would make the query invalid, and an optional one changes
+        semantics we have not verified.
+        """
+        info = self.type_info(type_name)
+        if info is None:
+            return []
+        leaves: list[str] = []
+        for name in sorted(info.fields):
+            raw = info.fields[name]
+            if raw.get("args"):
+                continue
+            if unwrap_type_kind(raw.get("type")) in ("SCALAR", "ENUM"):
+                leaves.append(name)
+        return leaves
+
+    def build_selection(
+        self, type_name: str, field_names: list[str], *, indent: str = "        "
+    ) -> tuple[str, list[str]]:
+        """Render a GraphQL selection set for `field_names` on `type_name`.
+
+        Whether a field needs a sub-selection is decided by **introspection**,
+        not by a hardcoded list of known object fields. Getting this wrong is
+        what made the live schema reject an early version of the report query
+        with `Field "archiveStatus" ... must have a sub selection`.
+
+        A composite field is expanded to its scalar and enum fields, one level
+        deep. A composite whose type exposes no usable leaves is skipped and
+        named in the returned warnings, because a field selected without a
+        sub-selection would make the whole query invalid.
+
+        Returns (selection text, warnings).
+        """
+        parts: list[str] = []
+        warnings: list[str] = []
+        for name in field_names:
+            kind = self.field_kind(type_name, name)
+            if kind is None:
+                warnings.append(f"{type_name}.{name}: not present in the live schema; skipped")
+                continue
+            if kind not in self.COMPOSITE_KINDS:
+                parts.append(name)
+                continue
+            parent = self.type_info(type_name)
+            raw = parent.fields.get(name) if parent else None
+            named = unwrap_type_name(raw.get("type")) if raw else None
+            leaves = self.leaf_fields(named) if named else []
+            if not leaves:
+                warnings.append(
+                    f"{type_name}.{name}: type {named!r} is composite but exposes no "
+                    "scalar fields to select; skipped rather than sending an invalid query"
+                )
+                continue
+            parts.append(f"{name} {{ {' '.join(leaves)} }}")
+        return ("\n" + indent).join(parts), warnings

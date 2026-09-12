@@ -10,13 +10,17 @@ It is not a dungeon guide and not a web app. It is a collector plus a dataset
 detailed enough that new questions can be answered later **without
 re-downloading anything**.
 
-> **Current status: Phase 0 (reconnaissance).**
-> Authentication, the schema-verification layer, the rate-limited API client,
-> the raw cache, the proven event paginator, report discovery and the CLI are
-> implemented and tested. **No live API call has been made yet** — see
-> [Why Phase 0 is not finished](#why-phase-0-is-not-finished). Database
-> collection begins in Phase 1, after you run `wclmplus recon` and the
-> findings are reviewed.
+> **Current status: Phase 0 (reconnaissance), first live run complete.**
+>
+> A live recon run on 2026-09-12 confirmed that **every field the research
+> design needs exists in the API** — `ReportFight` 23/23, `ReportDungeonPull`
+> 10/10, `ReportDungeonPullNPC` 6/6, and all 14 `EventDataType` values. It also
+> found two bugs in this project, both fixed (see `API_NOTES.md` section 12).
+>
+> The run stopped short of event data, so event shape, pagination semantics and
+> per-instance NPC identity in events are still unverified. One more
+> `wclmplus recon` run settles them. Database collection begins in Phase 1,
+> after that.
 
 ---
 
@@ -109,31 +113,29 @@ They are read from the live API and written to
 
 ---
 
-## Why Phase 0 is not finished
+## Why live verification happens on your machine
 
-Phase 0 requires live API verification, and **it could not be performed in the
-environment where this code was written**. Two independent blockers:
+Phase 0 requires live API calls, and they **cannot be made from the
+environment where this code is written**. Two independent blockers:
 
-1. **No credentials were available.** `WCL_CLIENT_ID` / `WCL_CLIENT_SECRET`
-   were not set, and by design they never leave your machine.
-2. **`warcraftlogs.com` was unreachable.** The build environment's egress
-   proxy denied every connection to it (`CONNECT tunnel failed, response 403`),
-   while other hosts resolved normally — so this was network policy, not a
-   transient failure.
+1. **No credentials there.** By design, yours never leave your computer.
+2. **`warcraftlogs.com` is unreachable there.** The build environment's egress
+   proxy denies every connection to it (`CONNECT tunnel failed, response 403`),
+   while other hosts resolve normally — network policy, not a transient fault.
 
-Rather than guess at field names and hand you code that "should" work, every
-schema assumption in this repository is marked unverified and the verification
-was turned into a command you run locally. `wclmplus recon` performs Phase 0
-steps 6–18 of the project brief and writes the evidence files itself.
+So the verification is a command *you* run, and it writes its own evidence
+files. That turned out to be a good thing: the first run caught two real bugs
+that no amount of offline testing would have found, because both were wrong
+assumptions about the live schema.
 
-Until you have run it:
+Every schema claim in `API_NOTES.md` is tagged `VERIFIED`, `CORRECTED` or
+`HYPOTHESIS`, with the evidence cited.
 
-- `API_NOTES.md` records **hypotheses**, clearly labelled, not verified behaviour.
-- Every dungeon ID in `config/dungeons.yml` is `null`.
-- Queries are **generated** from introspected fields, so a renamed or missing
-  field is reported as an absence instead of crashing a collection run.
+### Updating without git
 
-See `PROJECT_STATE.md` for the exact gate status.
+If you downloaded this as a ZIP rather than cloning it, `git pull` won't work.
+To update: download the ZIP again, extract it to a new folder, and copy your
+existing **`.env`** into it before running setup. Your credentials stay put.
 
 ---
 
@@ -243,7 +245,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-216 tests, all offline: no credentials, no network. Live smoke tests are
+232 tests, all offline: no credentials, no network. Live smoke tests are
 opt-in via `pytest -m live`.
 
 The suite covers secret redaction, OAuth failure modes, GraphQL error

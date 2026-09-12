@@ -1,0 +1,25 @@
+# Probe: does ReportData.reports work WITHOUT a guild or user scope?
+#
+# Introspection shows guildID and userID are optional arguments alongside
+# zoneID, gameZoneID, startTime, endTime, limit and page. If an unscoped
+# zone query returns reports, this project has a representative sampling
+# path and is not restricted to leaderboard or single-guild logs -- which
+# matters directly for the sampling bias listed in the research brief.
+#
+# This query is a probe only. It asks for the minimum per report.
+query ReportsProbe($zoneID: Int, $gameZoneID: Int, $limit: Int, $page: Int) {
+  reportData {
+    reports(zoneID: $zoneID, gameZoneID: $gameZoneID, limit: $limit, page: $page) {
+      total
+      per_page
+      current_page
+      has_more_pages
+      data {
+        code
+        startTime
+        endTime
+        zone { id name }
+      }
+    }
+  }
+}

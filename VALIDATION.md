@@ -2,16 +2,17 @@
 
 Mechanic test cases, expected evidence, observed evidence, and limitations.
 
-> **Overall status: NO MECHANIC HAS BEEN VALIDATED AGAINST REAL DATA.**
-> Blocked on **B1** (no credentials, and `warcraftlogs.com` unreachable from
-> the build environment). See `PROJECT_STATE.md`.
+> **Overall status: machinery validated; game behaviour not yet.**
 >
-> What has been validated is the *machinery*: 216 offline tests covering
-> pagination completeness, NPC-instance separation, secret redaction, cache
-> integrity and error classification. That proves the collector behaves
-> correctly given well-shaped input. It proves nothing about the game.
-
----
+> A live recon run on 2026-09-12 confirmed that every field the research design
+> needs exists in the API, and found two defects in this project (see
+> `API_NOTES.md` section 12), both fixed. It did **not** reach event data: the
+> run aborted at `report_metadata`, so no mechanic has been observed.
+>
+> 232 offline tests cover pagination completeness, NPC-instance separation,
+> secret redaction, cache integrity, error classification and both live
+> defects. That proves the collector behaves correctly on well-shaped input.
+> It proves nothing about the game.
 
 ## How to run validation
 
@@ -35,10 +36,11 @@ unsupported and every recast statistic in the project is invalid.
 | --- | --- |
 | **Goal** | Two copies of one NPC species in one pull keep separate cast timelines. |
 | **Expected evidence** | (a) A pull whose `enemyNPCs` instance-ID range covers more than one copy. (b) Events carrying `sourceInstance` so each cast attributes to copy 1 or copy 2. |
-| **Observed** | _pending_ |
-| **Status** | NOT STARTED — blocked on B1 |
+| **Observed (a)** | **CONFIRMED AVAILABLE.** All six identity fields exist on `ReportDungeonPullNPC`: `id`, `gameID`, `minimumInstanceID`, `maximumInstanceID`, `minimumInstanceGroupID`, `maximumInstanceGroupID`. |
+| **Observed (b)** | **STILL UNVERIFIED.** No event has been fetched. Encouraging sign: `Report.events` accepts `sourceInstanceID` and `targetInstanceID` as **filter arguments**, which implies per-instance data exists — but a filter argument is not proof the field is returned on each event. |
+| **Status** | HALF CONFIRMED — (a) yes, (b) pending the next recon run |
 
-Automated support already in place:
+Automated support in place:
 
 - Recon reports `duplicate_npc_species_candidates` — pulls usable as this fixture.
 - Recon raises a limitation if no sampled event carries `sourceInstance` /
@@ -49,8 +51,6 @@ Automated support already in place:
 
 **If (b) fails:** record that per-instance timing is not supported by the API.
 Do not infer instance identity from cast ordering — that would fabricate data.
-
----
 
 ## V2 — Pagination completeness
 
@@ -188,7 +188,7 @@ diagnostic.
 | | |
 | --- | --- |
 | **Goal** | No credential can reach a log, a cache file, an exception or an export. |
-| **Observed** | **PASSED offline.** |
+| **Observed** | **PASSED, now including a real live run.** The user ran auth, recon and discovery against the live API with real credentials. No credential appeared in terminal output, `recon_findings.json`, `RECON_REPORT.md` or any fixture. Terminal output was safe to paste verbatim into a chat. |
 | **Status** | PASSED for the implemented surface |
 
 Proven by: exact-value and pattern redaction; a planted-leak test confirming
@@ -198,35 +198,35 @@ write containing a credential being refused with nothing reaching disk;
 exposing the value; an error response echoing a token back not leaking it;
 recon output files asserted free of the token.
 
-**Residual risk:** a future code path that writes somewhere other than the raw
-cache or the logger. `wclmplus cache-audit` is the user-facing check.
-
----
+Note the live run's token had a **360-day** lifetime, not the assumed hour.
+That makes in-memory-only handling more important, not less — it is never
+written to disk.
 
 ## Known limitations (current)
 
-1. **Nothing has been observed live.** Every API statement in this repository is
-   a hypothesis. (B1)
-2. **The season dungeon list is incomplete.** Four of eight dungeons are known
-   by name; none by ID. Nothing is guessed.
-3. **No database exists.** Schema version 0. `DATA_DICTIONARY.md` is a design.
-4. **Per-instance event identity is unproven.** If events lack
-   `sourceInstance`, the project's core requirement is unsupported and V1 must
-   say so.
-5. **Enemy health may not be reliably available**, which would make execute-phase
+1. **No event data has been observed.** Event shape, pagination semantics and
+   per-instance identity in events remain unverified. (B1)
+2. **No pull data has been observed.** Field availability is confirmed;
+   interval contiguity, boss representation and event-assignment rates are not.
+3. **The season dungeon list is still unknown.** 44 zones were counted but
+   their names were not recorded by the first run. Recon now saves a full
+   `zone_inventory`.
+4. **`Report.gameVersion` does not exist.** Unused by the research design.
+5. **Enemy health availability is unknown**, which would make execute-phase
    duration (V3) and health-threshold phases (V6) unmeasurable.
-6. **API cost is unmeasured**, so no event profile can yet be recommended for
-   large samples.
-7. **Report discovery capability is unknown.** `ManualReportSource` works
-   regardless, so this limits sampling breadth, not function.
-8. **Report-code parsing is permissive** by design: any 8–32 character
-   alphanumeric token is accepted as a code. Use `wclmplus report-list-check`
-   before a run.
-9. **No hotfix epochs are declared.** Every run classifies as `unclassified`
-   until real dates are known. Absolute run dates are retained so epochs can be
-   applied retroactively.
-
----
+6. **Event-page cost is unmeasured.** Schema work costs ~2 points per recon, so
+   the budget will be dominated by event pages. No default profile can be
+   recommended for large samples yet.
+7. **Discovery reach is being probed.** `ReportData.reports` accepts
+   `zoneID`/`gameZoneID` with guild and user optional, which may allow broad
+   sampling; a probe now makes the real call. `ManualReportSource` works
+   regardless.
+8. **No database exists.** Schema version 0. `DATA_DICTIONARY.md` is a design.
+9. **Report-code parsing is permissive** by design: any 8–32 character
+   alphanumeric token is accepted. Use `wclmplus report-list-check` first.
+10. **No hotfix epochs are declared.** Every run classifies as `unclassified`
+    until real dates are known. Absolute run dates are retained so epochs can
+    be applied retroactively.
 
 ## Unresolved questions
 

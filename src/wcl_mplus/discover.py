@@ -53,41 +53,90 @@ def fetch_zones(client: GraphQLClient, *, expansion_id: int | None = None) -> di
 
 
 def match_zones(registry: DungeonRegistry, zones: list[dict[str, Any]]) -> dict[str, Any]:
-    """Match configured dungeon names against live zone names.
+    """Match configured dungeon names against the live zone registry.
 
-    Matching is by name, case-insensitively, across display names and aliases.
-    Ambiguity is reported rather than resolved arbitrarily: two zones with the
-    same name (a re-release, say) must be disambiguated by a human.
+    Warcraft Logs models a Mythic+ season as **one zone whose encounters are
+    the individual dungeons** -- not one zone per dungeon. An earlier version
+    of this function compared dungeon names against zone names and matched
+    nothing at all, which is how that was discovered.
+
+    So encounters are searched first, and zone names only as a fallback (some
+    zones are a single dungeon or raid). Each match records which way it was
+    found, so the distinction stays visible in the findings.
+
+    Ambiguity is reported rather than resolved: two encounters sharing a name
+    across different seasons must be disambiguated by a human, because picking
+    one silently would tie the whole corpus to the wrong season.
     """
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for zone in zones:
-        name = str(zone.get("name") or "").strip().lower()
-        if name:
-            by_name.setdefault(name, []).append(zone)
+    encounters_by_name: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    zones_by_name: dict[str, list[dict[str, Any]]] = {}
 
-    matched: dict[str, dict[str, Any]] = {}
+    for zone in zones:
+        zone_name = str(zone.get("name") or "").strip().lower()
+        if zone_name:
+            zones_by_name.setdefault(zone_name, []).append(zone)
+        for encounter in zone.get("encounters") or []:
+            if not isinstance(encounter, dict):
+                continue
+            name = str(encounter.get("name") or "").strip().lower()
+            if name:
+                encounters_by_name.setdefault(name, []).append((zone, encounter))
+
+    matched: dict[str, Any] = {}
     ambiguous: dict[str, list[int]] = {}
     unmatched: list[str] = []
 
     for entry in registry.dungeons:
-        candidates: list[dict[str, Any]] = []
-        for needle in [entry.display_name, *entry.aliases]:
-            candidates.extend(by_name.get(needle.strip().lower(), []))
-        # De-duplicate by zone id, since aliases can hit the same zone.
-        unique: dict[int, dict[str, Any]] = {
-            int(z["id"]): z for z in candidates if z.get("id") is not None
-        }
-        if not unique:
+        needles = [entry.display_name, *entry.aliases]
+
+        # -- preferred: the dungeon is an encounter inside a season zone ----
+        encounter_hits: dict[tuple[int, int], tuple[dict[str, Any], dict[str, Any]]] = {}
+        for needle in needles:
+            for zone, encounter in encounters_by_name.get(needle.strip().lower(), []):
+                if zone.get("id") is not None and encounter.get("id") is not None:
+                    encounter_hits[(int(zone["id"]), int(encounter["id"]))] = (zone, encounter)
+
+        if len(encounter_hits) == 1:
+            zone, encounter = next(iter(encounter_hits.values()))
+            matched[entry.key] = {
+                "key": entry.key,
+                "display_name": entry.display_name,
+                "match_kind": "encounter",
+                "wcl_zone_id": int(zone["id"]),
+                "wcl_zone_name": zone.get("name"),
+                "encounter_ids": [int(encounter["id"])],
+                "encounter_names": [str(encounter.get("name"))],
+                "expansion": zone.get("expansion"),
+                "partitions": zone.get("partitions"),
+                "difficulties": zone.get("difficulties"),
+                "verified": True,
+            }
+            continue
+        if len(encounter_hits) > 1:
+            ambiguous[entry.key] = sorted({zid for zid, _ in encounter_hits})
+            continue
+
+        # -- fallback: the dungeon is its own zone --------------------------
+        zone_hits: dict[int, dict[str, Any]] = {}
+        for needle in needles:
+            for zone in zones_by_name.get(needle.strip().lower(), []):
+                if zone.get("id") is not None:
+                    zone_hits[int(zone["id"])] = zone
+
+        if not zone_hits:
             unmatched.append(entry.display_name)
             continue
-        if len(unique) > 1:
-            ambiguous[entry.key] = sorted(unique)
+        if len(zone_hits) > 1:
+            ambiguous[entry.key] = sorted(zone_hits)
             continue
-        zone = next(iter(unique.values()))
+
+        zone = next(iter(zone_hits.values()))
         matched[entry.key] = {
             "key": entry.key,
             "display_name": entry.display_name,
+            "match_kind": "zone",
             "wcl_zone_id": int(zone["id"]),
+            "wcl_zone_name": zone.get("name"),
             "encounter_ids": [
                 int(e["id"])
                 for e in (zone.get("encounters") or [])
@@ -102,11 +151,15 @@ def match_zones(registry: DungeonRegistry, zones: list[dict[str, Any]]) -> dict[
             "verified": True,
         }
 
+    # The season zone is only unambiguous when every match agrees on one zone.
+    season_zone_ids = {item["wcl_zone_id"] for item in matched.values()}
     return {
         "matched": matched,
         "ambiguous": ambiguous,
         "unmatched": unmatched,
         "zones_seen": len(zones),
+        "season_zone_id": season_zone_ids.pop() if len(season_zone_ids) == 1 else None,
+        "season_zone_ids_seen": sorted(season_zone_ids) if len(season_zone_ids) > 1 else [],
     }
 
 
@@ -122,14 +175,17 @@ def build_overlay(result: dict[str, Any], registry: DungeonRegistry) -> dict[str
         for item in result["matched"].values()
     ]
     all_verified = len(entries) == len(registry.dungeons) and not result["unmatched"]
+    season: dict[str, Any] = {
+        "id": registry.season_id,
+        # The season is only "verified" once every configured dungeon resolved
+        # to exactly one live encounter or zone.
+        "verified": bool(all_verified),
+    }
+    if result.get("season_zone_id") is not None:
+        season["wcl_mplus_zone_id"] = result["season_zone_id"]
     return {
         "generated_at": dt.datetime.now(dt.UTC).isoformat(),
-        "season": {
-            "id": registry.season_id,
-            # The season is only "verified" once every configured dungeon
-            # resolved to exactly one live zone.
-            "verified": bool(all_verified),
-        },
+        "season": season,
         "dungeons": entries,
     }
 

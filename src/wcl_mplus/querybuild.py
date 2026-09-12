@@ -105,9 +105,14 @@ WANTED_PULL_NPC_FIELDS = [
     "maximumInstanceGroupID",
 ]
 
-#: Nested object fields requested as sub-selections when the parent exists.
-#: A scalar-looking field that is actually an object needs a selection set, so
-#: these are appended to the generated selection only if the parent is present.
+#: Kept only as a readability fallback for callers with no introspector (the
+#: naive `build_selection` below). The real sub-selections come from
+#: `SchemaIntrospector.build_selection`, which asks the live schema which
+#: fields are composite instead of guessing from a list like this one.
+#:
+#: Guessing here is what produced the live failure
+#: `Field "archiveStatus" of type "ReportArchiveStatus" must have a sub
+#: selection.` -- archiveStatus simply was not in the map.
 NESTED_FIELD_SELECTIONS: dict[str, str] = {
     "zone": "zone { id name }",
     "gameZone": "gameZone { id name }",
@@ -116,6 +121,7 @@ NESTED_FIELD_SELECTIONS: dict[str, str] = {
     "friendlyPlayers": "friendlyPlayers",
     "maps": "maps { id }",
     "boundingBox": "boundingBox { minX minY maxX maxY }",
+    "archiveStatus": "archiveStatus { isArchived isAccessible archiveDate }",
 }
 
 #: Event categories the mechanics profile wants. Checked against the live
@@ -178,8 +184,17 @@ def _is_comment(line: str) -> bool:
     return line.lstrip().startswith("#")
 
 
-def render(template_name: str, substitutions: dict[str, list[str]]) -> str:
-    """Fill `__PLACEHOLDER__` tokens in a query template with field lists.
+def render(template_name: str, substitutions: dict[str, list[str] | str]) -> str:
+    """Fill `__PLACEHOLDER__` tokens in a query template.
+
+    A value may be either:
+
+    * a **string** -- an already-rendered selection set, which is what
+      `SchemaIntrospector.build_selection` returns. This is the path real
+      queries take, because only introspection knows which fields are
+      composite and need a sub-selection.
+    * a **list of field names** -- rendered by the naive `build_selection`
+      below. Convenient for tests and for callers without an introspector.
 
     Substitution skips `#` comment lines. The templates document their own
     placeholders in comments, and rewriting those would both mangle the
@@ -198,7 +213,14 @@ def render(template_name: str, substitutions: dict[str, list[str]]) -> str:
             if token in line:
                 # Preserve the template's indentation for the whole block.
                 indent = line[: len(line) - len(line.lstrip())]
-                selection = build_selection(fields).replace("\n        ", "\n" + indent)
+                rendered_fields = fields if isinstance(fields, str) else build_selection(fields)
+                if not rendered_fields.strip():
+                    raise QueryError(
+                        f"Refusing to render {template_name!r}: the selection for "
+                        f"{placeholder} is empty. Introspection found none of the desired "
+                        "fields, so the schema changed shape -- run `wclmplus schema-check`."
+                    )
+                selection = rendered_fields.replace("\n        ", "\n" + indent)
                 line = line.replace(token, selection)
                 filled.add(placeholder)
         rendered.append(line)

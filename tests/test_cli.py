@@ -250,11 +250,18 @@ def test_inspect_report_handles_missing_report(monkeypatch, settings):
 def test_discover_dungeons_dry_run_writes_nothing(live, tmp_path):
     result = runner.invoke(cli.app, ["discover-dungeons"])
     assert result.exit_code == 0
-    assert "Matched 2 dungeon(s)" in result.output
+    assert "Matched 4 dungeon(s)" in result.output
     assert "Dry run" in result.output
     assert not (
         cli.ProjectConfig.load().dungeons.path.with_name("dungeons.discovered.yml")
     ).exists()
+
+
+def test_discover_dungeons_shows_newest_expansion_first(live):
+    """Regression: an earlier slice printed the six oldest expansions."""
+    result = runner.invoke(cli.app, ["discover-dungeons"])
+    assert result.exit_code == 0
+    assert "Expansions seen (newest first): 7=Midnight" in result.output
 
 
 def test_recon_writes_reports_and_summary(live, settings):

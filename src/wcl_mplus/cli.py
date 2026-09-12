@@ -469,9 +469,15 @@ def discover_dungeons_cmd(
 
     typer.echo(f"Zones inspected: {result['zones_seen']}")
     if result.get("expansions"):
+        # Sort by ID rather than slicing: the API returns expansions newest
+        # first, so an earlier `[-6:]` printed the six OLDEST and hid the
+        # current expansion entirely.
+        ordered = sorted(
+            result["expansions"], key=lambda e: (e.get("id") is None, e.get("id")), reverse=True
+        )
         typer.echo(
-            "Expansions seen: "
-            + ", ".join(f"{e['id']}={e['name']}" for e in result["expansions"][-6:])
+            "Expansions seen (newest first): "
+            + ", ".join(f"{e['id']}={e['name']}" for e in ordered)
         )
     if result["matched"]:
         typer.secho(f"\nMatched {len(result['matched'])} dungeon(s):", fg=typer.colors.GREEN)

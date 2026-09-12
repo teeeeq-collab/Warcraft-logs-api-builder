@@ -10,6 +10,7 @@ credentials. They do not prove anything about the *real* schema; only
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 from wcl_simulator import DUPLICATE_NPC_GAME_ID, REPORT_CODE, WclSimulator
@@ -265,13 +266,67 @@ def test_discovery_paths_are_probed(recon_factory):
     assert probes["Character.recentReports"]["present"] is True
 
 
-def test_zone_matching_reports_unverified_dungeons(recon_factory):
+def test_zone_step_matches_dungeons_as_encounters(recon_factory):
     recon, _ = recon_factory(config=ProjectConfig.load())
     findings = recon.run(report_code=REPORT_CODE)
     zones = findings.steps["world_zones"]
-    matched = {m["name"] for m in zones["configured_dungeon_matches"]}
-    assert {"Murder Row", "Ruby Life Pools"} <= matched
-    assert any("configured dungeon names matched" in t for t in findings.limitations)
+    matched = {m["display_name"] for m in zones["configured_dungeon_matches"]}
+    assert {"Murder Row", "Ruby Life Pools", "The Blinding Vale", "Den of Nalorakk"} <= matched
+    assert zones["unmatched"] == []
+    assert zones["season_zone_id"] == 44
+
+
+def test_zone_step_records_the_full_inventory(recon_factory):
+    """Findings must carry zone and encounter names.
+
+    Without them, identifying a season's dungeons needs a second run or a file
+    off the user's disk.
+    """
+    recon, _ = recon_factory(config=ProjectConfig.load())
+    findings = recon.run(report_code=REPORT_CODE)
+    inventory = findings.steps["world_zones"]["zone_inventory"]
+    season = next(z for z in inventory if z["id"] == 44)
+    names = {e["name"] for e in season["encounters"]}
+    assert "Murder Row" in names
+    assert len(names) == 8, "all eight season dungeons visible without a second run"
+
+
+def test_newest_expansion_is_reported_not_truncated_away(recon_factory):
+    """Regression: the API returns expansions newest first.
+
+    Taking the last six entries reported the six OLDEST expansions and hid the
+    current one, which made the season look absent from the API entirely.
+    """
+    recon, _ = recon_factory(config=ProjectConfig.load())
+    findings = recon.run(report_code=REPORT_CODE)
+    zones = findings.steps["world_zones"]
+    assert zones["newest_expansion"]["name"] == "Midnight"
+    assert zones["expansions"][0]["id"] == 7
+    assert len(zones["expansions"]) == 8, "no expansion dropped from the report"
+
+
+def test_unmatched_dungeon_names_become_a_limitation(recon_factory, tmp_path):
+    import yaml
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "dungeons.yml").write_text(
+        yaml.safe_dump(
+            {
+                "season": {"id": "midnight-s2"},
+                "dungeons": [{"key": "nowhere", "display_name": "Nowhere At All"}],
+            }
+        )
+    )
+    for name in ("sampling.yml", "hotfix_epochs.yml"):
+        (config_dir / name).write_text(
+            (pathlib.Path("config") / name).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    recon, _ = recon_factory(config=ProjectConfig.load(config_dir))
+    findings = recon.run(report_code=REPORT_CODE)
+    assert findings.steps["world_zones"]["unmatched"] == ["Nowhere At All"]
+    assert any("matched no live zone or encounter" in x for x in findings.limitations)
 
 
 # -- failure handling ------------------------------------------------------
@@ -327,3 +382,98 @@ def test_auth_failure_short_circuits_cleanly(recon_factory):
     assert findings.steps["auth"]["status"] == "FAILED"
     assert any("Authentication failed" in t for t in findings.limitations)
     assert findings.finished_at is not None, "the report is still written"
+
+
+# -- composite field sub-selections (live failure regression) --------------
+
+
+def test_report_metadata_succeeds_with_composite_fields(recon_factory):
+    """Regression for the first live recon run.
+
+    `archiveStatus` was selected without a sub-selection, so the live API
+    rejected the whole query with `Field "archiveStatus" of type
+    "ReportArchiveStatus" must have a sub selection.` That aborted recon before
+    pulls, events or pagination were ever probed.
+    """
+    recon, sim = recon_factory()
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert findings.steps["report_metadata"]["status"] == "OK", findings.steps[
+        "report_metadata"
+    ].get("error")
+
+    sent = [q for q, _ in sim.queries_seen if "ReportMetadata" in q]
+    assert sent, "a metadata query was sent"
+    assert "archiveStatus {" in sent[0], "composite field carries a sub-selection"
+    assert "isArchived" in sent[0], "sub-selection derived from introspection"
+
+
+def test_sub_selections_are_derived_not_hardcoded(recon_factory):
+    """A composite field absent from any hardcoded map still gets expanded."""
+    recon, sim = recon_factory()
+    recon.run(report_code=REPORT_CODE)
+    fight_queries = [q for q, _ in sim.queries_seen if "ReportFights" in q]
+    assert fight_queries
+    assert "gameZone {" in fight_queries[0]
+    assert "friendlyPlayers" in fight_queries[0], "a scalar list needs no sub-selection"
+    assert "friendlyPlayers {" not in fight_queries[0]
+
+
+def test_simulator_rejects_a_bare_composite_field():
+    """Proves the guard fires, rather than always passing."""
+    import httpx
+
+    sim = WclSimulator()
+    response = httpx.Client(transport=httpx.MockTransport(sim.handler)).post(
+        "https://example.test/api",
+        json={"query": 'query Q { reportData { report(code: "X") { code archiveStatus } } }'},
+    )
+    errors = response.json()["errors"]
+    assert "must have a sub selection" in errors[0]["message"]
+
+
+def test_recon_continues_past_metadata_to_pulls_and_events(recon_factory):
+    """The steps the live failure blocked now run."""
+    recon, _ = recon_factory()
+    findings = recon.run(report_code=REPORT_CODE)
+    for step in ("fights", "master_data", "dungeon_pulls", "event_samples", "pagination_probe"):
+        assert step in findings.steps, f"{step} should be reached"
+        assert findings.steps[step]["status"] != "FAILED", findings.steps[step]
+
+
+# -- report discovery capability ------------------------------------------
+
+
+def test_reports_probe_records_a_working_scope(recon_factory):
+    """Argument presence proves nothing; only a real call does."""
+    recon, _ = recon_factory(config=ProjectConfig.load())
+    findings = recon.run(report_code=REPORT_CODE)
+    probe = findings.steps["reports_probe"]
+    assert probe["status"] == "OK"
+    assert "unscoped" in probe["usable_scopes"]
+    assert probe["attempts"]["unscoped"]["returned"] == 3
+    assert probe["attempts"]["zone_scoped"]["variables"]["zoneID"] == 44
+
+
+def test_reports_probe_records_a_required_scope_as_a_limitation(recon_factory):
+    """A rejection is a finding about sampling reach, not a crash."""
+    recon, _ = recon_factory(
+        WclSimulator(unscoped_reports_allowed=False), config=ProjectConfig.load()
+    )
+    findings = recon.run(report_code=REPORT_CODE)
+    probe = findings.steps["reports_probe"]
+    assert probe["attempts"]["unscoped"]["status"] == "REJECTED"
+    assert "guildID" in probe["attempts"]["unscoped"]["error"]
+    # A zone-scoped query still works, so sampling is not dead.
+    assert probe["attempts"]["zone_scoped"]["status"] == "OK"
+    assert probe["status"] == "OK"
+
+
+def test_reports_probe_with_no_usable_scope_raises_a_limitation(recon_factory):
+    recon, _ = recon_factory(WclSimulator(unscoped_reports_allowed=False))
+    # Without config there is no season zone, so only the unscoped attempt runs.
+    findings = recon.run(report_code=REPORT_CODE)
+    probe = findings.steps["reports_probe"]
+    assert probe["status"] == "NO_USABLE_SCOPE"
+    assert probe["attempts"]["zone_scoped"]["status"] == "SKIPPED"
+    assert any("without a guild or user scope" in x for x in findings.limitations)

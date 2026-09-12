@@ -2,7 +2,7 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12
+- **Last updated:** 2026-09-12 (after first live recon run)
 - **Software version:** 0.1.0
 - **Database schema version:** 0 (no schema implemented yet)
 - **Normalizer version:** 1
@@ -12,64 +12,75 @@ Authoritative summary of where this project is. Updated at every gate.
 
 ## Current milestone
 
-**Phase 0 — API reconnaissance. Implementation complete; live verification blocked.**
+**Phase 0 — API reconnaissance. First live run done; one more needed.**
 
-Everything Phase 0 asks for that does not require network access to
-warcraftlogs.com is built and tested. The live verification steps (brief
-Phase 0 items 6–18) are implemented as a single command the user runs locally,
-`wclmplus recon`, which writes its own evidence files.
+The user ran `wclmplus recon` against the live API on 2026-09-12. It answered
+about half of Gate A and found two defects in this project, both now fixed.
 
-### Gate A — API reconnaissance: **NOT PASSED**
+### Gate A — API reconnaissance: **PARTIALLY PASSED**
 
 | Gate A question | Status |
 | --- | --- |
-| Are the required fields available? | **Unknown.** Verification implemented (`schema-check`), not executed. |
-| How does pagination work? | **Unknown.** Measurement implemented; paginator already correct under either semantics. |
-| How can reports be discovered? | **Unknown.** Probe implemented. `ManualReportSource` works regardless. |
-| What is the observed API cost? | **Unknown.** Measurement implemented (`measure_query_cost`). |
-| Are there access limitations? | **Unknown.** Archived/private handling implemented. |
-| Are dungeon pulls sufficiently detailed? | **Unknown.** Query and NPC-identity diagnostics implemented. |
+| Are the required fields available? | **YES.** ReportFight 23/23, ReportDungeonPull 10/10, ReportDungeonPullNPC 6/6, Report 11/12 (`gameVersion` absent, unused). EventDataType all 14 values. |
+| What is the observed API cost? | **Cheap.** 17 requests ≈ 2 points of 3600/hour. Event-page cost still unmeasured. |
+| How can reports be discovered? | **Arguments confirmed; behaviour being probed.** `ReportData.reports` takes `zoneID`/`gameZoneID` with `guildID`/`userID` optional — potentially a broad sampling path. A probe now tests it. |
+| Are there access limitations? | **Detectable.** `archiveStatus` exposes `isArchived`/`isAccessible`. Not yet exercised on a real archived report. |
+| How does pagination work? | **Still unknown.** Blocked by the defect below. |
+| Are dungeon pulls sufficiently detailed? | **Fields yes, content unknown.** No pull was fetched. |
 
-Gate A cannot be approved from this repository alone. It requires one
-`wclmplus recon --report <CODE>` run against the live API.
+The run aborted at `report_metadata`, so fights, pulls, NPC identity, events,
+pagination and query cost were never probed. Cause was ours, not the API's.
+
+### Defects the live run found — both fixed
+
+1. **Composite fields selected without a sub-selection.** Sub-selections came
+   from a hardcoded map of field names assumed to be objects; `archiveStatus`
+   was missing from it, so the query was invalid and six steps were skipped.
+   Now derived from introspection: `SchemaIntrospector.build_selection` reads
+   each field's type kind and expands composites automatically. No hardcoded
+   object-field list remains on the query path.
+2. **Mythic+ dungeons are encounters, not zones.** `discover-dungeons`
+   compared dungeon names against zone names and matched 0 of 4. A Mythic+
+   season is one zone whose `encounters` are the dungeons. Matcher rewritten;
+   ambiguous names are reported rather than resolved.
+
+Plus a reporting bug: expansions come back newest first, and the summary took
+the last six entries — printing the six *oldest* and hiding the current
+expansion, which made the season look absent from the API.
+
+**232 tests pass**, including regression tests for all three. The simulator now
+enforces the server's sub-selection rule and models a season zone with dungeon
+encounters, so none of these can regress silently.
 
 ---
 
 ## Blockers
 
-### B1 — No live API verification was possible (open, requires user action)
+### B1 — Second recon run needed (open, requires user action)
 
-Two independent causes, both established by direct test rather than assumed:
+Everything that follows `report_metadata` is unverified: pull content, NPC
+event-level identity, event shape, pagination semantics, event-page cost.
 
-1. **No credentials.** `WCL_CLIENT_ID` / `WCL_CLIENT_SECRET` were not present
-   in the build environment. By design they never leave the user's machine.
-2. **Network egress to warcraftlogs.com denied.** Every connection attempt was
-   refused by the environment's egress proxy:
-   `CONNECT tunnel failed, response 403` for `www.warcraftlogs.com`,
-   `warcraftlogs.com` and `classic.warcraftlogs.com`. Control hosts
-   (`pypi.org`, `api.github.com`) returned HTTP 200 in the same test, so this
-   was organization network policy, not a transient fault.
+The user re-runs, after `git pull`:
 
-**Consequence:** every statement about the Warcraft Logs schema in this
-repository is a *hypothesis*, labelled as such. None has been confirmed.
-
-**Resolution:** the user runs, on their own machine:
-
-```bash
-wclmplus auth-check
-wclmplus recon --report <PUBLIC_MYTHIC_PLUS_REPORT_CODE>
-wclmplus discover-dungeons --write
+```
+.venv\Scripts\wclmplus.exe recon --report "<PUBLIC_MYTHIC_PLUS_REPORT_URL>"
+.venv\Scripts\wclmplus.exe discover-dungeons
 ```
 
-Then `API_NOTES.md` and `VALIDATION.md` are updated from
-`data/exports/recon/recon_findings.json`, and Gate A is reassessed.
+### B2 — Season dungeon list still unknown (open)
 
-### B2 — Season dungeon list is incomplete (open)
+The first run recorded a zone *count* (44) but not zone or encounter names, so
+the eight Season 2 dungeons remain unidentified. Recon now writes a full
+`zone_inventory` — every zone with its encounter names — into the findings, so
+the next run resolves this without another round trip.
 
-Four of the eight Midnight Season 2 dungeons are named in the research brief
-(Murder Row, Ruby Life Pools, The Blinding Vale, Den of Nalorakk). The other
-four are unknown and are **not** guessed. `discover-dungeons` lists the live
-zones so the remaining slots can be filled from the API.
+### B3 — Live verification cannot be done in this environment (permanent)
+
+No credentials, and egress to `warcraftlogs.com` is denied by the build
+environment's proxy (403 on CONNECT; control hosts returned 200). All live
+evidence therefore comes from the user's machine, by design — their Client
+Secret never leaves it.
 
 ---
 
@@ -128,25 +139,26 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 ## Validation status
 
-No mechanic has been validated against real data. All validation cases are
-defined in `VALIDATION.md` with status `NOT STARTED — blocked on B1`.
-
-The *machinery* for validation is tested: NPC instance identity is preserved
-and proven distinct by fingerprint, duplicate-species pulls are detected, and
-pagination completeness is proven against a simulator under both cursor
-semantics.
-
----
+| Case | Status |
+| --- | --- |
+| V1 NPC instance identity | **Half confirmed.** All 6 pull-NPC identity fields exist. Event-level `sourceInstance` unverified; `Report.events` accepts `sourceInstanceID`/`targetInstanceID` filters, which suggests it exists. |
+| V2 Pagination completeness | Offline PASSED (22 tests, both cursor semantics). Live unverified. |
+| V3–V6 Mechanic timelines | NOT STARTED — needs event data. |
+| V7 Priority interrupt | NOT STARTED. |
+| V8 CC stop inference | NOT STARTED. |
+| V9 Event-to-pull assignment | NOT STARTED — Phase 1. |
+| V10 Credential safety | **PASSED**, now including a real live run: no credential appeared in any output, report or fixture. |
 
 ## Next actions
 
-1. **User:** create an API client, fill `.env`, run `wclmplus auth-check`.
-2. **User:** run `wclmplus recon --report <CODE>` with a public Mythic+ log.
-3. **User:** run `wclmplus discover-dungeons --write`.
-4. **Coordinator:** fold the findings into `API_NOTES.md` and `VALIDATION.md`,
-   reassess Gate A.
-5. **Then Phase 1:** SQLite schema and migrations, ingestion, pull assignment,
+1. **User:** `git pull`, then re-run `recon --report <CODE>` and
+   `discover-dungeons`. Send back `recon_findings.json`.
+2. **Coordinator:** confirm event-level NPC instance identity, pagination
+   semantics and event-page cost; fill in `API_NOTES.md` sections 5–7 and 11;
+   identify the eight Season 2 dungeons from `zone_inventory`.
+3. **Coordinator:** close Gate A.
+4. **Then Phase 1:** SQLite schema and migrations, ingestion, pull assignment,
    checkpoint/resume, dedupe, validation report — 5–10 Murder Row runs.
 
-Phase 1 must not start before step 4. The storage schema depends on the real
-event field names, which are still unknown.
+Phase 1 must not start before step 3. The storage schema depends on the real
+event field names, which remain the single biggest unknown.
