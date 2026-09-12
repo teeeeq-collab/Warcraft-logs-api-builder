@@ -2,20 +2,20 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12 (after second live recon run)
-- **Software version:** 0.1.2
+- **Last updated:** 2026-09-12 (after third live recon run)
+- **Software version:** 0.1.3
 - **Database schema version:** 0 (no schema implemented yet)
 - **Normalizer version:** 1
-- **Query set version:** 2
+- **Query set version:** 3
 
 ---
 
 ## Current milestone
 
-**Phase 0 — API reconnaissance. Two live runs done; one more needed.**
+**Phase 0 — API reconnaissance. Three live runs done; one more needed.**
 
-Both runs failed at the same step for *different* reasons, and both causes
-were defects in this project rather than the API. Both are fixed, with
+All three runs failed at the same step for *different* reasons, and every
+cause was a defect in this project rather than the API. All are fixed, with
 regression tests.
 
 ### Gate A — API reconnaissance: **MOSTLY PASSED**
@@ -49,11 +49,14 @@ not safe — see `API_NOTES.md` section 9.
 | 3 | Expansion list truncated from the wrong end, hiding the current expansion | Sorted by ID descending, nothing dropped |
 | 4 | Auto-expansion picked up permission-gated `User.avatar` | Deny-list for observed-gated fields, plus drop-and-retry for unanticipated ones |
 | 5 | Reused dungeon names left unresolved | Two-pass matching: infer the season zone, then resolve within it |
+| 6 | A *second* gated field (`User.battleTag`); the retry never fired because it matched `battleTag` against prose reading "battle tag" | Identity-first expansion makes gated extras unreachable; blame matching normalized, most-specific match only |
+| 7 | Cache keyed on query name, not query text, so a narrowed query could reuse a stale answer | Rendered query hash is part of the cache key |
 
-**239 tests pass**, including regression tests for all five. The simulator now
+**244 tests pass**, including regression tests for all seven. The simulator now
 enforces the server's sub-selection rule, gates `avatar` the way the live API
-does, models reused dungeon names across seasons, and returns expansions
-newest first — so none of these can regress silently.
+does, models reused dungeon names across seasons, gates `battleTag` behind a
+prose error message, and returns expansions newest first — so none of these
+can regress silently.
 
 ---
 
@@ -73,9 +76,10 @@ The user re-runs, after updating to the current code:
 
 ### B2 — Season dungeon list — **RESOLVED**
 
-All eight dungeons and the season zone are identified and in
-`config/dungeons.yml`. IDs still come from `discover-dungeons --write`, not
-from source.
+All eight dungeons and the season zone (55) are identified, and
+`discover-dungeons --write` has been run successfully: IDs are persisted in
+`config/dungeons.discovered.yml` on the user's machine. Nothing is hardcoded
+in source.
 
 ### B3 — Live verification cannot be done in this environment (permanent)
 

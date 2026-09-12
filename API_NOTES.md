@@ -9,10 +9,10 @@ Verified Warcraft Logs v2 API behaviour.
 Status tags: `VERIFIED` (observed live, evidence cited) · `CORRECTED`
 (observed to differ from the hypothesis) · `HYPOTHESIS` (not yet observed).
 
-> **Two recon runs so far, both partial.** Each failed at `report_metadata`
-> for a *different* reason, and both causes were defects in this project, not
-> the API (sections 12.1 and 12.3). Both are fixed. Sections 5–7 and 11 stay
-> unverified until a third run reaches event data.
+> **Three recon runs so far, all partial.** Each failed at `report_metadata`
+> for a *different* reason, and every cause was a defect in this project, not
+> the API (sections 12.1, 12.3, 12.5). All are fixed. Sections 5–7 and 11 stay
+> unverified until a run reaches event data.
 
 ---
 
@@ -316,6 +316,50 @@ Two-layer fix:
 Name-only matching found Ruby Life Pools in three zones and refused to choose
 — safe, but it left a season dungeon unidentified. Two-pass matching (see
 section 9) resolves it from the rest of the season's evidence.
+
+### 12.5 Permission-gated fields, again — FIXED PROPERLY
+
+```
+You do not have permission to view the battle tag for this user.
+(partial data was returned and discarded)
+```
+
+The third run failed on `User.battleTag`, having failed on `User.avatar` the
+run before. Adding names to a deny-list one at a time was losing a race
+against a type with several gated fields.
+
+**Two compounding faults:**
+
+1. **The strategy was wrong.** Expanding a composite to *every* scalar asks for
+   far more than the research needs. A nested object is wanted here only to
+   identify something — which zone, which uploader, which region.
+2. **The safety net never fired.** `dropped_fields` came back empty, because
+   the retry matched the schema spelling `battleTag` against prose that says
+   "battle tag". A word-boundary search finds nothing there.
+
+**Fixes:**
+
+- **Identity-first expansion** (`SchemaIntrospector.PREFERRED_LEAF_NAMES`):
+  when a type exposes `id`, `name`, `slug` or `compactName`, the expansion
+  takes only those. `User` reduces to `{ id name }`, so gated extras are
+  unreachable *whatever they are called*. A type with no identity leaves
+  (`ReportArchiveStatus`, `ReportMapBoundingBox`) still expands fully, because
+  there the state is the point — archived-report detection depends on it.
+- **Normalized blame matching**: both sides are reduced to letters and digits,
+  so `battleTag` matches "battle tag", "Battle-Tag" and "battletag" alike.
+  Names under four characters are still matched strictly, or a normalized `id`
+  would match "invalid" and "identity".
+- **Most-specific match only**: "compact name" literally contains the word
+  `name`, so a naive scan would drop a field the server never objected to.
+
+### 12.6 Cache identity ignored the query text — FIXED
+
+Cached responses were keyed on the logical query *name*, variables and
+`query_version`. But queries here are **generated** from introspection, so the
+same name can legitimately produce a different document between runs — after a
+schema change, or after narrowing a sub-selection as in 12.5. A stale response
+answering a different question could be served. The rendered query's hash is
+now part of the cache key; `query_version` remains a coarse manual override.
 
 ## 13. Open questions
 

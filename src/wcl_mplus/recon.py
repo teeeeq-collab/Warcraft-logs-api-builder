@@ -81,6 +81,51 @@ EVENT_SAMPLE_LIMIT = 50
 PAGINATION_PROBE_LIMIT = 25
 
 
+def _normalize_identifier(text: str) -> str:
+    """Lowercase and strip everything but letters and digits."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _blamed_fields(message: str, candidates: list[str]) -> set[str]:
+    """Which of `candidates` a server error message is complaining about.
+
+    Only the most specific match is kept. "...view the compact name for..."
+    literally contains the word `name`, so a naive scan blames both
+    `compactName` and `name` and drops a field the server never objected to.
+    A candidate whose normalized form is contained in another matching
+    candidate's is therefore discarded.
+    """
+    hits = {field for field in candidates if _error_blames_field(message, field)}
+    return {
+        field
+        for field in hits
+        if not any(
+            other != field and _normalize_identifier(field) in _normalize_identifier(other)
+            for other in hits
+        )
+    }
+
+
+def _error_blames_field(message: str, field: str) -> bool:
+    """Does a server error message refer to `field`?
+
+    The complaint is prose written for humans, and it does not spell fields the
+    way the schema does. `battleTag` came back as "You do not have permission
+    to view the **battle tag** for this user." -- a word-boundary match for
+    `battleTag` finds nothing there, which is why an early version of the retry
+    silently failed to drop anything.
+
+    So both sides are normalized to letters and digits only, which makes
+    `battleTag` match "battle tag", "Battle-Tag" and "battletag" alike.
+
+    Short names are matched strictly instead: a normalized `id` would appear
+    inside "invalid", "identity" and most English error text.
+    """
+    if len(field) < 4:
+        return bool(re.search(rf"\b{re.escape(field)}\b", message, re.IGNORECASE))
+    return _normalize_identifier(field) in _normalize_identifier(message)
+
+
 @dataclass
 class ReconFindings:
     """Accumulated Phase 0 evidence."""
@@ -199,15 +244,9 @@ class Recon:
             except GraphQLError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 message = str(exc)
-                # Any leaf we asked for that the server names is a candidate
-                # to drop. Word-boundary match: the complaint is prose, not a
-                # structured field reference.
-                blamed = {
-                    leaf
-                    for leaf in selection.leaves
-                    if leaf not in excluded
-                    and re.search(rf"\b{re.escape(leaf)}\b", message, re.IGNORECASE)
-                }
+                blamed = _blamed_fields(
+                    message, [leaf for leaf in selection.leaves if leaf not in excluded]
+                )
                 if not blamed:
                     return None, sorted(excluded), last_error
                 excluded |= blamed

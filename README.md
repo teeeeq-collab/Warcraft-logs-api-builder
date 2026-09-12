@@ -10,7 +10,7 @@ It is not a dungeon guide and not a web app. It is a collector plus a dataset
 detailed enough that new questions can be answered later **without
 re-downloading anything**.
 
-> **Current status: Phase 0 (reconnaissance), two live runs complete.**
+> **Current status: Phase 0 (reconnaissance), three live runs complete.**
 >
 > Confirmed against the live API: **every field the research design needs
 > exists** (`ReportFight` 23/23, `ReportDungeonPull` 10/10,
@@ -19,7 +19,7 @@ re-downloading anything**.
 > discovery works without a guild or user scope**, so representative
 > season-wide sampling is possible rather than leaderboard-only.
 >
-> The runs also found five bugs in this project, all fixed with regression
+> The runs also found seven bugs in this project, all fixed with regression
 > tests (see `API_NOTES.md` section 12). They have not yet reached event data,
 > so event shape, pagination semantics and per-instance NPC identity in events
 > remain unverified. One more run settles them.
@@ -247,7 +247,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-239 tests, all offline: no credentials, no network. Live smoke tests are
+244 tests, all offline: no credentials, no network. Live smoke tests are
 opt-in via `pytest -m live`.
 
 The suite covers secret redaction, OAuth failure modes, GraphQL error

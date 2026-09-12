@@ -113,6 +113,15 @@ EVENT_DATA_TYPES = [
 ]
 
 
+def _humanize(field: str) -> str:
+    """Render a camelCase field the way the API's prose errors do.
+
+    `battleTag` -> "battle tag". Matching a schema field name against text like
+    that is exactly what an early version of the drop-and-retry got wrong.
+    """
+    return re.sub(r"(?<!^)(?=[A-Z])", " ", field).lower()
+
+
 def _strip_comments(query: str) -> str:
     """Drop `#` comment lines.
 
@@ -452,8 +461,19 @@ class WclSimulator:
             },
             # `avatar` is permission-gated on the live API: selecting it makes
             # the server answer "You do not have permission to view the avatar
-            # for this user." and fail the whole query.
-            "User": {"fields": _fields({"id": "Int!", "name": "String!", "avatar": "String"})},
+            # for this user." and fail the whole query. `battleTag` is gated
+            # too, and failed a later run -- which is why auto-expansion now
+            # takes identity leaves only instead of every scalar.
+            "User": {
+                "fields": _fields(
+                    {
+                        "id": "Int!",
+                        "name": "String!",
+                        "avatar": "String",
+                        "battleTag": "String",
+                    }
+                )
+            },
             "Region": {
                 "fields": _fields(
                     {"id": "Int!", "compactName": "String!", "name": "String!", "slug": "String!"}
@@ -965,7 +985,15 @@ class WclSimulator:
             # Permission-gated field. The live API returns partial data
             # alongside the error, which is why the client rejects the whole
             # response rather than treating half an answer as complete.
-            gated = [f for f in ("avatar" if self.avatar_is_gated else None, self.gated_leaf) if f]
+            gated = [
+                f
+                for f in (
+                    "avatar" if self.avatar_is_gated else None,
+                    "battleTag" if self.avatar_is_gated else None,
+                    self.gated_leaf,
+                )
+                if f
+            ]
             body_no_comments = _strip_comments(query)
             hit = next((f for f in gated if f in body_no_comments), None)
             if hit:
@@ -976,7 +1004,10 @@ class WclSimulator:
                         "errors": [
                             {
                                 "message": (
-                                    f"You do not have permission to view the {hit} for this user."
+                                    "You do not have permission to view the "
+                                    # Prose, as the live API writes it: a
+                                    # camelCase field comes back as words.
+                                    f"{_humanize(hit)} for this user."
                                 )
                             }
                         ],

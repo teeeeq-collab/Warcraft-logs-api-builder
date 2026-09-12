@@ -13,6 +13,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -164,7 +165,17 @@ class GraphQLClient:
         rest of the cache identity.
         """
         variables = variables or {}
-        cache_params = {"variables": variables, "query_name": kind}
+        # The rendered query text is part of the cache identity, not just its
+        # name. Queries here are *generated* from introspection, so the same
+        # `kind` can legitimately produce different documents between runs --
+        # after a schema change, or after narrowing a sub-selection. Keying on
+        # the name alone would serve a response that answers a different
+        # question. `query_version` remains a coarse manual override.
+        cache_params = {
+            "variables": variables,
+            "query_name": kind,
+            "query_sha": hashlib.sha256(query.encode("utf-8")).hexdigest()[:16],
+        }
 
         if use_cache:
             entry = self.cache.get(kind, cache_params, report_code=report_code)

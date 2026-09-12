@@ -322,7 +322,28 @@ class SchemaIntrospector:
     #: the whole report query. The rest are media/URL fields of no research
     #: value that carry the same risk. Anything not anticipated here is caught
     #: by the drop-and-retry in recon.
-    RISKY_LEAF_NAMES = frozenset({"avatar", "icon", "image", "thumbnail", "logo", "url", "banner"})
+    #: Identity leaves. When a composite type exposes any of these, the
+    #: auto-expansion takes **only** these and nothing else.
+    #:
+    #: This is the primary defence against permission-gated fields, and it
+    #: exists because expanding to *every* scalar proved to be whack-a-mole:
+    #: three consecutive live runs each failed on a different gated field of
+    #: `User` (`avatar`, then `battleTag`). Nested objects are wanted here for
+    #: identification -- which zone, which uploader, which region -- so asking
+    #: for the identity fields and stopping is both what the research needs and
+    #: what avoids an entire class of failure.
+    #:
+    #: A type with none of these (`ReportArchiveStatus`, `ReportMapBoundingBox`)
+    #: falls through to all its scalars, because there the *state* is the point.
+    PREFERRED_LEAF_NAMES = ("id", "name", "slug", "compactName")
+
+    #: Leaf fields never requested, even on a type with no identity leaves.
+    #: **Observed** problems, not guesses: `avatar` and `battleTag` are
+    #: permission-gated on `User` and each failed a live query. The rest are
+    #: media/URL fields of no research value that carry the same risk.
+    RISKY_LEAF_NAMES = frozenset(
+        {"avatar", "banner", "battleTag", "icon", "image", "logo", "thumbnail", "url"}
+    )
 
     def field_kind(self, type_name: str, field_name: str) -> str | None:
         """Introspected kind of a field's underlying named type."""
@@ -339,13 +360,19 @@ class SchemaIntrospector:
     ) -> list[str]:
         """Scalar and enum fields of a type, usable as a sub-selection.
 
-        Three kinds of field are left out:
+        When the type has identity leaves (`PREFERRED_LEAF_NAMES`), **only**
+        those are returned -- that is what a nested object is wanted for here,
+        and it sidesteps the permission-gated extras that repeatedly broke live
+        queries. A type with no identity leaves returns all its scalars,
+        because there the state is the point.
+
+        Three kinds of field are always left out:
 
         * fields taking arguments -- a required argument we cannot supply would
           make the query invalid, and an optional one changes semantics we have
           not verified;
-        * `RISKY_LEAF_NAMES`, which are observed to be permission-gated or are
-          media fields of no research value;
+        * `RISKY_LEAF_NAMES`, observed to be permission-gated or media fields
+          of no research value;
         * anything in `exclude`, which is how recon drops a field the server
           complained about and retries.
         """
@@ -362,7 +389,12 @@ class SchemaIntrospector:
                 continue
             if unwrap_type_kind(raw.get("type")) in ("SCALAR", "ENUM"):
                 leaves.append(name)
-        return leaves
+
+        # Identity-bearing type: take only the identity leaves. Everything
+        # else on such a type is extra surface with nothing to gain, and is
+        # where the permission-gated fields kept turning up.
+        identity = [name for name in self.PREFERRED_LEAF_NAMES if name in leaves]
+        return identity or leaves
 
     def build_selection(
         self,

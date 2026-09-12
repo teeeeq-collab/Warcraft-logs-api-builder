@@ -334,3 +334,27 @@ def test_stats_summary_is_serializable(settings):
     import json
 
     assert json.loads(json.dumps(client.stats.summary()))["requests"] == 1
+
+
+def test_changed_query_text_is_not_served_from_cache(settings):
+    """Cache identity includes the query, not just its name.
+
+    Queries are generated from introspection, so the same logical `kind` can
+    produce a different document between runs -- after a schema change, or
+    after narrowing a sub-selection. Keying on the name alone would serve a
+    response that answers a different question.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={"data": {"v": len(calls)}})
+
+    client, _ = build_client(settings, handler)
+    first = client.execute("query Q { a b }", {"code": "X"}, kind="k", report_code="X")
+    again = client.execute("query Q { a b }", {"code": "X"}, kind="k", report_code="X")
+    assert first == again and len(calls) == 1, "identical query is cached"
+
+    changed = client.execute("query Q { a }", {"code": "X"}, kind="k", report_code="X")
+    assert len(calls) == 2, "a different document must not reuse the cached answer"
+    assert changed != first

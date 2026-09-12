@@ -563,3 +563,94 @@ def test_a_non_field_error_is_not_retried_forever(recon_factory):
     findings = recon.run(report_code=REPORT_CODE)
     assert findings.steps["report_metadata"]["status"] == "FAILED"
     assert "Internal server weirdness" in findings.steps["report_metadata"]["error"]
+
+
+# -- identity-first expansion (third live failure regression) --------------
+
+
+def test_gated_user_fields_are_unreachable_by_construction(recon_factory):
+    """Regression for the third live recon failure.
+
+    Three consecutive live runs each failed on a different permission-gated
+    field of `User`: `avatar`, then `battleTag`. Adding names to a deny-list
+    one at a time was losing the race.
+
+    A nested object is wanted here only to identify something, so expansion
+    now takes the identity leaves and stops. Gated extras cannot be reached at
+    all, whatever they are called.
+    """
+    recon, sim = recon_factory(WclSimulator(avatar_is_gated=True))
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert findings.steps["report_metadata"]["status"] == "OK", findings.steps[
+        "report_metadata"
+    ].get("error")
+
+    metadata_queries = [q for q, _ in sim.queries_seen if "ReportMetadata" in q]
+    assert len(metadata_queries) == 1, "no retry needed: nothing gated was asked for"
+    query = metadata_queries[0]
+    assert "owner { id name }" in query, "identity leaves only"
+    assert "avatar" not in query
+    assert "battleTag" not in query
+
+
+def test_state_bearing_types_still_expand_fully(recon_factory):
+    """Narrowing must not cost us the fields that carry state.
+
+    `ReportArchiveStatus` has no identity leaves, so it keeps all its scalars —
+    otherwise archived reports could not be detected and kept out of
+    event-frequency denominators.
+    """
+    recon, sim = recon_factory()
+    recon.run(report_code=REPORT_CODE)
+    query = next(q for q, _ in sim.queries_seen if "ReportMetadata" in q)
+    assert "isArchived" in query
+    assert "isAccessible" in query
+    assert "minX" in next((q for q, _ in sim.queries_seen if "dungeonPulls" in q), ""), (
+        "bounding box keeps its geometry"
+    )
+
+
+def test_prose_error_naming_a_camel_case_field_is_understood(recon_factory):
+    """The live message said "battle tag", not "battleTag".
+
+    A word-boundary search for the schema spelling found nothing, so the retry
+    dropped nothing and failed immediately with `dropped_fields: []`.
+    """
+    recon, sim = recon_factory(WclSimulator(avatar_is_gated=False, gated_leaf="compactName"))
+    findings = recon.run(report_code=REPORT_CODE)
+
+    assert findings.steps["report_metadata"]["status"] == "OK", findings.steps[
+        "report_metadata"
+    ].get("error")
+    assert findings.steps["report_metadata"]["dropped_fields"] == ["compactName"], (
+        "only the field actually named is dropped"
+    )
+
+    queries = [q for q, _ in sim.queries_seen if "ReportMetadata" in q]
+    assert "compactName" in queries[0] and "compactName" not in queries[-1]
+    assert "name" in queries[-1], "the innocent 'name' field survived"
+
+
+def test_blame_matching_edge_cases():
+    """Unit coverage for the matcher itself."""
+    from wcl_mplus.recon import _blamed_fields
+
+    # camelCase rendered as prose
+    assert _blamed_fields(
+        "You do not have permission to view the battle tag for this user.",
+        ["id", "name", "avatar", "battleTag"],
+    ) == {"battleTag"}
+
+    # the most specific match wins: "compact name" contains the word "name"
+    assert _blamed_fields(
+        "You do not have permission to view the compact name for this user.",
+        ["id", "name", "slug", "compactName"],
+    ) == {"compactName"}
+
+    # an error that names nothing we asked for blames nothing
+    assert _blamed_fields("Internal server weirdness", ["id", "name"]) == set()
+
+    # short names are matched strictly, or "invalid" would blame `id`
+    assert _blamed_fields("The request was invalid", ["id"]) == set()
+    assert _blamed_fields("Field 'id' is not allowed", ["id"]) == {"id"}

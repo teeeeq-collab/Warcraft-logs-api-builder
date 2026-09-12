@@ -9,6 +9,55 @@ recorded here.
 
 ---
 
+## 0.1.3 — 2026-09-12
+
+Third live run. One more gated field, and a fix to the strategy rather than the
+symptom.
+
+- `software_version` 0.1.2 → 0.1.3
+- `query_version` 2 → 3 (generated selections narrowed; cached responses from
+  the old queries are invalidated)
+
+### Fixed
+
+- **Permission-gated nested fields, properly this time.** The third run failed
+  on `User.battleTag`, having failed on `User.avatar` the run before. Two
+  compounding faults: expanding a composite to *every* scalar asked for far
+  more than the research needs, and the drop-and-retry never fired because it
+  matched the schema spelling `battleTag` against prose reading "battle tag".
+
+  - **Identity-first expansion**: when a type exposes `id`, `name`, `slug` or
+    `compactName`, only those are selected. `User` reduces to `{ id name }`,
+    making gated extras unreachable whatever they are named. Types with no
+    identity leaves (`ReportArchiveStatus`, `ReportMapBoundingBox`) still
+    expand fully — archived-report detection depends on those fields.
+  - **Normalized blame matching**: `battleTag` now matches "battle tag",
+    "Battle-Tag" and "battletag". Names under four characters stay strict, or
+    a normalized `id` would match "invalid".
+  - **Most-specific match only**: "compact name" contains the word `name`, so
+    a naive scan dropped a field the server never objected to.
+
+- **Cache identity ignored the query text.** Responses were keyed on the query
+  *name*, variables and `query_version`, but queries are generated from
+  introspection and the same name can produce a different document between
+  runs. A stale response answering a different question could be served. The
+  rendered query's hash is now part of the key.
+
+### Verified against the live API
+
+- All eight Season 2 dungeons resolved to zone 55 and were written to
+  `config/dungeons.discovered.yml`, including the three reused names, each via
+  season-zone resolution.
+- The raw cache works: the third run served 20 of 22 requests from disk and
+  issued only 2.
+
+### Still unverified
+
+Event shape, pagination semantics, per-instance identity *in events*, pull
+content and event-page cost.
+
+---
+
 ## 0.1.2 — 2026-09-12
 
 Second live run. Two more defects found and fixed; the season is identified and
