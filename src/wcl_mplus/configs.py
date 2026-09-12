@@ -354,6 +354,17 @@ class SamplingConfig:
             )
         return self.sample_profiles[name]
 
+    @staticmethod
+    def parse_event_type(spec: str) -> tuple[str, str | None]:
+        """Split an event-profile entry into (data type, hostility).
+
+        `"Casts@Enemies"` -> `("Casts", "Enemies")`; `"Debuffs"` ->
+        `("Debuffs", None)`. Hostility exists because an unfiltered event
+        query is dominated by players -- see the note in sampling.yml.
+        """
+        data_type, _, hostility = str(spec).partition("@")
+        return data_type.strip(), (hostility.strip() or None)
+
     def validate_event_types(self, live_enum: list[str]) -> dict[str, list[str]]:
         """Compare configured event types against the live enum.
 
@@ -365,7 +376,11 @@ class SamplingConfig:
         allowed = set(live_enum)
         problems: dict[str, list[str]] = {}
         for name, profile in self.event_profiles.items():
-            bad = [t for t in profile.event_types if t not in allowed]
+            bad = [
+                spec
+                for spec in profile.event_types
+                if self.parse_event_type(spec)[0] not in allowed
+            ]
             if bad:
                 problems[name] = bad
         return problems
@@ -468,6 +483,58 @@ class HotfixEpochs:
         return open_ended[-1] if open_ended else None
 
 
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RoleMap:
+    """Spec -> role, loaded from config rather than hardcoded.
+
+    Warcraft Logs reports a spec but no role, and role is game knowledge that
+    changes between expansions. Anything not listed as tank or healer is dps:
+    the brief's questions turn on tank and healer experience and on group
+    damage in aggregate, so enumerating every dps spec would be maintenance
+    with no research value.
+    """
+
+    tank: set[str] = field(default_factory=set)
+    healer: set[str] = field(default_factory=set)
+    path: Path | None = None
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> RoleMap:
+        file_path = path or (project_root() / "config" / "roles.yml")
+        if not file_path.is_file():
+            return cls()
+        data = _load_yaml(file_path)
+        return cls(
+            tank={str(s) for s in data.get("tank") or []},
+            healer={str(s) for s in data.get("healer") or []},
+            path=file_path,
+        )
+
+    def role_for(self, class_name: str | None, spec: str | None) -> str | None:
+        """Role for a class/spec pair, or None when the spec is unknown.
+
+        A "Class-Spec" key wins over the bare spec name, so a future collision
+        between two same-named specs of different roles can be resolved without
+        changing this code.
+        """
+        if not spec:
+            return None
+        qualified = f"{class_name}-{spec}" if class_name else None
+        for candidate in (qualified, spec):
+            if candidate is None:
+                continue
+            if candidate in self.tank:
+                return "tank"
+            if candidate in self.healer:
+                return "healer"
+        return "dps"
+
+
 @dataclass
 class ProjectConfig:
     """All configuration, loaded together."""
@@ -475,6 +542,7 @@ class ProjectConfig:
     dungeons: DungeonRegistry
     sampling: SamplingConfig
     hotfixes: HotfixEpochs
+    roles: RoleMap = field(default_factory=RoleMap)
 
     @classmethod
     def load(cls, config_dir: Path | None = None) -> ProjectConfig:
@@ -483,6 +551,7 @@ class ProjectConfig:
             dungeons=DungeonRegistry.load(base / "dungeons.yml"),
             sampling=SamplingConfig.load(base / "sampling.yml"),
             hotfixes=HotfixEpochs.load(base / "hotfix_epochs.yml"),
+            roles=RoleMap.load(base / "roles.yml"),
         )
 
     def hash(self) -> str:

@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Spec -> role mapping.
+#
+# This is game knowledge, not API data, so it lives in config where it can be
+# corrected without touching source. Warcraft Logs reports a spec name
+# (`subType` on a player actor) and a class-spec icon, but no role.
+#
+# Spec names are not unique across classes -- Holy is Paladin and Priest,
+# Restoration is Druid and Shaman -- which is fine here because both members
+# of each pair share a role. If that ever stops being true, add a
+# "Class-Spec" key: it is checked before the bare spec name.
+# ---------------------------------------------------------------------------
+
+tank:
+  - Protection          # Paladin, Warrior
+  - Blood               # Death Knight
+  - Brewmaster          # Monk
+  - Guardian            # Druid
+  - Vengeance           # Demon Hunter
+
+healer:
+  - Holy                # Paladin, Priest
+  - Discipline          # Priest
+  - Restoration         # Druid, Shaman
+  - Mistweaver          # Monk
+  - Preservation        # Evoker
+
+# Anything not listed above is treated as dps. Listing every dps spec would be
+# a maintenance burden with no research value: the questions in the brief turn
+# on tank and healer experience, and on group damage in aggregate.

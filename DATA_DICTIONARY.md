@@ -1,207 +1,235 @@
 # Data dictionary
 
-> **Status: PROPOSED DESIGN, NOT IMPLEMENTED.**
-> Database schema version is **0**: no tables exist yet. Storage is Phase 1
-> work and is deliberately deferred until `wclmplus recon` reveals the real
-> event field names (blocker **B1** in `PROJECT_STATE.md`). Building a schema
-> around guessed field names is exactly the mistake this ordering avoids.
->
-> What *is* implemented and documented below as real: the raw cache envelope,
-> the pagination checkpoint, and the provenance block.
+Schema version **1** (`migrations/001_initial.sql`). Built against event and
+field shapes **observed** in five live recon runs, not against guesses.
 
 ---
 
 ## Conventions
 
-### Timestamps — three kinds, never conflated
+### Timestamps — four columns per event, never conflated
 
-| Name | Meaning | Units |
+| Column | Meaning | Units |
 | --- | --- | --- |
-| `report_timestamp_ms` | Milliseconds since the report's own start. What the API returns on events. | integer ms |
-| `absolute_timestamp_ms` | Unix epoch milliseconds. `report.startTime + report_timestamp_ms`. Needed for hotfix epochs and date filtering. | integer ms |
-| `run_relative_ms` | Milliseconds since the run (fight) started. | integer ms |
-| `pull_relative_ms` | Milliseconds since the containing pull started. `NULL` when the event falls outside every pull. | integer ms |
+| `rel_ms` | Milliseconds since the **report** started. What the API returns. | integer ms |
+| `abs_ms` | Unix epoch milliseconds. `report.start_time_ms + rel_ms`. Needed for hotfix epochs and date filtering. | integer ms |
+| `run_rel_ms` | Milliseconds since the **run** started. | integer ms |
+| `pull_rel_ms` | Milliseconds since the **pull** started. `NULL` when the event falls outside every pull. | integer ms |
 
-All four are stored per event. Deriving them later is cheap; recovering a
-discarded one is impossible. Millisecond resolution is preserved everywhere:
-overlap analysis at ±1s is a stated research requirement, so no ingestion-time
-bucketing is permitted.
+All four are stored. Deriving one later is cheap; recovering a discarded one is
+impossible. Millisecond resolution is preserved throughout: overlap analysis at
+±1 s is a stated research requirement, so no ingestion-time bucketing happens.
 
-### Null semantics
+### NULL always means "the API did not supply this"
 
-`NULL` always means **"the API did not supply this"**, never zero, never
-"false", never "not applicable". A count that is genuinely zero is stored as
-`0`. This distinction decides whether a mechanic was absent or merely
-unobserved.
+Never zero, never false, never "not applicable". A genuine zero is stored as
+`0`. The distinction decides whether a mechanic was **absent** or merely
+**unobserved** — and those support opposite conclusions.
 
-### Raw vs derived
+The sharpest case is `events.source_instance`. A missing value probably means
+the NPC had only one copy, but that is an inference about the *pull*, not a
+fact about the event. It stays `NULL` and is resolved during analysis against
+`pull_npcs.min_instance_id`/`max_instance_id`: one copy in the pull, the NULL
+maps to it; several copies, the attribution is genuinely unknown and must be
+reported as unknown.
 
-Every column is tagged:
+### Raw, derived, provenance
 
-- **raw** — as the API returned it, unmodified
-- **derived** — computed by this project; carries `normalizer_version`
+Every column is one of:
+
+- **raw** — as the API returned it
+- **derived** — computed here; carries `normalizer_version`, and where the
+  derivation is an inference it carries its own confidence column
 - **provenance** — how the row came to exist
 
-Derived values must be reproducible from raw values plus the raw cache. If a
-derived column cannot be recomputed from what is stored, the raw input is
-missing and must be added.
+A derived value must be reproducible from raw values plus the raw cache.
 
 ---
 
-## Implemented: raw cache envelope
+## `collection_jobs` — provenance
 
-Every cached response (`data/raw_cache/<kind>/<report_code>/<hash>.json.gz`):
+`job_id`, `started_at`, `finished_at`, `status` (`running` | `complete` |
+`failed` | `interrupted`), `sample_profile`, `event_profile`, `config_hash`,
+`software_version`, `normalizer_version`, `query_version`, `schema_version`,
+`git_commit`, `git_dirty`, `reports_attempted`, `reports_completed`,
+`reports_failed`, `notes`.
 
-| Field | Kind | Notes |
-| --- | --- | --- |
-| `cache_format_version` | provenance | Envelope layout version. Currently 1. |
-| `kind` | provenance | Logical request name, e.g. `events_sample_Casts`. Part of the cache key. |
-| `report_code` | provenance | `NULL` for non-report queries; those live under `_global/`. |
-| `params` | provenance | Query variables, **redacted**. Any `Authorization`-like key is stripped before storage. |
-| `query_version` | provenance | Part of the cache key: bumping it invalidates stale responses after a query edit. |
-| `fetched_at` | provenance | Unix seconds. |
-| `provenance` | provenance | Software, normalizer, query and schema versions; git commit; dirty-tree flag. |
-| `response` | raw | The GraphQL `data` object, verbatim. |
+Every row written during a job can be traced to the exact code and
+configuration that produced it.
 
-Cache identity = SHA-256 of `{kind, query_version, params}`, truncated to 32
-hex characters. Because `params` includes the page cursor, two pages of one
-query never collide.
+## `report_provenance` — how each report entered the corpus
 
-**Never stored:** client secret, access token, `Authorization` header. Enforced
-by scanning the serialized bytes before writing and refusing the write on a
-hit — a credential leak becomes a loud failure, not a file.
+`report_code`, `source_type`, `seed`, `discovered_at`, `rank`, `page`,
+`job_id`, `extra` (JSON).
 
----
+**One row per discovery event, not per report.** A report found by both a
+manual list and zone-scoped discovery keeps both records — which is what makes
+uploader and leaderboard bias assessable after the fact. Uniqueness is
+`(report_code, source_type, seed, job_id)`, so re-running one job does not
+invent a second discovery.
 
-## Implemented: pagination checkpoint
+## `reports`
 
-Persisted per paginated query so an interrupted download resumes exactly:
+`report_code` (PK), `title_hash`, `owner_hash`, `start_time_ms`, `end_time_ms`,
+`zone_id`, `zone_name`, `region_id`, `region_slug`, `revision`, `segments`,
+`visibility`, `is_archived`, `is_accessible`, `archive_date`, `log_version`,
+`game_version`, `retrieved_at`, `collection_status`.
 
-| Field | Kind | Notes |
-| --- | --- | --- |
-| `kind` | provenance | Logical query name. |
-| `report_code` | provenance | |
-| `variables` | provenance | Query variables for the resumed request. |
-| `next_start_time` | derived | Cursor to resume from. `NULL` once complete. |
-| `pages_fetched` | derived | Cumulative across resumes. |
-| `events_emitted` | derived | Cumulative count actually yielded. |
-| `boundary_timestamp` | derived | Timestamp of the last page's final event. |
-| `boundary_counts` | derived | Fingerprint → count of events already emitted at that timestamp. **Required for correctness on resume**: without it, a resume re-emits the boundary events. |
-| `complete` | derived | True when the cursor came back null. |
+Report **titles are hashed**: they routinely contain player and guild names.
 
----
+## `dungeon_runs`
 
-## Implemented: provenance block
+`run_id` (PK, `"<report_code>:<fight_id>"`), `report_code`, `fight_id`,
+`dungeon_key`, `encounter_id`, `game_zone_id`, `game_zone_name`, `wcl_zone_id`,
+`rel_start_ms`, `rel_end_ms`, `abs_start_ms`, `abs_end_ms`, `duration_ms`,
+`keystone_level`, `keystone_affixes` (JSON), `keystone_bonus`,
+`keystone_time_ms`, `rating`, `count_reached`, `count_required`,
+`average_item_level`, `kill`, `timed`, `size`, `npc_count_map` (JSON),
+`hotfix_epoch`, `key_bracket`, `duplicate_group_id`, `is_canonical`,
+`collection_status`, `job_id`.
 
-Recorded in every cache envelope, recon report and (later) collection job:
+`timed` is **derived** from `keystone_bonus > 0`. It stays `NULL` when the
+bonus is unknown: "not timed" and "unknown" are different facts.
 
-| Field | Notes |
+`collection_status` is an enum, not a boolean:
+
+`complete` · `metadata-only` · `archived-events-unavailable` · `inaccessible` ·
+`partial-run` · `malformed` · `collection-failed` · `validation-failed`
+
+**Only `complete` runs may enter an event-frequency denominator.**
+
+## `players` and `run_players`
+
+`players`: `player_id` (PK, salted hash), `first_seen`, `last_seen`,
+`run_count`. **No names.**
+
+`run_players`: `run_id`, `actor_id`, `player_id`, `class`, `spec`, `role`,
+`item_level`.
+
+Class and spec live on the *run*, not the player: a player brings a different
+character or spec to each run. `role` comes from `config/roles.yml`, because
+Warcraft Logs reports a spec but no role and role is game knowledge.
+
+> **Limitation.** Master data exposes no realm for players, so `player_id` is a
+> hash of the character name alone. Two same-named characters on different
+> realms collide. This weakens roster-based duplicate detection slightly and is
+> reported in every validation run.
+
+## `actors`
+
+`report_code` + `actor_id` (PK), `game_id`, `name`, `type`, `sub_type`, `icon`,
+`pet_owner`, `is_player`.
+
+**NPC names are kept** — they are the subject of the research. Player and pet
+names are pseudonymized at the ingest boundary, so no downstream table or
+export can leak one.
+
+## `abilities`
+
+`game_id` (PK), `name`, `icon`, `type`, `first_seen`, `last_seen`.
+
+`gameID` arrives as a float and is truncated to an integer.
+
+## `pulls`
+
+`pull_id` (PK, `"<run_id>:<wcl_pull_id>"`), `run_id`, `wcl_pull_id`,
+`pull_index`, `name`, `encounter_id`, `is_boss`, the four time bases,
+`duration_ms`, `kill`, `x`, `y`, `map_ids` (JSON), `bounding_box` (JSON),
+`composition_signature`, `npc_species_count`, `npc_total_count`,
+`prev_pull_id`, `next_pull_id`.
+
+Warcraft Logs' own pull boundaries are authoritative; no combat-gap detector
+exists. `is_boss` is derived from a non-zero `encounter_id`.
+
+`composition_signature` is canonical: `"236085x18 | 236084x2"`, sorted by game
+ID. Two pulls with the same signature at different coordinates are **not**
+assumed identical — `x`, `y`, `map_ids` and `pull_index` are retained so route
+context survives into analysis.
+
+## `pull_npcs`
+
+`pull_id`, `npc_game_id`, `actor_id`, `min_instance_id`, `max_instance_id`,
+`min_instance_group_id`, `max_instance_group_id`, `instance_count`,
+`instance_count_confidence`.
+
+`instance_count` is **derived** from the instance-ID range and always carries
+its confidence (`exact` | `inferred` | `unknown`), because a range is an
+inference about multiplicity, not a reported count. Absent instance IDs yield
+`(1, "inferred")`; a half-present range yields `(NULL, "unknown")`.
+
+Observed in live data: one pull held **18 copies** of NPC 236085.
+
+## `event_pages` — the pagination audit trail *and* the checkpoint
+
+`page_id` (PK), `run_id`, `data_type`, `hostility`, `page_index`,
+`requested_start_ms`, `requested_end_ms`, `cursor_ms`, `next_cursor_ms`,
+`event_count`, `raw_cache_path`, `status`, `error`, `fetched_at`.
+
+**Resume state lives here, not in a side file.** A page row is written in the
+same transaction as its events, so the last recorded page is by construction
+the last one whose events actually landed. There is no checkpoint that can
+disagree with the data. A stream is finished when its last page has
+`next_cursor_ms IS NULL`.
+
+## `events`
+
+Identity is `(page_id, seq_in_page)`. A re-fetched page **replaces** its own
+events rather than appending beside them, which is what makes re-ingest
+idempotent without needing a content hash — and a content hash would have been
+wrong anyway, since two genuinely identical events can occur at one
+millisecond.
+
+| Column group | Columns |
 | --- | --- |
-| `software_version` | Collector version. |
-| `normalizer_version` | Bumped when raw → normalized mapping changes. |
-| `query_version` | Bumped when `queries/*.graphql` change meaningfully. |
-| `schema_version` | Database schema version. `0` in Phase 0. |
-| `git_commit` | Short commit, or `NULL` outside a repo. |
-| `git_dirty` | `true` if uncommitted changes exist, so a recorded commit is known not to describe the code fully. |
+| Identity | `event_id`, `page_id`, `seq_in_page`, `run_id`, `report_code`, `pull_id`, `data_type`, `hostility` |
+| Time | `rel_ms`, `abs_ms`, `run_rel_ms`, `pull_rel_ms` |
+| Actors | `type`, `source_id`, `source_instance`, `target_id`, `target_instance` |
+| Abilities | `ability_game_id`, `extra_ability_game_id` |
+| Damage | `amount`, `absorbed`, `blocked`, `mitigated`, `unmitigated_amount`, `overkill`, `hit_type`, `is_tick`, `is_aoe` |
+| Auras | `stack`, `is_buff`, `buffs` |
+| Health | `hit_points`, `max_hit_points` |
+| Deaths | `killer_id`, `killer_instance`, `killing_ability_game_id` |
+| Position | `x`, `y`, `map_id` |
+| Everything else | `extra` (JSON), `normalizer_version` |
 
----
+Three columns deserve their own note, because each answers a question the brief
+expected to be unanswerable:
 
-## Proposed tables (Phase 1)
+- **`max_hit_points`** is on every damage event, so damage as a fraction of
+  player health is directly computable. No estimation needed.
+- **`buffs`** is a dot-separated list of aura IDs active on the target at the
+  instant of the hit (`"384072.386208.132404."`). "Was a defensive up for this
+  tankbuster" is a lookup, not a correlation across timelines.
+- **`unmitigated_amount`** beside `mitigated` separates what the mob swung for
+  from what the tank actually took — the difference between measuring danger
+  and measuring mitigation.
 
-Names are negotiable; the concepts are not. Column lists will be finalized
-against real event shapes after Gate A.
+`extra` holds every field not promoted, verbatim. Forcing events into a fixed
+schema would discard fields whose value is not yet understood, and the point is
+to answer questions not yet asked. New field names appearing in the API are
+raised as an `unexpected_event_fields` diagnostic rather than dropped silently.
 
-### `collection_jobs`
-Job ID, config hash, sample profile, event profile, start/end, status,
-software/normalizer/query/schema versions, git commit, reports attempted,
-reports completed, failures.
+### Indexes
 
-### `report_provenance`
-Report code, discovery source type, seed, discovery timestamp, rank, page.
-**One row per discovery event**, so a report found by two sources keeps both
-provenance records — necessary to assess uploader and leaderboard bias.
+Chosen for the queries the research actually runs, not speculatively:
 
-### `reports`
-Report code (PK), absolute start/end, visibility, archive status, accessibility,
-zone, revision, log version, retrieval time, owner pseudonym.
+| Index | Serves |
+| --- | --- |
+| `(pull_id, rel_ms)` | per-pull mechanic timelines |
+| `(run_id, source_id, source_instance, rel_ms)` | **per-NPC-copy cast recurrence** |
+| `(run_id, target_id, rel_ms)` | death windows, per-player damage |
+| `(ability_game_id, type)` | mechanic frequency across the corpus |
 
-### `dungeon_runs`
-Run ID (PK), report code, WCL fight ID, dungeon key, WCL zone ID, game zone ID,
-relative and absolute start/end, duration, key level, affixes, keystone bonus,
-keystone time, rating, count reached/required, average item level, kill state,
-timed flag, **hotfix epoch**, duplicate group ID, canonical-run flag, collection
-status.
+## `ingest_diagnostics`
 
-`collection_status` is an enum, not a boolean: `complete`, `metadata-only`,
-`archived-events-unavailable`, `inaccessible`, `partial-run`, `malformed`,
-`collection-failed`, `validation-failed`. **Only `complete` runs may enter an
-event-frequency denominator.**
+`job_id`, `run_id`, `kind`, `severity`, `detail`, `created_at`.
 
-### `players`
-Local player ID (PK), stable identity hash, class, spec, role, item level,
-talent import code. **No names.** The identity hash is salted with a fixed,
-non-secret project salt so the same player matches across reports — which is
-what roster-based duplicate detection needs.
-
-### `run_players`
-Run ID, player ID, report actor ID, role, spec, item level. Resolves the
-per-report actor ID to a stable player.
-
-### `actors`
-Report code, actor ID (composite PK), type, subtype, game ID, pet owner,
-player/NPC flag, name (NPCs only — player names are pseudonymized).
-
-### `abilities`
-Game ability ID (PK), name, icon, type, first seen, last seen.
-
-### `pulls`
-Pull ID (PK), run ID, pull index, WCL pull ID, encounter ID, relative and
-absolute start/end, duration, x, y, map IDs, bounding box, pull name, kill
-state, **composition signature**, previous/next pull ID.
-
-The composition signature is a canonical string of NPC game IDs and
-multiplicities (`npcA×1|npcB×2|npcC×1`) used to group similar pulls. Two pulls
-with the same signature at different coordinates are **not** assumed identical —
-x/y, map and sequence are retained precisely so route context is not lost.
-
-### `pull_npcs`
-Pull ID, NPC game ID, report actor ID, minimum/maximum instance ID,
-minimum/maximum instance group ID, derived multiplicity.
-
-Derived multiplicity is marked derived and carries a confidence flag: it is
-inferred from the instance-ID range, which is an inference, not a fact.
-
-### `event_pages`
-Page ID (PK), run ID, event category, requested start/end, page cursor,
-raw-cache path, event count, next cursor, success flag, error text.
-
-The audit trail for pagination: which pages were requested, which succeeded,
-and where the raw response lives.
-
-### `events`
-The core table. Minimum columns:
-
-report code, run ID, pull ID (nullable), report-relative ms, absolute ms,
-run-relative ms, pull-relative ms, event type, source actor ID, **source
-instance**, target actor ID, **target instance**, ability game ID, amount,
-absorbed, overkill, mitigated/blocked/resisted, hit type, tick flag, stack
-count, extra ability game ID, `extra` (JSON), raw-cache reference,
-normalizer version.
-
-`extra` holds every field not promoted to a column, as JSON. This is deliberate:
-forcing every event into a fixed schema would discard fields whose value is not
-yet understood, and the whole point is to answer questions not yet asked.
-
-`source_instance` and `target_instance` are **never** dropped or defaulted.
-They are the only thing separating two copies of one NPC species.
-
-### Derived views (reproducible from `events`)
-`casts`, `aura_transitions`, `dispels`, `interrupts`, `damage`, `healing`,
-`deaths`, `summons`.
-
-Views, not authored tables, so a change to interpretation is a re-derivation
-rather than a re-download. Each must be reconstructible from `events` plus the
-raw cache alone.
+Diagnostics are **data, not logging**. A validation report is only trustworthy
+if what could not be done is recorded beside what could. Kinds currently
+emitted: `report_unavailable`, `archived_report`, `no_matching_runs`,
+`no_pulls`, `overlapping_pulls`, `events_outside_pulls`,
+`unexpected_event_fields`, `empty_roster`, `event_collection_failed`,
+`report_failed`, `duplicate_candidate`, `pagination`, `selection`.
 
 ---
 
@@ -209,9 +237,20 @@ raw cache alone.
 
 | Rule | Reason |
 | --- | --- |
-| A cast start and its completion are **one** mechanic occurrence. | Counting both doubles every cast statistic. |
-| A true interrupt is raw; a CC "stop" is **derived with a confidence score**. | An incomplete cast may be an interrupt, a mob death, target loss, a phase change, or movement. Labelling all of them CC stops is wrong. |
-| Aura removal is not automatically a dispel. | Natural expiry and dispel are different events with different research meaning. |
+| A cast start (`begincast`) and its completion (`cast`) are **one** mechanic occurrence. | Counting both doubles every cast statistic. Both are stored; analysis must not sum them. |
+| A true interrupt is raw; a CC "stop" is **derived with a confidence score**. | An incomplete cast may be an interrupt, a mob death, target loss, a phase change, or movement. Labelling all of them CC stops invents data. |
+| Aura removal is not automatically a dispel. | `dispel` and `removedebuff` are different events with different research meaning. `is_buff` and `extra_ability_game_id` disambiguate. |
 | Mob death time and pull end time are stored so observations can be **censored**. | A mob that dies nine seconds after casting gives no evidence about a cooldown longer than nine seconds. |
-| Key level alone never explains cast counts. | The usual mechanism is: higher key → more health → longer pull → room for another cast. Pull duration and mob lifetime must be available alongside key level. |
-| Hotfix epoch is stored per run. | Mechanics change mid-season; pooling epochs silently would contaminate current-behaviour conclusions. |
+| Key level alone never explains cast counts. | The usual mechanism is: higher key → more health → longer pull → room for another cast. `duration_ms` and pull duration must accompany `keystone_level` in any such claim. |
+| `hotfix_epoch` is stored per run. | Mechanics change mid-season; pooling epochs silently would contaminate current-behaviour conclusions. |
+| Events outside every pull are **kept**. | Between-pull events are where movement, drinking and out-of-combat deaths live. Dropping them would hide why a pull started badly. |
+
+---
+
+## Not yet implemented
+
+Derived views (`casts`, `aura_transitions`, `dispels`, `interrupts`, `damage`,
+`deaths`) and Parquet export are Phase 5. They will be **views**, not authored
+tables, so a change in interpretation is a re-derivation rather than a
+re-download — and each must be reconstructible from `events` plus the raw cache
+alone.

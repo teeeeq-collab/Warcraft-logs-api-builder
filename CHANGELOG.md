@@ -9,6 +9,93 @@ recorded here.
 
 ---
 
+## 0.2.0 — 2026-09-12 — **Phase 1: the collector**
+
+Storage, ingestion and validation. Built against the event shapes observed in
+Phase 0, and tested end to end offline; it has not yet ingested a real report.
+
+- `software_version` 0.1.5 → 0.2.0
+- `schema_version` 0 → **1** (`migrations/001_initial.sql`)
+- 247 → **317 tests**, all offline
+
+### Added
+
+**Storage** — 14-table SQLite schema with a numbered migration runner, enforced
+foreign keys, WAL journaling and batched writes. Every table choice traces to
+an observed field; indexes are chosen for the queries the research actually
+runs, notably `(run_id, source_id, source_instance, rel_ms)` for per-NPC-copy
+cast recurrence.
+
+**Normalizer** — maps real report, fight, pull, NPC, master-data and event
+shapes to rows. Four timestamp bases per event (report-, absolute-, run- and
+pull-relative). Player and pet names pseudonymized at the ingest boundary; NPC
+and ability names kept. Unpromoted fields preserved verbatim in `extra`, and a
+field name the API starts returning that this project does not model is raised
+as a diagnostic rather than dropped.
+
+**Collector** — report → run → pulls → NPC instances → roster → events, with:
+
+- *Exact resume.* The pagination checkpoint is the `event_pages` table, and a
+  page row is written in the same transaction as its events. The last recorded
+  page is therefore by construction the last one whose events landed; there is
+  no checkpoint that can disagree with the data.
+- *Idempotent re-ingest.* Running a job twice changes no row counts. Event
+  identity is `(page_id, seq_in_page)`, not a content hash — two genuinely
+  identical events can occur at one millisecond, and a hash would merge them.
+- *Explicit failure states.* Archived, missing and partial reports are recorded
+  as states, never as silence.
+
+**Pull assignment** — Warcraft Logs' own boundaries, closed intervals, binary
+search. Events outside every pull are **kept**, counted and reported: they are
+where movement, drinking and out-of-combat deaths live. Overlapping pull
+intervals are reported rather than silently resolved.
+
+**Duplicate detection** — multi-field fingerprint (dungeon, key level, start
+time, duration, roster overlap, affixes) with transitive grouping. Deliberately
+biased toward false negatives: **nothing is ever deleted**, one member per
+group is marked canonical, and a "same group runs the key again" case is
+correctly *not* a duplicate.
+
+**Validation report** — JSON plus Markdown, covering run counts by status,
+bracket and epoch; event totals and pull-assignment rate; unknown actors and
+abilities; pagination completeness; duplicate groups; ingest diagnostics; and
+known limitations. Its central section **reconstructs a per-NPC-copy cast
+timeline from the database**, so "instance identity survived collection" is
+demonstrated rather than asserted — and when no such pull exists, the report
+says the claim is untested rather than passing silently.
+
+**CLI** — `collect` (with `--dry-run`, `--refresh`, `--dungeon`,
+`--max-runs-per-report`), `dedupe`, `validate`, `stats`.
+
+**Config** — `config/roles.yml` maps spec to role, because Warcraft Logs
+reports a spec but no role and role is game knowledge that changes between
+expansions.
+
+### Changed
+
+- Event profiles accept a hostility filter (`Casts@Enemies`). This is a
+  finding, not a tuning choice: an unfiltered cast sample returned 50 player
+  casts and zero NPC casts, which would have made NPC mechanic timelines
+  invisible. The mechanics profile now fetches enemy and friendly casts as
+  separate streams.
+- `report_provenance` is unique per *discovery event*
+  `(report_code, source_type, seed, job_id)`, so two sources finding one report
+  keep two rows while re-running one job does not invent a second.
+
+### Known limitation
+
+Player identity is a hash of the character name alone: master data exposes no
+realm, so two same-named characters on different realms collide. This slightly
+weakens roster-based duplicate detection and is stated in every validation run.
+
+### Not yet done
+
+**No real report has been ingested.** The pipeline is proven against the
+synthetic API only. Phase 1 closes when 5–10 real Murder Row runs pass
+validation and Gate C is assessed.
+
+---
+
 ## 0.1.5 — 2026-09-12 — **Gate A closed**
 
 The last Phase 0 unknown confirmed. No code changes; documentation and version

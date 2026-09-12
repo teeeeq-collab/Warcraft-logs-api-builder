@@ -23,7 +23,10 @@ from typing import Any
 import typer
 
 from .client import ApiError, GraphQLClient
+from .collect import Collector
 from .configs import ConfigFileError, ProjectConfig
+from .db import Database, DatabaseError
+from .dedupe import group_duplicates
 from .discover import discover_dungeons
 from .querybuild import WANTED_FIGHT_FIELDS, WANTED_REPORT_FIELDS, QueryError, render
 from .rawcache import RawCache
@@ -32,6 +35,7 @@ from .redaction import RedactedError, install_logging_redaction
 from .reportsource import DiscoveryError, ManualReportSource
 from .schema import SchemaIntrospector
 from .settings import ConfigError, Settings
+from .validate import collect_validation, write_reports
 from .version import provenance
 
 app = typer.Typer(
@@ -87,6 +91,15 @@ def _load_config() -> ProjectConfig:
 def _client(settings: Settings) -> GraphQLClient:
     settings.ensure_dirs()
     return GraphQLClient(settings)
+
+
+def _database(settings: Settings) -> Database:
+    settings.ensure_dirs()
+    try:
+        return Database(settings.db_dir / "wclmplus.sqlite")
+    except DatabaseError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
 
 
 def _fail(exc: Exception, hint: str = "") -> None:
@@ -585,6 +598,239 @@ def recon(
         "\nNext: review the report, copy confirmed behaviour into API_NOTES.md, and only "
         "then proceed to Phase 1."
     )
+
+
+# ---------------------------------------------------------------------------
+# collection
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def collect(
+    report_list: Path = typer.Option(
+        ...,
+        "--report-list",
+        help="File with one report code or URL per line. Check it first with `report-list-check`.",
+    ),
+    profile: str = typer.Option(
+        "mechanics", "--profile", help="Event profile from config/sampling.yml."
+    ),
+    dungeon: str | None = typer.Option(
+        None, "--dungeon", help='Only collect runs of this dungeon, e.g. "Murder Row".'
+    ),
+    max_runs: int | None = typer.Option(
+        None, "--max-runs-per-report", help="Cap runs taken from each report."
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Re-fetch events for runs already collected. Needed after a normalizer change; "
+        "otherwise completed streams are skipped.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be collected and make no API calls."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Collect reports into the local database.
+
+    Safe to interrupt: pagination checkpoints live in the database, so re-running
+    the same command resumes from the last page that actually landed. Safe to
+    re-run: a completed run is not collected twice.
+    """
+    _setup_logging(verbose)
+    settings = _load_settings()
+    config = _load_config()
+
+    try:
+        source = ManualReportSource.from_file(report_list)
+    except DiscoveryError as exc:
+        _fail(exc)
+        return
+
+    candidates = list(source.discover())
+    typer.echo(f"Report list:   {report_list} ({len(candidates)} report(s))")
+    typer.echo(f"Event profile: {profile}")
+    if dungeon:
+        typer.echo(f"Dungeon:       {dungeon}")
+
+    if dry_run:
+        typer.secho("\nDry run - no API calls made.", fg=typer.colors.YELLOW)
+        event_profile = config.sampling.event_profile(profile)
+        typer.echo("Would fetch these event streams per run:")
+        for spec in event_profile.event_types:
+            data_type, hostility = type(config.sampling).parse_event_type(spec)
+            typer.echo(f"  - {data_type}" + (f" (hostility: {hostility})" if hostility else ""))
+        typer.echo("\nReports:")
+        for candidate in candidates[:10]:
+            typer.echo(f"  {candidate.code}")
+        if len(candidates) > 10:
+            typer.echo(f"  ... and {len(candidates) - 10} more")
+        return
+
+    db = _database(settings)
+    with _client(settings) as client:
+        collector = Collector(client, db, config)
+        if refresh:
+            for row in db.query("SELECT run_id FROM dungeon_runs"):
+                collector.reset_run_events(row["run_id"])
+            typer.echo("Cleared existing events; they will be fetched again.")
+        try:
+            result = collector.collect(
+                candidates,
+                event_profile=profile,
+                dungeon_key=dungeon,
+                max_runs_per_report=max_runs,
+            )
+        except KeyboardInterrupt:
+            typer.secho(
+                "\nInterrupted. Everything fetched so far is saved - re-run the same "
+                "command to resume.",
+                fg=typer.colors.YELLOW,
+            )
+            raise typer.Exit(code=130) from None
+        except ApiError as exc:
+            _fail(exc)
+            return
+
+    summary = result.summary()
+    typer.echo("")
+    typer.secho(
+        f"Collected {summary['runs_complete']} of {summary['runs']} run(s) from "
+        f"{summary['reports_completed']} report(s).",
+        fg=typer.colors.GREEN if not summary["reports_failed"] else typer.colors.YELLOW,
+    )
+    typer.echo(f"  Events written: {summary['events_written']:,}")
+    typer.echo(f"  Pages fetched:  {summary['pages_fetched']:,}")
+    if summary["reports_failed"]:
+        typer.secho(f"  Reports failed: {summary['reports_failed']}", fg=typer.colors.RED)
+        for error in summary["errors"]:
+            typer.echo(f"    {error}")
+    typer.echo(f"  Job ID:         {summary['job_id']}")
+    typer.echo("\nNext: wclmplus validate")
+    db.close()
+
+
+@app.command()
+def dedupe(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+    """Group probable duplicate uploads of the same real run.
+
+    Nothing is deleted. One member of each group is marked canonical; the rest
+    stay queryable, because merging two genuinely different runs would corrupt
+    the data in a way that cannot be undone.
+    """
+    _setup_logging(verbose)
+    db = _database(_load_settings())
+    groups = group_duplicates(db)
+    if not groups:
+        typer.secho("No probable duplicate runs found.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"{len(groups)} probable duplicate group(s):", fg=typer.colors.YELLOW)
+        for members in list(groups.values())[:20]:
+            typer.echo(f"  {' = '.join(members)}")
+        typer.echo("\nNothing deleted. One run per group is marked canonical.")
+    db.close()
+
+
+@app.command()
+def validate(
+    dungeon: str | None = typer.Option(
+        None, "--dungeon", help="Restrict the report to one dungeon."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Write the validation report for the collected corpus.
+
+    Produces `data/exports/validation/VALIDATION_REPORT.md` and
+    `validation.json`, including a reconstructed per-NPC-copy mechanic timeline
+    as evidence that instance identity survived collection.
+    """
+    _setup_logging(verbose)
+    settings = _load_settings()
+    db = _database(settings)
+
+    dungeon_key = _load_config().dungeons.resolve(dungeon).key if dungeon else None
+    report = collect_validation(db, dungeon_key=dungeon_key)
+
+    if json_output:
+        _echo_json(report)
+        db.close()
+        return
+
+    json_path, md_path = write_reports(report, settings.exports_dir / "validation")
+
+    runs, events = report["runs"], report["events"]
+    typer.echo(f"Runs analysable:  {runs['analysable']}")
+    typer.echo(f"Events:           {events['total']:,}")
+    typer.echo(f"Assigned to pull: {events['assigned_to_pulls']:,} ({events['assigned_pct']}%)")
+    if report["pages"]["incomplete_streams"]:
+        typer.secho(
+            f"Incomplete event streams: {report['pages']['incomplete_streams']} "
+            "- re-run `collect` to resume.",
+            fg=typer.colors.YELLOW,
+        )
+
+    evidence = report["npc_instance_evidence"]
+    if evidence:
+        typer.secho(
+            f"\nNPC instance identity demonstrated on {len(evidence)} pull(s):",
+            fg=typer.colors.GREEN,
+        )
+        for item in evidence[:3]:
+            copies = ", ".join(
+                f"copy {c['instance']}: {c['casts']} cast(s) from {c['first_cast_ms_into_pull']}ms"
+                for c in item["per_copy"]
+            )
+            typer.echo(f"  {item['npc']} / {item['ability']} - {copies}")
+    else:
+        typer.secho(
+            "\nNo pull held two copies of one NPC casting, so instance separation is "
+            "UNTESTED in this corpus.",
+            fg=typer.colors.YELLOW,
+        )
+
+    if report["limitations"]:
+        typer.secho(f"\n{len(report['limitations'])} limitation(s):", fg=typer.colors.YELLOW)
+        for index, text in enumerate(report["limitations"], start=1):
+            typer.echo(f"  {index}. {text}")
+
+    typer.echo(f"\nReport:   {md_path}")
+    typer.echo(f"Evidence: {json_path}")
+    db.close()
+
+
+@app.command()
+def stats(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+    """Show what is in the local database."""
+    _setup_logging(verbose)
+    settings = _load_settings()
+    db = _database(settings)
+
+    counts = db.table_counts()
+    typer.echo(f"Database: {db.path}  ({db.size_bytes() / 1_048_576:.1f} MiB)")
+    typer.echo("")
+    for table, count in counts.items():
+        if count:
+            typer.echo(f"  {table:<22} {count:>10,}")
+
+    runs = db.query(
+        "SELECT dungeon_key, key_bracket, COUNT(*) AS runs, "
+        "       ROUND(AVG(duration_ms)/1000.0) AS mean_s "
+        "  FROM dungeon_runs WHERE collection_status = 'complete' "
+        " GROUP BY dungeon_key, key_bracket ORDER BY dungeon_key, key_bracket"
+    )
+    if runs:
+        typer.echo("\nComplete runs:")
+        typer.echo(f"  {'dungeon':<22} {'bracket':<10} {'runs':>5} {'mean dur':>10}")
+        for row in runs:
+            typer.echo(
+                f"  {str(row['dungeon_key']):<22} {str(row['key_bracket']):<10} "
+                f"{row['runs']:>5} {str(row['mean_s']) + 's':>10}"
+            )
+    else:
+        typer.echo("\nNo complete runs yet. Run `wclmplus collect --report-list <file>`.")
+    db.close()
 
 
 def main() -> None:

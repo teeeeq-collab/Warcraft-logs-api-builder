@@ -10,25 +10,24 @@ It is not a dungeon guide and not a web app. It is a collector plus a dataset
 detailed enough that new questions can be answered later **without
 re-downloading anything**.
 
-> **Current status: Phase 0 complete, Gate A passed. Phase 1 starting.**
+> **Current status: Phase 1 built. Awaiting the first real collection.**
 >
-> Five live runs against the real API. Confirmed: every field the research
-> design needs exists; **pagination is lossless** (316 pages, 7,920 events in,
-> 7,920 out); **NPC instance identity is real end to end** — one pull held 18
-> copies of a single NPC, and enemy cast events carry the instance marker, so
-> two copies of the same caster keep separate timelines; **Midnight Season 2 is
+> Phase 0 closed with Gate A passed after five live API runs. Phase 1 — the
+> database, ingestion, resume, duplicate detection and validation reporting —
+> is implemented and tested end to end, **but has never ingested a real
+> report.** That is the next step.
+>
+> Confirmed live in Phase 0: every field the research design needs exists;
+> **pagination is lossless** (316 pages, 7,920 events in, 7,920 out); **NPC
+> instance identity is real end to end** — one pull held 18 copies of a single
+> NPC, and enemy cast events carry the instance marker; **Midnight Season 2 is
 > zone 55** with all eight dungeons identified; and **report discovery works
 > season-wide**, so sampling is not confined to leaderboard logs.
 >
 > The data supports more than the brief assumed: damage events carry
 > `maxHitPoints` (damage as a share of player health), `buffs` (which
-> defensives were up at the moment of the hit) and `unmitigatedAmount` (what
+> defensives were up at the instant of the hit) and `unmitigatedAmount` (what
 > the mob swung for, versus what the tank took).
->
-> **One lesson that shapes collection:** an unfiltered event query is dominated
-> by players. Filtering to `hostilityType: Enemies` is what makes the enemy
-> side visible at all — unfiltered, a cast sample returned five players and
-> zero NPCs.
 
 ---
 
@@ -170,6 +169,10 @@ Nothing here requires you to understand GraphQL.
 | `wclmplus inspect-report CODE` | Summarize one report and its Mythic+ runs |
 | `wclmplus discover-dungeons [--write]` | Resolve dungeon names to live zone/encounter IDs |
 | `wclmplus recon [--report CODE]` | Full Phase 0 reconnaissance |
+| `wclmplus collect --report-list FILE` | Collect reports into the local database |
+| `wclmplus dedupe` | Group probable duplicate uploads of one run |
+| `wclmplus validate` | Write the validation report for the corpus |
+| `wclmplus stats` | Show what is in the local database |
 
 Every command has `--help`.
 
@@ -253,7 +256,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-247 tests, all offline: no credentials, no network. Live smoke tests are
+317 tests, all offline: no credentials, no network. Live smoke tests are
 opt-in via `pytest -m live`.
 
 The suite covers secret redaction, OAuth failure modes, GraphQL error

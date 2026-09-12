@@ -25,22 +25,31 @@ event_profiles:
 
   mechanics:
     description: "Default research profile: what a tank/healer experiences."
+    # An entry may carry a hostility filter as "Type@Hostility".
+    #
+    # This is not an optimisation. A live sample of unfiltered Casts returned
+    # 50 events from five PLAYERS and not one NPC -- players simply out-cast
+    # the trash in raw event count, and players are not instanced, so the
+    # sample carried no sourceInstance at all. Filtering to Enemies returned 11
+    # distinct NPCs with 36 of 50 events carrying the instance marker.
+    # Splitting the two is what makes NPC cast timelines visible.
     event_types:
-      - Casts
+      - Casts@Enemies        # the mechanics themselves
+      - Casts@Friendlies     # player defensives, interrupt attempts, dispels
       - Debuffs
       - Buffs
       - Interrupts
       - Dispels
       - Deaths
       - Summons
-      - DamageTaken
+      - DamageTaken          # player-side incoming damage: the danger signal
     include_combatant_info: true
-    # DamageTaken is player-side incoming damage; this is the tank/party danger signal.
 
   full:
     description: "Adds healing and full damage. Larger; justify before large samples."
     event_types:
-      - Casts
+      - Casts@Enemies
+      - Casts@Friendlies
       - Debuffs
       - Buffs
       - Interrupts

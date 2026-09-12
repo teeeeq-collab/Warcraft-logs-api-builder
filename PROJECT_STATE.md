@@ -2,9 +2,9 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12 (after fifth live recon run — Gate A closed)
-- **Software version:** 0.1.5
-- **Database schema version:** 0 (no schema implemented yet)
+- **Last updated:** 2026-09-12 (Phase 1 implementation complete)
+- **Software version:** 0.2.0
+- **Database schema version:** 1 (`migrations/001_initial.sql`)
 - **Normalizer version:** 1
 - **Query set version:** 4
 
@@ -12,66 +12,55 @@ Authoritative summary of where this project is. Updated at every gate.
 
 ## Current milestone
 
-**Phase 0 — API reconnaissance. COMPLETE. Gate A passed.**
+**Phase 1 — Murder Row pilot. Implementation complete; awaiting real runs.**
 
-The fourth live run finished all 16 steps with 0 failures and one recorded
-limitation (`Report.gameVersion` does not exist, and nothing needs it).
+Phase 0 closed with Gate A passed after five live runs. Phase 1 is now built
+and tested end to end against the synthetic API: schema, ingestion, pull
+assignment, resume, duplicate detection, validation reporting and CLI.
 
-### Gate A — API reconnaissance: **PASSED**
+**300 tests pass**, all offline.
 
-| Gate A question | Answer |
+### What Phase 1 delivers
+
+| Piece | State |
 | --- | --- |
-| Are the required fields available? | **Yes.** ReportFight 23/23, ReportDungeonPull 10/10, ReportDungeonPullNPC 6/6, Report 11/12. All 14 `EventDataType` values. |
-| How does pagination work? | **Measured.** Cursor is **exclusive**. A 316-page traversal returned 7,920 events and emitted 7,920 — nothing lost, nothing double-counted, no out-of-order timestamps, no warnings. |
-| How can reports be discovered? | **Broadly.** `ReportData.reports` answers unscoped *and* zone-scoped with no guild or user seed. Zone-scoped is the one to build on: it returns exactly the Season 2 population. |
-| What is the observed API cost? | **Measured, and not the constraint.** The whole run cost ~29 points of 3600/hour; 316 event pages ≈ 0.05 points each. Time and bytes bind first: 97 s and 3.3 MB. |
-| Are there access limitations? | **Yes, and detectable.** `archiveStatus` works; `User.avatar` and `User.battleTag` are permission-gated and are no longer requested. |
-| Are dungeon pulls sufficiently detailed? | **Yes.** 13 pulls on one +10 run, each with its enemy NPC list, coordinates, bounding box and map. |
+| SQLite schema + migrations | 14 tables, schema version 1, built against **observed** event fields |
+| Ingestion | report → run → pulls → NPC instances → roster → events |
+| Pull assignment | WCL boundaries authoritative; unassigned events kept and counted |
+| Resume | Checkpoint is the `event_pages` table, written in the same transaction as its events |
+| Idempotent re-ingest | Re-running a job changes no row counts |
+| Duplicate detection | Multi-field fingerprint, transitive grouping, **nothing deleted** |
+| Validation report | JSON + Markdown, with a reconstructed per-NPC-copy timeline as evidence |
+| CLI | `collect`, `dedupe`, `validate`, `stats` added |
 
-### What the data turned out to support
+### Design decisions the live data forced
 
-Three findings materially exceed what the brief assumed possible:
-
-- **`maxHitPoints` is on every damage event**, so damage as a fraction of
-  player health is directly reconstructible. The brief said not to guess at
-  this; no guessing is needed.
-- **`buffs` is on every damage event** — the aura IDs active on the target at
-  the moment of the hit. "Was a defensive up for this tankbuster" becomes a
-  lookup rather than a correlation across timelines.
-- **`unmitigatedAmount` alongside `mitigated`** separates what the mob swung
-  for from what the tank actually took — the difference between measuring
-  danger and measuring mitigation.
-
-Plus `extraAbilityGameID` on both interrupts and dispels, naming *what was
-interrupted* and *what was removed* — the two links the brief's interrupt and
-dispel questions depend on.
-
-### The last unknown, now closed
-
-Enemy cast events **do** carry instance identity. Filtering the same fight to
-`hostilityType: Enemies` returned 11 distinct NPC actors with 36 of 50 events
-carrying `sourceInstance`, and both `cast` and `begincast` — so cast start and
-cast completion are separately observable, which is what distinguishes an
-interrupted cast from a completed one without inference.
-
-The unfiltered sample had returned five players and zero instance markers.
-That contrast is the finding to carry forward: **an unfiltered event query is
-dominated by players**, and `hostilityType` is not an optimisation here, it is
-what makes the enemy side visible at all.
-
-One nuance recorded rather than resolved: 14 of 50 enemy casts carried no
-`sourceInstance`, almost certainly single-copy NPCs. Stored as NULL and
-resolved against the pull's instance range at analysis time; where a pull holds
-several copies the attribution is unknown and is recorded as unknown.
+1. **Events are fetched per hostility.** An unfiltered cast sample returned 50
+   player casts and zero NPC casts. `Casts@Enemies` and `Casts@Friendlies` are
+   separate streams in the mechanics profile, because unfiltered would have
+   made NPC mechanic timelines invisible.
+2. **`source_instance` is never defaulted.** A NULL means the API did not say.
+   Resolving it to "copy 1" at ingestion would assert a fact about the pull
+   that only the pull's instance range can establish.
+3. **Re-ingest identity is `(page_id, seq_in_page)`, not a content hash.** Two
+   genuinely identical events can occur at one millisecond; a content hash
+   would silently merge them.
+4. **`instance_count` carries a confidence.** It is derived from an ID range,
+   and a derived multiplicity must never be mistaken for a reported one.
 
 ---
 
 ## Blockers
 
-### B1 — Enemy-cast instance identity — **RESOLVED**
+### B1 — Pilot runs needed (open, requires user action)
 
-Confirmed live: 36 of 50 enemy cast events carry `sourceInstance`, across 11
-distinct NPC actors. Per-NPC-copy cast timelines are supported by the API.
+The pipeline has never ingested a real report. It needs 5–10 Murder Row runs
+across key levels to prove the same on live data.
+
+```
+.venv\Scripts\wclmplus.exe collect --report-list reports.txt --dungeon "Murder Row"
+.venv\Scripts\wclmplus.exe validate
+```
 
 ### B2 — Season dungeon list — **RESOLVED**
 
@@ -142,24 +131,23 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 | Case | Status |
 | --- | --- |
-| V1 NPC instance identity | **Confirmed for Debuffs, DamageTaken, Interrupts, Buffs, Deaths, Summons.** Pull level confirmed on a real fixture: 18 copies of NPC 236085 in one pull. Enemy *casts* pending one probe. |
-| V2 Pagination completeness | **PASSED live.** Exclusive cursor; 316 pages, 7,920 in, 7,920 out, no warnings. Plus 22 offline tests covering both cursor semantics. |
-| V3-V6 Mechanic timelines | Ready to attempt — every event shape they need is confirmed present. |
-| V7 Priority interrupt | **Reconstructible.** `interrupt` events carry `extraAbilityGameID` (what was interrupted) and `targetInstance` (which copy). |
-| V8 CC stop inference | Ready to attempt; still needs the confidence-scored inference rules. |
-| V9 Event-to-pull assignment | NOT STARTED — Phase 1. |
-| V10 Credential safety | **PASSED** across four live runs. No credential in any output, report or fixture. |
+| V1 NPC instance identity | **PASSED against the API** (pull level: 18 copies in one pull; event level: enemy casts, debuffs, damage, interrupts, deaths all carry instance markers). **Reconstructed from the database** in the validation report, so the claim is demonstrated end to end — but only on synthetic data so far. |
+| V2 Pagination completeness | **PASSED live.** Exclusive cursor; 316 pages, 7,920 in, 7,920 out. Plus 22 offline tests over both cursor semantics, and a resume test that interrupts mid-stream and lands on identical data. |
+| V3-V6 Mechanic timelines | Not started. Needs real pilot runs. |
+| V7 Priority interrupt | Reconstructible: `interrupt` carries `extra_ability_game_id` and `target_instance`. Untested on real data. |
+| V8 CC stop inference | Not started; needs the confidence-scored inference rules. |
+| V9 Event-to-pull assignment | **Implemented and tested offline.** Unassigned events retained and reported. Real assignment rate unknown. |
+| V10 Credential safety | **PASSED** across five live runs and the whole Phase 1 pipeline. No credential or player name reaches the database, reports or exports. |
 
 ## Next actions
 
-**Phase 0 is closed. Phase 1 starts.** No user action is pending.
+1. **User:** assemble a list of 5-10 public Murder Row report URLs across key
+   levels, then run `collect` and `validate`. Send back the validation report.
+2. **Coordinator:** review Gate C questions against real data — is
+   normalization stable, is resume reliable on a real report, are known
+   mechanics visible, is deduplication plausible, is data volume manageable?
+3. **Then Phase 2:** expand to 50-100 runs across brackets, measure per-run
+   cost and growth, and produce the first empirical mechanic-frequency analysis.
 
-1. **Phase 1 — the Murder Row pilot:**
-   - SQLite schema and migrations, built against the *observed* event fields
-   - Ingestion: report → run → pulls → NPC instances → events
-   - Event-to-pull assignment with diagnostics
-   - Checkpoint/resume, idempotent re-ingest, duplicate-run detection
-   - Validation report, then 5-10 Murder Row runs
-
-Phase 1's schema design no longer rests on guesses: `DATA_DICTIONARY.md` can be
-rewritten against real field lists.
+Gate C must pass before Phase 2. The pipeline is proven against synthetic data
+only; a real report is the thing that has never been ingested.

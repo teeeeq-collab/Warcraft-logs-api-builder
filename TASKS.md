@@ -32,19 +32,22 @@ this repository; `user` means a step only the credential holder can perform.
 
 ---
 
-## Phase 1 — Tiny Murder Row pilot (not started)
+## Phase 1 — Tiny Murder Row pilot
 
-| ID | Description | Owner | Status | Depends on | Acceptance criteria |
-| --- | --- | --- | --- | --- | --- |
-| P1-1 | SQLite schema and migrations | coordinator | TODO | P0-20 | Tables for jobs, provenance, reports, runs, players, actors, abilities, pulls, pull NPCs, event pages, events; indexes justified by a real query |
-| P1-2 | Report ingestion and run extraction | coordinator | TODO | P1-1 | Keystone metadata stored; non-Mythic+ fights excluded; archived/partial states explicit |
-| P1-3 | Pull extraction and event assignment | coordinator | TODO | P1-2 | WCL pull boundaries authoritative; unassigned events retained and counted; overlaps diagnosed |
-| P1-4 | NPC instance identity | coordinator | TODO | P1-3 | A pull with two copies of one species yields two separate timelines; proven on a real fixture |
-| P1-5 | Event collection with resume | coordinator | TODO | P1-1, P0-8 | Interrupt mid-report and resume; result identical to an uninterrupted run |
-| P1-6 | Idempotent re-ingest | coordinator | TODO | P1-5 | Running the same job twice changes no row counts |
-| P1-7 | Duplicate-run detection | coordinator | TODO | P1-2 | Multi-field fingerprint; uncertain cases grouped and flagged, never deleted |
-| P1-8 | Validation report | coordinator | TODO | P1-1…P1-7 | JSON + Markdown with counts, assignment rates, unknown actors/abilities, pagination warnings, limitations |
-| P1-9 | Gate B and Gate C decisions | coordinator | TODO | P1-8 | Both question sets answered from evidence on 5–10 runs |
+| ID | Description | Owner | Status | Acceptance criteria |
+| --- | --- | --- | --- | --- |
+| P1-1 | SQLite schema and migrations | coordinator | DONE | 14 tables against observed fields; migration runner applies and records versions; foreign keys enforced |
+| P1-2 | Normalizer | coordinator | DONE | Real event shapes map to rows; four timestamp bases; players pseudonymized; unmodelled fields preserved in `extra` and reported |
+| P1-3 | Report and run ingestion | coordinator | DONE | Keystone metadata stored; non-Mythic+ fights excluded; archived and missing reports recorded as explicit states |
+| P1-4 | Pull extraction and event assignment | coordinator | DONE | WCL boundaries authoritative; events outside every pull retained and counted; overlapping intervals reported |
+| P1-5 | NPC instance identity | coordinator | DONE | Two copies of one species produce separate timelines; proven by query and by the validation report |
+| P1-6 | Event collection with resume | coordinator | DONE | Interrupt mid-stream, resume, land on identical data with no duplicated pages |
+| P1-7 | Idempotent re-ingest | coordinator | DONE | Re-running a job changes no row counts; `--refresh` forces a rebuild |
+| P1-8 | Duplicate-run detection | coordinator | DONE | Multi-field fingerprint; transitive grouping; nothing deleted; one canonical member per group |
+| P1-9 | Validation report | coordinator | DONE | JSON + Markdown with counts, assignment rate, unknown actors/abilities, diagnostics, limitations, and a reconstructed per-copy timeline |
+| P1-10 | CLI | coordinator | DONE | `collect` (with `--dry-run`, `--refresh`, `--dungeon`), `dedupe`, `validate`, `stats` |
+| P1-11 | **Pilot collection on real reports** | user | **BLOCKED** | 5-10 Murder Row runs ingested; validation report produced from live data |
+| P1-12 | Gate C decision | coordinator | BLOCKED | Normalization stable, resume reliable, known mechanics visible, dedupe plausible, volume manageable |
 
-Phases 2–5 are described in the research brief and are not broken down until
-Gate A passes: their design depends on the real event shape.
+Phases 2-5 are described in the research brief and are not broken down until
+Gate C passes: their shape depends on what the pilot measures.

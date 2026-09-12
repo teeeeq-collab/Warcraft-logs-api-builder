@@ -1,0 +1,774 @@
+"""Collection: report -> run -> pulls -> NPC instances -> events -> database.
+
+Two properties this module exists to guarantee:
+
+* **Resume is exact.** Pagination checkpoints live in the `event_pages` table,
+  not in a side file. A page is written only after its events are written, in
+  one transaction, so an interrupted collection resumes from the last page that
+  actually landed. There is no state that can disagree with the data.
+
+* **Re-ingest is idempotent.** Running the same job twice changes no row
+  counts. Runs and pulls are replaced by primary key; a re-fetched event page
+  replaces its own events rather than appending beside them.
+
+Event fetching is split by hostility where it matters. That is a finding, not
+a tuning choice: an unfiltered cast sample came back as fifty player casts and
+zero NPC casts, which would have made NPC mechanic timelines invisible.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from .client import ApiError, GraphQLClient
+from .configs import ProjectConfig, SamplingConfig
+from .db import Database, json_or_none
+from .normalize import (
+    is_mythic_plus,
+    normalize_abilities,
+    normalize_actors,
+    normalize_event,
+    normalize_pulls,
+    normalize_report,
+    normalize_run,
+    normalize_run_players,
+    run_id_for,
+    unexpected_event_fields,
+)
+from .paginate import EventPaginator, PageResult
+from .pullassign import PullAssigner
+from .querybuild import (
+    WANTED_FIGHT_FIELDS,
+    WANTED_PULL_FIELDS,
+    WANTED_PULL_NPC_FIELDS,
+    WANTED_REPORT_FIELDS,
+    load_query,
+    render,
+)
+from .redaction import RedactedError
+from .reportsource import ReportCandidate
+from .schema import SchemaIntrospector
+from .version import (
+    NORMALIZER_VERSION,
+    QUERY_VERSION,
+    SCHEMA_VERSION,
+    SOFTWARE_VERSION,
+    provenance,
+)
+
+logger = logging.getLogger(__name__)
+
+#: Events requested per page. The documented ceiling is 10,000 and untested;
+#: this is deliberately below it, and page size is an ingestion detail that
+#: cannot affect results because pagination is lossless either way.
+EVENTS_PAGE_LIMIT = 2000
+
+
+class CollectionError(RedactedError):
+    """Collection failed for a reason worth stopping on."""
+
+
+@dataclass
+class EventRequest:
+    """One event stream to fetch: a category, optionally hostility-filtered."""
+
+    data_type: str
+    hostility: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.data_type}@{self.hostility}" if self.hostility else self.data_type
+
+
+@dataclass
+class RunOutcome:
+    """What happened to one run."""
+
+    run_id: str
+    status: str
+    events_written: int = 0
+    pages_fetched: int = 0
+    pulls: int = 0
+    assignment: dict[str, Any] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CollectionResult:
+    job_id: str
+    reports_attempted: int = 0
+    reports_completed: int = 0
+    reports_failed: int = 0
+    runs: list[RunOutcome] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "reports_attempted": self.reports_attempted,
+            "reports_completed": self.reports_completed,
+            "reports_failed": self.reports_failed,
+            "runs": len(self.runs),
+            "runs_complete": sum(1 for r in self.runs if r.status == "complete"),
+            "events_written": sum(r.events_written for r in self.runs),
+            "pages_fetched": sum(r.pages_fetched for r in self.runs),
+            "errors": self.errors[:20],
+        }
+
+
+class Collector:
+    """Fetches reports and writes them into the database."""
+
+    def __init__(
+        self,
+        client: GraphQLClient,
+        db: Database,
+        config: ProjectConfig,
+        *,
+        job_id: str | None = None,
+        page_limit: int = EVENTS_PAGE_LIMIT,
+    ) -> None:
+        self.client = client
+        self.db = db
+        self.config = config
+        self.introspector = SchemaIntrospector(client)
+        self.job_id = job_id or uuid.uuid4().hex[:16]
+        self.page_limit = page_limit
+        self._selections: dict[str, str] = {}
+
+    # -- schema-safe selections -------------------------------------------
+
+    def _selection(self, type_name: str, wanted: list[str]) -> str:
+        """Introspection-derived selection set, cached per type."""
+        if type_name not in self._selections:
+            present = self.introspector.present_fields(type_name, wanted)
+            if not present:
+                raise CollectionError(
+                    f"The live schema exposes none of the wanted {type_name} fields. "
+                    "Run `wclmplus schema-check` before collecting."
+                )
+            selection = self.introspector.build_selection(type_name, present)
+            for warning in selection.warnings:
+                self.db.diagnostic("selection", warning, job_id=self.job_id, severity="info")
+            self._selections[type_name] = selection.text
+        return self._selections[type_name]
+
+    # -- job lifecycle ----------------------------------------------------
+
+    def start_job(self, *, sample_profile: str | None, event_profile: str) -> None:
+        prov = provenance()
+        self.db.upsert(
+            "collection_jobs",
+            {
+                "job_id": self.job_id,
+                "started_at": time.time(),
+                "finished_at": None,
+                "status": "running",
+                "sample_profile": sample_profile,
+                "event_profile": event_profile,
+                "config_hash": self.config.hash(),
+                "software_version": SOFTWARE_VERSION,
+                "normalizer_version": NORMALIZER_VERSION,
+                "query_version": QUERY_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "git_commit": prov.get("git_commit"),
+                "git_dirty": 1 if prov.get("git_dirty") else 0,
+            },
+        )
+        self.db.conn.commit()
+
+    def finish_job(self, result: CollectionResult, status: str = "complete") -> None:
+        self.db.execute(
+            "UPDATE collection_jobs SET finished_at = ?, status = ?, reports_attempted = ?, "
+            "reports_completed = ?, reports_failed = ? WHERE job_id = ?",
+            (
+                time.time(),
+                status,
+                result.reports_attempted,
+                result.reports_completed,
+                result.reports_failed,
+                self.job_id,
+            ),
+        )
+        self.db.conn.commit()
+
+    # -- event profile ----------------------------------------------------
+
+    def event_requests(self, event_profile: str) -> list[EventRequest]:
+        profile = self.config.sampling.event_profile(event_profile)
+        requests: list[EventRequest] = []
+        for spec in profile.event_types:
+            data_type, hostility = SamplingConfig.parse_event_type(spec)
+            requests.append(EventRequest(data_type=data_type, hostility=hostility))
+        return requests
+
+    # -- report -----------------------------------------------------------
+
+    def collect_report(
+        self,
+        candidate: ReportCandidate,
+        *,
+        event_profile: str = "mechanics",
+        dungeon_key: str | None = None,
+        max_runs: int | None = None,
+    ) -> list[RunOutcome]:
+        """Ingest one report: metadata, its Mythic+ runs, and their events."""
+        code = candidate.code
+        logger.info("Collecting report %s", code)
+
+        self.db.upsert(
+            "report_provenance",
+            {
+                "report_code": code,
+                "source_type": candidate.provenance.source_type,
+                "seed": candidate.provenance.seed,
+                "discovered_at": candidate.provenance.discovered_at,
+                "rank": candidate.provenance.rank,
+                "page": candidate.provenance.page,
+                "job_id": self.job_id,
+                "extra": json_or_none(candidate.provenance.extra),
+            },
+            replace=False,
+        )
+
+        report = self._fetch_report(code)
+        if report is None:
+            self.db.diagnostic(
+                "report_unavailable",
+                f"Report {code} returned no data (private, deleted, or wrong code).",
+                job_id=self.job_id,
+                severity="error",
+            )
+            self.db.conn.commit()
+            return []
+
+        report_row = normalize_report(report, retrieved_at=time.time())
+        report_start_ms = int(report_row["start_time_ms"] or 0)
+
+        if report_row.get("is_archived"):
+            report_row["collection_status"] = "archived-events-unavailable"
+            self.db.diagnostic(
+                "archived_report",
+                f"Report {code} is archived; its runs must not enter an "
+                "event-frequency denominator.",
+                job_id=self.job_id,
+                severity="warning",
+            )
+
+        with self.db.transaction():
+            self.db.upsert("reports", report_row)
+
+        fights = self._fetch_fights(code)
+        runs = [f for f in fights if is_mythic_plus(f)]
+        if dungeon_key is not None:
+            entry = self.config.dungeons.resolve(dungeon_key)
+            wanted_encounters = set(entry.encounter_ids)
+            if wanted_encounters:
+                runs = [f for f in runs if f.get("encounterID") in wanted_encounters]
+            else:
+                runs = [
+                    f
+                    for f in runs
+                    if str((f.get("gameZone") or {}).get("name", "")).lower()
+                    == entry.display_name.lower()
+                ]
+        if max_runs is not None:
+            runs = runs[:max_runs]
+
+        if not runs:
+            self.db.diagnostic(
+                "no_matching_runs",
+                f"Report {code} held no Mythic+ run matching the request "
+                f"({len(fights)} fights seen).",
+                job_id=self.job_id,
+                severity="info",
+            )
+            self.db.conn.commit()
+            return []
+
+        master = self._fetch_master_data(code)
+        outcomes: list[RunOutcome] = []
+        for fight in runs:
+            outcomes.append(
+                self._collect_run(
+                    fight,
+                    report_code=code,
+                    report_start_ms=report_start_ms,
+                    master=master,
+                    event_profile=event_profile,
+                    archived=bool(report_row.get("is_archived")),
+                )
+            )
+        return outcomes
+
+    # -- run --------------------------------------------------------------
+
+    def _collect_run(
+        self,
+        fight: dict[str, Any],
+        *,
+        report_code: str,
+        report_start_ms: int,
+        master: dict[str, Any],
+        event_profile: str,
+        archived: bool,
+    ) -> RunOutcome:
+        fight_id = int(fight.get("id") or 0)
+        run_id = run_id_for(report_code, fight_id)
+        outcome = RunOutcome(run_id=run_id, status="collection-failed")
+
+        dungeon_key, wcl_zone_id = self._resolve_dungeon(fight)
+        run_row = normalize_run(
+            fight,
+            report_code=report_code,
+            report_start_ms=report_start_ms,
+            hotfix_epoch=self.config.hotfixes.epoch_for(
+                report_start_ms + int(fight.get("startTime") or 0)
+            ),
+            key_bracket=self.config.sampling.bracket_for(fight.get("keystoneLevel")),
+            dungeon_key=dungeon_key,
+            wcl_zone_id=wcl_zone_id,
+            collection_status="metadata-only",
+            job_id=self.job_id,
+        )
+
+        with self.db.transaction():
+            self.db.upsert("dungeon_runs", run_row)
+            self._store_master_data(master, report_code=report_code)
+            self._store_roster(master, run_id=run_id, fight=fight)
+
+        pull_rows, npc_rows = self._collect_pulls(
+            report_code=report_code,
+            fight_id=fight_id,
+            run_id=run_id,
+            report_start_ms=report_start_ms,
+            run_rel_start_ms=int(run_row["rel_start_ms"]),
+        )
+        outcome.pulls = len(pull_rows)
+
+        if archived:
+            outcome.status = "archived-events-unavailable"
+            self._set_run_status(run_id, outcome.status)
+            return outcome
+
+        assigner = PullAssigner.from_rows(pull_rows)
+        if assigner.overlaps:
+            self.db.diagnostic(
+                "overlapping_pulls",
+                f"{len(assigner.overlaps)} overlapping pull interval(s) in {run_id}: "
+                f"{assigner.stats.overlapping_pairs[:5]}",
+                run_id=run_id,
+                job_id=self.job_id,
+            )
+
+        try:
+            for request in self.event_requests(event_profile):
+                written, pages = self._collect_events(
+                    request,
+                    run_id=run_id,
+                    report_code=report_code,
+                    report_start_ms=report_start_ms,
+                    run_rel_start_ms=int(run_row["rel_start_ms"]),
+                    rel_start_ms=int(run_row["rel_start_ms"]),
+                    rel_end_ms=int(run_row["rel_end_ms"]),
+                    assigner=assigner,
+                    pull_starts={p["pull_id"]: int(p["rel_start_ms"]) for p in pull_rows},
+                )
+                outcome.events_written += written
+                outcome.pages_fetched += pages
+        except ApiError as exc:
+            outcome.errors.append(str(exc))
+            outcome.status = "collection-failed"
+            self.db.diagnostic(
+                "event_collection_failed",
+                str(exc),
+                run_id=run_id,
+                job_id=self.job_id,
+                severity="error",
+            )
+            self._set_run_status(run_id, outcome.status)
+            self.db.conn.commit()
+            return outcome
+
+        outcome.assignment = assigner.stats.summary()
+        if assigner.stats.unassigned:
+            self.db.diagnostic(
+                "events_outside_pulls",
+                f"{assigner.stats.unassigned} of {assigner.stats.total} events in {run_id} "
+                f"fell outside every pull "
+                f"({assigner.stats.summary()['assigned_pct']}% assigned). Retained, not dropped.",
+                run_id=run_id,
+                job_id=self.job_id,
+                severity="info",
+            )
+
+        outcome.status = "complete"
+        self._set_run_status(run_id, outcome.status)
+        self.db.conn.commit()
+        return outcome
+
+    def _resolve_dungeon(self, fight: dict[str, Any]) -> tuple[str | None, int | None]:
+        """Match a fight to a configured dungeon by encounter ID, then by name."""
+        encounter_id = fight.get("encounterID")
+        for entry in self.config.dungeons.dungeons:
+            if encounter_id is not None and encounter_id in entry.encounter_ids:
+                return entry.key, entry.wcl_zone_id
+        zone_name = str((fight.get("gameZone") or {}).get("name") or "")
+        if zone_name:
+            for entry in self.config.dungeons.dungeons:
+                if entry.matches(zone_name):
+                    return entry.key, entry.wcl_zone_id
+        return None, None
+
+    def _set_run_status(self, run_id: str, status: str) -> None:
+        self.db.execute(
+            "UPDATE dungeon_runs SET collection_status = ? WHERE run_id = ?", (status, run_id)
+        )
+
+    # -- sub-fetches ------------------------------------------------------
+
+    def _fetch_report(self, code: str) -> dict[str, Any] | None:
+        data = self.client.execute(
+            render(
+                "report_metadata",
+                {"REPORT_FIELDS": self._selection("Report", WANTED_REPORT_FIELDS)},
+            ),
+            {"code": code},
+            kind="report_metadata",
+            report_code=code,
+        )
+        return ((data.get("reportData") or {}).get("report")) or None
+
+    def _fetch_fights(self, code: str) -> list[dict[str, Any]]:
+        data = self.client.execute(
+            render(
+                "report_fights",
+                {"FIGHT_FIELDS": self._selection("ReportFight", WANTED_FIGHT_FIELDS)},
+            ),
+            {"code": code},
+            kind="report_fights",
+            report_code=code,
+        )
+        report = ((data.get("reportData") or {}).get("report")) or {}
+        return [f for f in (report.get("fights") or []) if isinstance(f, dict)]
+
+    def _fetch_master_data(self, code: str) -> dict[str, Any]:
+        data = self.client.execute(
+            load_query("report_master_data"),
+            {"code": code},
+            kind="report_master_data",
+            report_code=code,
+        )
+        return (((data.get("reportData") or {}).get("report")) or {}).get("masterData") or {}
+
+    def _store_master_data(self, master: dict[str, Any], *, report_code: str) -> None:
+        self.db.upsert_many("actors", normalize_actors(master, report_code=report_code))
+        self.db.upsert_many("abilities", normalize_abilities(master, seen_at=time.time()))
+
+    def _store_roster(self, master: dict[str, Any], *, run_id: str, fight: dict[str, Any]) -> None:
+        friendly = [int(p) for p in (fight.get("friendlyPlayers") or []) if isinstance(p, int)]
+        run_rows, player_rows = normalize_run_players(
+            master,
+            run_id=run_id,
+            friendly_player_ids=friendly,
+            role_for=self.config.roles.role_for,
+        )
+        # Insert players without clobbering an existing first_seen.
+        self.db.upsert_many("players", player_rows, replace=False)
+        self.db.upsert_many("run_players", run_rows)
+        if friendly and not run_rows:
+            self.db.diagnostic(
+                "empty_roster",
+                f"{run_id} listed {len(friendly)} friendly players but none resolved "
+                "to a player actor in master data.",
+                run_id=run_id,
+                job_id=self.job_id,
+            )
+
+    def _collect_pulls(
+        self,
+        *,
+        report_code: str,
+        fight_id: int,
+        run_id: str,
+        report_start_ms: int,
+        run_rel_start_ms: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        data = self.client.execute(
+            render(
+                "report_dungeon_pulls",
+                {
+                    "PULL_FIELDS": self._selection("ReportDungeonPull", WANTED_PULL_FIELDS),
+                    "PULL_NPC_FIELDS": self._selection(
+                        "ReportDungeonPullNPC", WANTED_PULL_NPC_FIELDS
+                    ),
+                },
+            ),
+            {"code": report_code, "fightIDs": [fight_id]},
+            kind="report_dungeon_pulls",
+            report_code=report_code,
+        )
+        fights = (((data.get("reportData") or {}).get("report")) or {}).get("fights") or []
+        raw_pulls: list[dict[str, Any]] = []
+        for fight in fights:
+            if isinstance(fight, dict) and fight.get("id") == fight_id:
+                raw_pulls.extend(
+                    [p for p in (fight.get("dungeonPulls") or []) if isinstance(p, dict)]
+                )
+
+        pull_rows, npc_rows = normalize_pulls(
+            raw_pulls,
+            run_id=run_id,
+            report_start_ms=report_start_ms,
+            run_rel_start_ms=run_rel_start_ms,
+        )
+        with self.db.transaction():
+            # Replace wholesale: a re-ingest must not leave stale pulls behind.
+            self.db.execute(
+                "DELETE FROM pull_npcs WHERE pull_id IN "
+                "(SELECT pull_id FROM pulls WHERE run_id = ?)",
+                (run_id,),
+            )
+            self.db.execute("DELETE FROM pulls WHERE run_id = ?", (run_id,))
+            self.db.upsert_many("pulls", pull_rows)
+            self.db.upsert_many("pull_npcs", npc_rows)
+        if not pull_rows:
+            self.db.diagnostic(
+                "no_pulls",
+                f"{run_id} returned no dungeonPulls; events cannot be assigned to pulls.",
+                run_id=run_id,
+                job_id=self.job_id,
+                severity="warning",
+            )
+        return pull_rows, npc_rows
+
+    # -- events -----------------------------------------------------------
+
+    def _resume_point(self, run_id: str, request: EventRequest) -> tuple[int | None, int]:
+        """Where to resume this stream, and the next page index to use.
+
+        The checkpoint is the `event_pages` table itself. A page row is written
+        in the same transaction as its events, so the last recorded page is by
+        construction the last one whose events actually landed.
+
+        Returns (cursor, next_page_index); a cursor of None with index > 0 means
+        the stream already finished.
+        """
+        row = self.db.execute(
+            "SELECT page_index, next_cursor_ms FROM event_pages "
+            "WHERE run_id = ? AND data_type = ? AND IFNULL(hostility,'') = ? AND status = 'ok' "
+            "ORDER BY page_index DESC LIMIT 1",
+            (run_id, request.data_type, request.hostility or ""),
+        ).fetchone()
+        if row is None:
+            return None, 0
+        return row["next_cursor_ms"], int(row["page_index"]) + 1
+
+    def _collect_events(
+        self,
+        request: EventRequest,
+        *,
+        run_id: str,
+        report_code: str,
+        report_start_ms: int,
+        run_rel_start_ms: int,
+        rel_start_ms: int,
+        rel_end_ms: int,
+        assigner: PullAssigner,
+        pull_starts: dict[str, int],
+    ) -> tuple[int, int]:
+        """Fetch one event stream for a run, resuming if it was interrupted."""
+        resume_cursor, next_index = self._resume_point(run_id, request)
+        if next_index > 0 and resume_cursor is None:
+            logger.debug("%s %s already complete", run_id, request.label)
+            return 0, 0
+
+        start_cursor = rel_start_ms if resume_cursor is None else int(resume_cursor)
+        if next_index > 0:
+            logger.info(
+                "Resuming %s %s from page %d (cursor %s)",
+                run_id,
+                request.label,
+                next_index,
+                start_cursor,
+            )
+
+        page_counter = {"index": next_index}
+        totals = {"events": 0, "pages": 0}
+
+        def fetch_page(cursor: int | float) -> PageResult:
+            data = self.client.execute(
+                load_query("report_events"),
+                {
+                    "code": report_code,
+                    "startTime": float(cursor),
+                    "endTime": float(rel_end_ms),
+                    "dataType": request.data_type,
+                    "hostilityType": request.hostility,
+                    "limit": self.page_limit,
+                    "fightIDs": [int(run_id.split(":")[-1])],
+                },
+                kind=f"events_{request.label}_{int(cursor)}",
+                report_code=report_code,
+            )
+            block = (((data.get("reportData") or {}).get("report")) or {}).get("events") or {}
+            events = [e for e in (block.get("data") or []) if isinstance(e, dict)]
+            next_cursor = block.get("nextPageTimestamp")
+
+            index = page_counter["index"]
+            page_counter["index"] += 1
+
+            # Events and their page row are written together: the checkpoint
+            # can never claim a page whose events did not land.
+            with self.db.transaction():
+                cursor_row = {
+                    "run_id": run_id,
+                    "data_type": request.data_type,
+                    "hostility": request.hostility,
+                    "page_index": index,
+                    "requested_start_ms": int(cursor),
+                    "requested_end_ms": rel_end_ms,
+                    "cursor_ms": int(cursor),
+                    "next_cursor_ms": None if next_cursor is None else int(next_cursor),
+                    "event_count": len(events),
+                    "raw_cache_path": None,
+                    "status": "ok",
+                    "error": None,
+                    "fetched_at": time.time(),
+                }
+                self.db.upsert("event_pages", cursor_row)
+                page_id = int(
+                    self.db.scalar(
+                        "SELECT page_id FROM event_pages WHERE run_id = ? AND data_type = ? "
+                        "AND IFNULL(hostility,'') = ? AND page_index = ?",
+                        (run_id, request.data_type, request.hostility or "", index),
+                    )
+                )
+                # A re-fetched page replaces its own events rather than
+                # appending beside them.
+                self.db.execute("DELETE FROM events WHERE page_id = ?", (page_id,))
+
+                rows = []
+                for seq, event in enumerate(events):
+                    rel_ms = event.get("timestamp")
+                    pull = (
+                        assigner.assign(int(rel_ms)) if isinstance(rel_ms, (int, float)) else None
+                    )
+                    rows.append(
+                        normalize_event(
+                            event,
+                            page_id=page_id,
+                            seq_in_page=seq,
+                            run_id=run_id,
+                            report_code=report_code,
+                            report_start_ms=report_start_ms,
+                            run_rel_start_ms=run_rel_start_ms,
+                            data_type=request.data_type,
+                            hostility=request.hostility,
+                            pull_id=pull.pull_id if pull else None,
+                            pull_rel_start_ms=(pull_starts.get(pull.pull_id) if pull else None),
+                        )
+                    )
+                self.db.upsert_many("events", rows)
+
+            totals["events"] += len(events)
+            totals["pages"] += 1
+
+            unexpected = unexpected_event_fields(events)
+            if unexpected:
+                self.db.diagnostic(
+                    "unexpected_event_fields",
+                    f"{request.label} in {run_id} carried unmodelled field(s): "
+                    f"{sorted(unexpected)}. Preserved in events.extra.",
+                    run_id=run_id,
+                    job_id=self.job_id,
+                    severity="info",
+                )
+
+            return PageResult(events=events, next_page_timestamp=next_cursor, raw=block)
+
+        paginator = EventPaginator(
+            fetch_page,
+            kind=f"{run_id}:{request.label}",
+            start_time=start_cursor,
+            end_time=rel_end_ms,
+            report_code=report_code,
+        )
+        # Rows are written inside fetch_page; draining the iterator is what
+        # drives pagination, and it keeps peak memory to one page.
+        for _ in paginator.iter_events():
+            pass
+
+        for warning in paginator.diagnostics.warnings:
+            self.db.diagnostic(
+                "pagination", warning, run_id=run_id, job_id=self.job_id, severity="info"
+            )
+        return totals["events"], totals["pages"]
+
+    def reset_run_events(self, run_id: str) -> int:
+        """Drop a run's event pages and events so they are fetched again.
+
+        Needed when the normalizer changes: the cached raw responses stay, but
+        the derived rows must be rebuilt. Without this, `_resume_point` would
+        see a completed stream and skip it.
+        """
+        with self.db.transaction():
+            removed = int(
+                self.db.scalar("SELECT COUNT(*) FROM events WHERE run_id = ?", (run_id,)) or 0
+            )
+            self.db.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+            self.db.execute("DELETE FROM event_pages WHERE run_id = ?", (run_id,))
+        return removed
+
+    # -- top level --------------------------------------------------------
+
+    def collect(
+        self,
+        candidates: list[ReportCandidate],
+        *,
+        event_profile: str = "mechanics",
+        dungeon_key: str | None = None,
+        max_runs_per_report: int | None = None,
+    ) -> CollectionResult:
+        result = CollectionResult(job_id=self.job_id)
+        self.start_job(sample_profile=None, event_profile=event_profile)
+        status = "complete"
+        try:
+            for candidate in candidates:
+                result.reports_attempted += 1
+                try:
+                    outcomes = self.collect_report(
+                        candidate,
+                        event_profile=event_profile,
+                        dungeon_key=dungeon_key,
+                        max_runs=max_runs_per_report,
+                    )
+                except ApiError as exc:
+                    result.reports_failed += 1
+                    result.errors.append(f"{candidate.code}: {exc}")
+                    self.db.diagnostic(
+                        "report_failed",
+                        f"{candidate.code}: {exc}",
+                        job_id=self.job_id,
+                        severity="error",
+                    )
+                    self.db.conn.commit()
+                    continue
+                result.runs.extend(outcomes)
+                if outcomes and all(o.status == "complete" for o in outcomes) or not outcomes:
+                    result.reports_completed += 1
+                else:
+                    result.reports_failed += 1
+        except KeyboardInterrupt:
+            # Everything written so far is durable and resumable: page rows and
+            # their events commit together.
+            status = "interrupted"
+            logger.warning("Interrupted. Progress is saved; resume with the same job.")
+            raise
+        finally:
+            self.finish_job(result, status=status)
+        return result

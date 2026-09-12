@@ -86,7 +86,7 @@ def test_version_reports_provenance():
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["software_version"]
-    assert payload["schema_version"] == 0, "no database schema exists in Phase 0"
+    assert payload["schema_version"] == 1, "matches the highest applied migration"
 
 
 def test_config_check_reports_unverified_dungeons():
@@ -299,3 +299,127 @@ def test_recon_writes_sanitized_fixtures(live, settings, monkeypatch, tmp_path):
     for name in ("Tankadin", "Brewhealz", "SomeUploader"):
         assert name not in combined, f"{name} leaked into a fixture"
     assert "Shivan Punisher" in combined, "NPC names are research data and are kept"
+
+
+# -- Phase 1 commands ------------------------------------------------------
+
+
+@pytest.fixture
+def report_list(tmp_path):
+    path = tmp_path / "reports.txt"
+    path.write_text(f"# pilot\n{REPORT_CODE}\n")
+    return path
+
+
+def test_collect_dry_run_makes_no_api_calls(live, report_list):
+    result = runner.invoke(cli.app, ["collect", "--report-list", str(report_list), "--dry-run"])
+    assert result.exit_code == 0
+    assert "Dry run" in result.output
+    assert "Casts (hostility: Enemies)" in result.output, (
+        "the hostility split must be visible before committing to a run"
+    )
+    assert not live.queries_seen, "no query was sent"
+
+
+def test_collect_then_stats_then_validate(live, report_list, settings):
+    collected = runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    assert collected.exit_code == 0, collected.output
+    assert "Events written" in collected.output
+    assert "Job ID" in collected.output
+
+    stats = runner.invoke(cli.app, ["stats"])
+    assert stats.exit_code == 0
+    assert "dungeon_runs" in stats.output
+    assert "murder-row" in stats.output
+
+    validated = runner.invoke(cli.app, ["validate"])
+    assert validated.exit_code == 0
+    assert "Runs analysable:" in validated.output
+    assert "NPC instance identity demonstrated" in validated.output
+    report = settings.exports_dir / "validation" / "VALIDATION_REPORT.md"
+    assert report.is_file()
+    assert "Shivan Punisher" in report.read_text()
+
+
+def test_collect_is_safe_to_repeat(live, report_list):
+    first = runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    assert first.exit_code == 0
+    second = runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    assert second.exit_code == 0
+    assert "Events written: 0" in second.output, "a completed run is not collected twice"
+
+
+def test_collect_refresh_refetches_events(live, report_list):
+    runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    refreshed = runner.invoke(cli.app, ["collect", "--report-list", str(report_list), "--refresh"])
+    assert refreshed.exit_code == 0
+    assert "Cleared existing events" in refreshed.output
+    assert "Events written: 0" not in refreshed.output
+
+
+def test_collect_dungeon_filter(live, report_list):
+    result = runner.invoke(
+        cli.app,
+        ["collect", "--report-list", str(report_list), "--dungeon", "Ruby Life Pools"],
+    )
+    assert result.exit_code == 0
+    assert "Collected 0 of 0 run(s)" in result.output
+
+
+def test_collect_rejects_a_bad_report_list(live, tmp_path):
+    missing = tmp_path / "nope.txt"
+    result = runner.invoke(cli.app, ["collect", "--report-list", str(missing)])
+    assert result.exit_code == 1
+    assert "not found" in result.output
+
+
+def test_stats_on_empty_database(live):
+    result = runner.invoke(cli.app, ["stats"])
+    assert result.exit_code == 0
+    assert "No complete runs yet" in result.output
+
+
+def test_dedupe_reports_no_duplicates_for_one_run(live, report_list):
+    runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    result = runner.invoke(cli.app, ["dedupe"])
+    assert result.exit_code == 0
+    assert "No probable duplicate runs found" in result.output
+
+
+def test_validate_json_output(live, report_list):
+    runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    result = runner.invoke(cli.app, ["validate", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["events"]["total"] > 0
+    assert payload["npc_instance_evidence"]
+
+
+def test_validate_warns_when_instance_evidence_is_absent(live, report_list, settings):
+    runner.invoke(cli.app, ["collect", "--report-list", str(report_list)])
+    from wcl_mplus.db import Database
+
+    db = Database(settings.db_dir / "wclmplus.sqlite")
+    db.execute("UPDATE events SET source_instance = NULL")
+    db.conn.commit()
+    db.close()
+
+    result = runner.invoke(cli.app, ["validate"])
+    assert result.exit_code == 0
+    assert "UNTESTED in this corpus" in result.output
+
+
+def test_no_player_name_appears_in_any_command_output(live, report_list, settings):
+    outputs = [
+        runner.invoke(cli.app, ["collect", "--report-list", str(report_list)]).output,
+        runner.invoke(cli.app, ["stats"]).output,
+        runner.invoke(cli.app, ["validate"]).output,
+        runner.invoke(cli.app, ["dedupe"]).output,
+    ]
+    blob = (
+        "\n".join(outputs)
+        + (settings.exports_dir / "validation" / "VALIDATION_REPORT.md").read_text()
+    )
+    for name in ("Tankadin", "Brewhealz", "SomeUploader"):
+        assert name not in blob
+    assert TOKEN not in blob
