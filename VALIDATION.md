@@ -36,12 +36,15 @@ unsupported and every recast statistic in the project is invalid.
 | **Goal** | Two copies of one NPC species in one pull keep separate timelines. |
 | **Observed (a) pull level** | **CONFIRMED.** All six identity fields populate. One +10 Murder Row run yielded 20 duplicate-species pulls, the largest being **18 copies** of NPC 236085 in a single pull. |
 | **Observed (b) event level** | **CONFIRMED for Debuffs, DamageTaken, Interrupts, Buffs, Deaths, Summons.** Enemy actors carry `sourceInstance` (e.g. enemy 11 instance 2 applying a debuff); interrupts carry `targetInstance`; deaths carry `killerInstance`. |
-| **Observed (c) enemy casts** | **PENDING.** The Casts sample was unfiltered and returned 50 player casts. Players are not instanced, so it proved nothing either way. A `hostilityType: Enemies` probe now checks directly. |
-| **Status** | CONFIRMED except for enemy casts, which one short run settles |
+| **Observed (c) enemy casts** | **CONFIRMED.** `hostilityType: Enemies` on the same fight returned 11 distinct NPC actors with **36 of 50** events carrying `sourceInstance`, and both `cast` and `begincast`. The unfiltered sample had returned 5 players and 0 instance markers. |
+| **Status** | **PASSED** |
 
-**If (c) fails:** record that per-instance cast timing is not supported by the
-API. Do not infer instance identity from cast ordering — that would fabricate
-data.
+**Open nuance:** 14 of 50 enemy casts carried no `sourceInstance`, almost
+certainly because only one copy of that NPC existed. That is an inference. It
+is handled by storing NULL and resolving against the pull's instance range at
+analysis time — if the pull holds one copy of that `gameID` the null maps to
+it; if it holds several, the attribution is unknown and must be recorded as
+unknown rather than defaulted to instance 1.
 
 ## V2 — Pagination completeness
 
@@ -196,8 +199,9 @@ written to disk.
 
 ## Known limitations (current)
 
-1. **Enemy-cast instance identity is unconfirmed.** Every other enemy event
-   type carries it. One probe settles it. (B1)
+1. **A missing `sourceInstance` is not yet interpretable with certainty.**
+   Believed to mean "only one copy exists". Stored as NULL and resolved against
+   the pull's instance range at analysis time, never defaulted.
 2. **No mechanic has been measured.** Phase 1 onward.
 3. **`Report.gameVersion` does not exist** (unused). **`User.avatar` and
    `User.battleTag` are permission-gated** and are not requested.

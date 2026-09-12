@@ -2,8 +2,8 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12 (after fourth live recon run — Gate A)
-- **Software version:** 0.1.4
+- **Last updated:** 2026-09-12 (after fifth live recon run — Gate A closed)
+- **Software version:** 0.1.5
 - **Database schema version:** 0 (no schema implemented yet)
 - **Normalizer version:** 1
 - **Query set version:** 4
@@ -46,36 +46,32 @@ Plus `extraAbilityGameID` on both interrupts and dispels, naming *what was
 interrupted* and *what was removed* — the two links the brief's interrupt and
 dispel questions depend on.
 
-### The one open item
+### The last unknown, now closed
 
-The Casts sample returned 50 events, **every one from a player**. Five players
-out-cast the trash in raw event count, and players are not instanced, so it
-carried no `sourceInstance` and said nothing about NPC cast timelines.
+Enemy cast events **do** carry instance identity. Filtering the same fight to
+`hostilityType: Enemies` returned 11 distinct NPC actors with 36 of 50 events
+carrying `sourceInstance`, and both `cast` and `begincast` — so cast start and
+cast completion are separately observable, which is what distinguishes an
+interrupted cast from a completed one without inference.
 
-Enemy instance identity is confirmed on Debuffs, DamageTaken, Interrupts,
-Buffs, Deaths and Summons, so the expectation for casts is strong — but
-expectation is not evidence, and per-NPC recast timing is the fact this
-project's headline statistics rest on. Recon now samples enemy casts separately
-with `hostilityType: Enemies`; one short run closes it.
+The unfiltered sample had returned five players and zero instance markers.
+That contrast is the finding to carry forward: **an unfiltered event query is
+dominated by players**, and `hostilityType` is not an optimisation here, it is
+what makes the enemy side visible at all.
 
-**Lesson carried into Phase 1:** an unfiltered event query is dominated by
-players. `hostilityType` is not an optimisation here; it is what makes the
-enemy side visible at all.
+One nuance recorded rather than resolved: 14 of 50 enemy casts carried no
+`sourceInstance`, almost certainly single-copy NPCs. Stored as NULL and
+resolved against the pull's instance range at analysis time; where a pull holds
+several copies the attribution is unknown and is recorded as unknown.
 
 ---
 
 ## Blockers
 
-### B1 — Confirm enemy-cast instance identity (open, one short run)
+### B1 — Enemy-cast instance identity — **RESOLVED**
 
-```
-.venv\Scripts\wclmplus.exe recon --report "<PUBLIC_MYTHIC_PLUS_REPORT_URL>"
-```
-
-Look for `Casts_enemies` in the findings with
-`events_with_source_instance > 0`. If it is zero, per-instance recast timing is
-**not supported by the API** and must be recorded as such rather than inferred
-from cast ordering.
+Confirmed live: 36 of 50 enemy cast events carry `sourceInstance`, across 11
+distinct NPC actors. Per-NPC-copy cast timelines are supported by the API.
 
 ### B2 — Season dungeon list — **RESOLVED**
 
@@ -156,10 +152,9 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 ## Next actions
 
-1. **User:** one more `recon` run to confirm enemy-cast instance identity (B1).
-2. **Coordinator:** close B1 in `API_NOTES.md` and `VALIDATION.md`.
-3. **Phase 1 — can begin in parallel**, since the event shapes that determine
-   the storage schema are confirmed:
+**Phase 0 is closed. Phase 1 starts.** No user action is pending.
+
+1. **Phase 1 — the Murder Row pilot:**
    - SQLite schema and migrations, built against the *observed* event fields
    - Ingestion: report → run → pulls → NPC instances → events
    - Event-to-pull assignment with diagnostics

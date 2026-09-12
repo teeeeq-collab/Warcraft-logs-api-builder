@@ -10,23 +10,25 @@ It is not a dungeon guide and not a web app. It is a collector plus a dataset
 detailed enough that new questions can be answered later **without
 re-downloading anything**.
 
-> **Current status: Phase 0 complete — Gate A passed.**
+> **Current status: Phase 0 complete, Gate A passed. Phase 1 starting.**
 >
-> Four live runs against the real API. The fourth completed all 16 checks with
-> no failures. Confirmed: every field the research design needs exists;
-> **pagination is lossless** (316 pages, 7,920 events in, 7,920 out); **NPC
-> instance identity is real** (one pull held 18 copies of a single NPC, and
-> enemy events carry the instance marker); **Midnight Season 2 is zone 55**
-> with all eight dungeons identified; and **report discovery works
+> Five live runs against the real API. Confirmed: every field the research
+> design needs exists; **pagination is lossless** (316 pages, 7,920 events in,
+> 7,920 out); **NPC instance identity is real end to end** — one pull held 18
+> copies of a single NPC, and enemy cast events carry the instance marker, so
+> two copies of the same caster keep separate timelines; **Midnight Season 2 is
+> zone 55** with all eight dungeons identified; and **report discovery works
 > season-wide**, so sampling is not confined to leaderboard logs.
 >
-> The data also supports more than the brief assumed: damage events carry
+> The data supports more than the brief assumed: damage events carry
 > `maxHitPoints` (damage as a share of player health), `buffs` (which
-> defensives were up at the moment of the hit) and `unmitigatedAmount`
-> (what the mob swung for, versus what the tank took).
+> defensives were up at the moment of the hit) and `unmitigatedAmount` (what
+> the mob swung for, versus what the tank took).
 >
-> One item open: enemy *cast* instance identity, which one short run settles.
-> Then Phase 1 — the database and the Murder Row pilot.
+> **One lesson that shapes collection:** an unfiltered event query is dominated
+> by players. Filtering to `hostilityType: Enemies` is what makes the enemy
+> side visible at all — unfiltered, a cast sample returned five players and
+> zero NPCs.
 
 ---
 

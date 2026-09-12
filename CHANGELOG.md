@@ -9,6 +9,34 @@ recorded here.
 
 ---
 
+## 0.1.5 — 2026-09-12 — **Gate A closed**
+
+The last Phase 0 unknown confirmed. No code changes; documentation and version
+stamp only.
+
+### Verified against the live API
+
+- **Enemy cast events carry `sourceInstance`.** `hostilityType: Enemies` on one
+  +10 Murder Row fight returned 11 distinct NPC actors with **36 of 50** events
+  carrying the instance marker, and both `cast` and `begincast` — so cast start
+  and cast completion are separately observable, which distinguishes an
+  interrupted cast from a completed one without inference.
+
+  The unfiltered sample of the same fight had returned five players and zero
+  instance markers. **Per-NPC-copy cast timelines are supported.**
+
+- 14 of 50 enemy casts carried no `sourceInstance`, almost certainly because
+  only one copy of that NPC existed. Recorded as an inference, not a fact: the
+  field is stored NULL and resolved against the pull's instance range during
+  analysis. Where a pull holds several copies of the species, the attribution
+  is unknown and is recorded as unknown rather than defaulted to instance 1.
+
+- Enemy cast events also carry `hitPoints`/`maxHitPoints`, so enemy health may
+  be readable directly from enemy casts — relevant to the execute-phase
+  questions, and untested.
+
+---
+
 ## 0.1.4 — 2026-09-12 — **Gate A passed**
 
 Fourth live run: 16 of 16 steps, 0 failures. Pulls, NPC identity, event shapes,

@@ -16,9 +16,8 @@ Status tags: `VERIFIED` (observed live, evidence cited) · `CORRECTED`
 > different reason, every cause a defect in this project rather than the API
 > (sections 12.1, 12.3, 12.5).
 >
-> One gap remains: the Casts sample was unfiltered and came back entirely
-> player casts, so *enemy* cast instance identity is inferred rather than seen.
-> A hostility-filtered probe now closes it (section 6).
+> **Gate A is closed.** The final unknown — whether enemy *cast* events carry
+> instance identity — was confirmed on a fifth run (section 6).
 
 ---
 
@@ -137,15 +136,31 @@ timeline would have manufactured seventeen phantom "recasts".
 So a debuff application, a damage hit, an interrupt and a death can each be
 attributed to a specific copy of an NPC.
 
-**The one gap, now probed.** The Casts sample returned 50 events, *every one
-from a player*. Five players out-cast the trash in raw event count, and
-players are not instanced, so the sample carried no `sourceInstance` and could
-say nothing about NPC cast timelines. Recon now samples enemy casts separately
-with `hostilityType: Enemies` and records how many carry `sourceInstance`.
+**Enemy casts — CONFIRMED.** The unfiltered Casts sample returned 50 events
+from source IDs `[1, 2, 3, 7, 8]` — the five players — with **0** carrying
+`sourceInstance`. Players are not instanced, so that sample could not have
+answered the question either way.
 
-Enemy actors demonstrably carry `sourceInstance` on other event types, so the
-expectation is strong — but expectation is not evidence, and this is the single
-fact the project's recast statistics rest on.
+Filtering to `hostilityType: Enemies` on the same fight:
+
+| | Unfiltered | `Enemies` |
+| --- | --- | --- |
+| Distinct source actors | 5 (all players) | **11 NPCs** |
+| Events with `sourceInstance` | 0 of 50 | **36 of 50** |
+| Event types | `cast` 48, `begincast` 2 | `cast` 44, **`begincast` 6** |
+
+`begincast` and `cast` both appear on the enemy side, so cast **start** and
+cast **completion** are separately observable — which is what lets an
+interrupted cast be told from a completed one without inference.
+
+**The 14 enemy casts with no `sourceInstance`** are, almost certainly,
+single-copy NPCs: Warcraft Logs appears to omit the field when there is only
+one instance of a species. That is an inference, not an observation, and it
+must not be resolved at ingestion time. **Store the field as NULL when absent
+and resolve it during analysis** against the pull's NPC instance range: if a
+pull contains exactly one copy of that `gameID`, the null maps to that copy;
+if it contains several, the attribution is genuinely unknown and must be
+recorded as such rather than defaulted to instance 1.
 
 **Lesson for collection:** an unfiltered event query is dominated by players.
 `hostilityType: Enemies` is not an optimisation here, it is what makes the
@@ -472,25 +487,26 @@ now part of the cache key; `query_version` remains a coarse manual override.
 
 ## 13. Open questions
 
-Answered by the four live runs: field availability, rate-limit shape and cost,
-the season dungeon list, report discovery reach, pull detail, event shapes,
-pagination semantics, and whether max player HP is reconstructible (it is —
-`maxHitPoints` is on every damage event).
+**Gate A is closed.** Five live runs answered: field availability, rate-limit
+shape and cost, the season dungeon list, report discovery reach, pull detail,
+event shapes, pagination semantics, whether max player HP is reconstructible
+(it is), and whether enemy casts carry instance identity (they do).
 
-Remaining:
+Remaining, none of them blocking Phase 1:
 
-1. **Do enemy *cast* events carry `sourceInstance`?** Every other enemy event
-   type does, and a hostility-filtered probe now checks it directly. This is
-   the one fact the project's recast statistics rest on.
+1. **What does a missing `sourceInstance` mean?** Believed to be "only one copy
+   of this NPC exists", but unconfirmed. Handled by storing NULL and resolving
+   against the pull's instance range at analysis time, never by defaulting.
 2. What is the real event page ceiling? 10,000 is documented, untested.
-3. What does a *complete* event download cost per run, per profile? This sizes
-   Phase 2, and points are demonstrably not the constraint — time and bytes are.
+3. What does a *complete* event download cost per run, per profile? Points are
+   demonstrably not the constraint; time and bytes are.
 4. Do pull intervals overlap, and do bosses appear as `dungeonPulls`?
 5. What share of events falls outside every pull, and what are they?
 6. Can enemy health be reconstructed well enough to time an execute phase?
-   Player `hitPoints`/`maxHitPoints` are present on damage events; whether the
-   same holds for enemies as *targets* of player damage is untested
-   (`DamageDone` was not sampled).
+   Player `hitPoints`/`maxHitPoints` are on damage events; enemy casts also
+   carry them (an enemy cast showed `hitPoints` 1,432,221 of the same
+   `maxHitPoints`), so enemy health may be readable straight off enemy cast
+   events. Untested.
 7. What does `allowUnlisted` change, and does it stay within v1's public-only
    scope?
 8. Is `keystoneLevel` non-null a reliable Mythic+ marker? It held on this
