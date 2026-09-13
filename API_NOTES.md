@@ -511,3 +511,65 @@ Remaining, none of them blocking Phase 1:
    scope?
 8. Is `keystoneLevel` non-null a reliable Mythic+ marker? It held on this
    report (13 of 15 fights, levels 8 and 10), but one report is one report.
+
+---
+
+## 8. Stream benchmark — VERIFIED (10 fights, 10 reports)
+
+Measured by `wclmplus benchmark`, one Mythic+ fight per report. Medians.
+
+| Stream | Events/fight | Exhausted | KB/event | Points | Seconds |
+| --- | ---: | :---: | ---: | ---: | ---: |
+| `DamageDone` (=@Friendlies) | ≥24,048 | 2/10 | 0.53 | 13.2 | 6.9 |
+| `Healing` (=@Friendlies) | ≥24,004 | 4/10 | 0.42 | 13.0 | 6.1 |
+| `Threat@Enemies` | 10,090 | 10/10 | 0.38 | 6.5 | 2.5 |
+| `DamageDone@Enemies` | 7,204 | 10/10 | 0.40 | 5.0 | 1.9 |
+| `Resources@Friendlies` | 7,014 | 10/10 | 0.47 | 5.0 | 1.7 |
+| `Threat@Friendlies` | 1,941 | 10/10 | 0.22 | 2.0 | 0.4 |
+| `Healing@Enemies` | 956 | 10/10 | 0.21 | 2.0 | 0.4 |
+| `CombatantInfo` | 5 | 10/10 | 7.34 | 2.0 | 0.3 |
+| `Resources@Enemies` | **0** | 10/10 | — | 2.0 | 0.3 |
+
+`DamageDone` and `Healing` hit the 12-page cap on most fights: those figures are
+**lower bounds**, not totals.
+
+### hostilityType defaults to Friendlies. It never means "both".
+
+Confirmed on every stream tested — `Casts`, `Buffs` (earlier), and now
+`DamageDone`, `Healing`, `Threat`. In each case an unfiltered request returned
+**exactly** the `@Friendlies` count, with the `@Enemies` events absent entirely.
+Treat this as a property of the API, not a per-stream quirk: name the hostility
+on every stream, always.
+
+`Threat` is the starkest case — its enemy side is roughly five times its
+friendly side, so an unfiltered request drops ~84% of the stream.
+
+### `Resources` does not expose NPC energy
+
+Zero events across all ten fights, every probe exhausted. The hope that enemy
+resource events would reveal progress toward energy-gated mechanics is not
+supported. `Resources@Friendlies` is the whole of this stream.
+
+### `Threat` carries no threat value
+
+No field in the stream names threat. It returns `cast` (134,768 observed),
+`death` (2,559) and `applydebuff` (370) events carrying `melee`, `fake` and
+`feign` flags. It shows what was swung and when, not who held aggro. Whether
+threat numbers exist on another endpoint is untested.
+
+### `CombatantInfo` ignores hostility
+
+All three requests returned byte-identical results on 9 of 10 fights. It is
+per-player data that exists once per fight. Never request it split — that
+collects the same rows twice.
+
+It is also the best value in the API: five events per fight, ~36 KB, 2 points,
+0.3 s, carrying `talents`, `talentTree`, `gear`, `specID`, `auras`, `itemLevel`
+and every stat. Everything class-specific depends on it.
+
+### Cost per page
+
+About 1.1 points per page across every stream (a 12-page probe cost 13 points,
+a 1-page probe 2). Quota, not wall clock, is the binding constraint: at 34
+pages/run the existing `mechanics` profile costs ~37 points/run, so 3,600
+points/hour allows ~97 runs/hour while 17.5 s/run would allow ~205.

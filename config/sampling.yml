@@ -120,7 +120,12 @@ event_profiles:
     event_types:
       - Casts@Enemies
       - Buffs@Enemies
-      - Resources@Enemies    # UNVERIFIED: may expose NPC energy mechanics. Benchmark first.
+      # Resources@Enemies was here on the hope that NPC energy mechanics would
+      # show up. MEASURED: zero events across 10 fights, every probe exhausted.
+      # NPC energy is not exposed through this stream, so paying a request per
+      # run for a guaranteed empty answer buys nothing. Removed, not disabled --
+      # if a future dungeon suggests otherwise, benchmark it again rather than
+      # carrying a dead stream.
       - Summons
       - Debuffs
       - DamageTaken
@@ -139,7 +144,6 @@ event_profiles:
     event_types:
       - Casts@Enemies
       - Buffs@Enemies
-      - Resources@Enemies
       - Summons
       - Debuffs
       - DamageTaken
@@ -147,10 +151,14 @@ event_profiles:
       - Dispels
       - Deaths
     focus_event_types:
+      # Every one explicitly @Friendlies. An unfiltered request returns the
+      # friendly side anyway -- measured for DamageDone, Healing, Threat, and
+      # previously for Casts and Buffs -- but relying on that default hides the
+      # assumption in the API's behaviour instead of stating it here.
       - Casts@Friendlies
       - Buffs@Friendlies
-      - DamageDone
-      - Healing
+      - DamageDone@Friendlies
+      - Healing@Friendlies
       - Resources@Friendlies
     include_combatant_info: true
 
@@ -166,15 +174,23 @@ event_profiles:
       - Buffs@Friendlies
       - Debuffs
       - DamageTaken
-      - DamageDone
-      - Healing
+      - DamageDone@Friendlies
+      - DamageDone@Enemies
+      - Healing@Friendlies
+      - Healing@Enemies
       - Resources@Friendlies
-      - Resources@Enemies
+      # Resources@Enemies omitted: measured empty across every probed fight.
       - Interrupts
       - Dispels
       - Summons
       - Deaths
-      - Threat
+      # Threat@Enemies, not Threat: unfiltered returns the friendly side only,
+      # and the enemy side is ~5x larger. MEASURED: this stream carries NO
+      # threat value -- no field in it names threat at all. It returns the casts
+      # and deaths that generate threat, flagged melee/fake/feign. It cannot
+      # answer "who had aggro"; it can show what was swung and when.
+      - Threat@Enemies
+      - Threat@Friendlies
     include_combatant_info: true
 
   forensic_full:

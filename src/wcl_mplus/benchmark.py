@@ -96,9 +96,31 @@ class HostilityComparison:
     all_exhausted: bool
 
     @property
+    def filter_ignored(self) -> bool:
+        """All three requests returned the same count: the filter did nothing.
+
+        CombatantInfo behaves this way -- it is per-player data that exists once
+        per fight regardless of hostility. Without this check the three equal
+        counts read as "unfiltered returns friendlies only", and the sum of
+        parts double-counts the very same events, so a profile would be told to
+        split a stream that cannot be split and would collect it twice.
+        """
+        # Exhaustion is required. Three probes that each stopped at the same page
+        # cap also return identical counts, and calling that an ignored filter
+        # would turn a measurement artefact into a finding about the API.
+        return (
+            self.all_exhausted
+            and self.unfiltered > 0
+            and self.unfiltered == self.enemies
+            and self.unfiltered == self.friendlies
+        )
+
+    @property
     def verdict(self) -> str:
         if not self.all_exhausted:
             return "inconclusive (a probe hit its page cap before finishing)"
+        if self.filter_ignored:
+            return "hostility filter IGNORED -- all three requests returned the same events"
         total = self.enemies + self.friendlies
         if self.unfiltered == total:
             return "unfiltered = Enemies + Friendlies"
@@ -114,8 +136,10 @@ class HostilityComparison:
             "unfiltered": self.unfiltered,
             "enemies": self.enemies,
             "friendlies": self.friendlies,
-            "sum_of_parts": self.enemies + self.friendlies,
+            # Meaningless when the filter is ignored: both sides are the same rows.
+            "sum_of_parts": (None if self.filter_ignored else self.enemies + self.friendlies),
             "all_exhausted": self.all_exhausted,
+            "filter_ignored": self.filter_ignored,
             "verdict": self.verdict,
         }
 
@@ -288,9 +312,10 @@ def render_report(
             "| --- | ---: | ---: | ---: | ---: | --- |",
         ]
         for c in comparisons:
+            total = "—" if c.filter_ignored else f"{c.enemies + c.friendlies:,}"
             lines.append(
                 f"| `{c.data_type}` | {c.unfiltered:,} | {c.enemies:,} | {c.friendlies:,} "
-                f"| {c.enemies + c.friendlies:,} | {c.verdict} |"
+                f"| {total} | {c.verdict} |"
             )
 
     lines += ["", "## Observed fields per stream", ""]

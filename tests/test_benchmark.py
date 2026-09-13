@@ -117,3 +117,43 @@ def test_json_report_is_machine_readable(bench):
     payload = json.loads(render_json([m], [], runs_probed=1))
     assert payload["measurements"][0]["stream"] == m.label
     assert payload["max_pages_per_stream"] >= 1
+
+
+def test_an_ignored_hostility_filter_is_not_read_as_friendly_only():
+    """Three identical counts mean the filter did nothing, not that it worked.
+
+    CombatantInfo returns the same five per-player rows for unfiltered,
+    @Enemies and @Friendlies. Read as "friendlies only" a profile would split a
+    stream that cannot be split and collect the same events twice, and the
+    sum of parts would double-count them.
+    """
+    from wcl_mplus.benchmark import HostilityComparison
+
+    c = HostilityComparison(
+        data_type="CombatantInfo", unfiltered=5, enemies=5, friendlies=5, all_exhausted=True
+    )
+    assert c.filter_ignored is True
+    assert "IGNORED" in c.verdict
+    assert c.summary()["sum_of_parts"] is None
+
+    real = HostilityComparison(
+        data_type="Threat", unfiltered=1941, enemies=10090, friendlies=1941, all_exhausted=True
+    )
+    assert real.filter_ignored is False
+    assert "FRIENDLIES ONLY" in real.verdict
+    assert real.summary()["sum_of_parts"] == 12031
+
+
+def test_capped_probes_returning_equal_counts_are_not_called_ignored():
+    """Three probes stopping at the same page cap look identical but prove nothing."""
+    from wcl_mplus.benchmark import HostilityComparison
+
+    capped = HostilityComparison(
+        data_type="DamageDone",
+        unfiltered=24000,
+        enemies=24000,
+        friendlies=24000,
+        all_exhausted=False,
+    )
+    assert capped.filter_ignored is False
+    assert "inconclusive" in capped.verdict
