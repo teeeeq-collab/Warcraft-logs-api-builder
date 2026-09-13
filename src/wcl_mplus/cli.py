@@ -747,7 +747,14 @@ def collect(
         for error in summary["errors"]:
             typer.echo(f"    {error}")
     typer.echo(f"  Job ID:         {summary['job_id']}")
-    typer.echo("\nNext: wclmplus validate")
+    # Name the file that was written. With --database there is more than one,
+    # and "which database did that go into" should never be a guess.
+    typer.echo(f"  Database:       {db.path}")
+    typer.echo(
+        "\nNext: wclmplus validate"
+        + (f" --database {database}" if database else "")
+        + "  (writes data/exports/validation/)"
+    )
     db.close()
 
 
@@ -864,6 +871,7 @@ def dedupe(
     """
     _setup_logging(verbose)
     db = _database(_load_settings(), path=database)
+    typer.echo(f"Database: {db.path}")
     groups = group_duplicates(db)
     if not groups:
         typer.secho("No probable duplicate runs found.", fg=typer.colors.GREEN)
@@ -1050,6 +1058,7 @@ def stats(
     settings = _load_settings()
     db = _database(settings, path=database)
 
+    typer.echo(f"Database: {db.path}\n")
     counts = db.table_counts()
     typer.echo(f"Database: {db.path}  ({db.size_bytes() / 1_048_576:.1f} MiB)")
     typer.echo("")

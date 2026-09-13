@@ -464,3 +464,12 @@ def test_database_flag_honours_an_explicit_path(tmp_path):
     db = _database(FakeSettings(), path=elsewhere)
     assert db.path == elsewhere
     db.close()
+
+
+def test_commands_name_the_database_they_touched(settings, tmp_path, monkeypatch):
+    """With partitioning, "which file did that write to" must never be a guess."""
+    monkeypatch.setattr(cli, "_load_settings", lambda: settings)
+    result = runner.invoke(cli.app, ["stats"])
+    assert result.exit_code == 0
+    assert "Database:" in result.output
+    assert ".sqlite" in result.output
