@@ -751,6 +751,8 @@ class Collector:
         result = CollectionResult(job_id=self.job_id)
         self.start_job(sample_profile=None, event_profile=event_profile)
         status = "complete"
+        points_before = self.client.stats.points_spent_observed
+        requests_before = self.client.stats.requests
         try:
             for candidate in candidates:
                 result.reports_attempted += 1
@@ -784,5 +786,52 @@ class Collector:
             logger.warning("Interrupted. Progress is saved; resume with the same job.")
             raise
         finally:
+            self._record_api_cost(result, points_before, requests_before)
             self.finish_job(result, status=status)
         return result
+
+    def _record_api_cost(
+        self,
+        result: CollectionResult,
+        points_before: float | None,
+        requests_before: int,
+    ) -> None:
+        """Write what this job spent of the hourly budget.
+
+        Wall clock says how long a corpus takes to build; points say whether the
+        API will allow it at all, and the two bind at different corpus sizes.
+        Only the API knows the cost of a query, so it is observed rather than
+        modelled.
+
+        The hourly counter resets on its own schedule, so a job spanning a reset
+        yields a negative delta. That is recorded as unknown rather than as a
+        suspiciously cheap job -- an underestimate here would license a corpus
+        size the quota cannot actually support.
+        """
+        points_after = self.client.stats.points_spent_observed
+        spent: float | None = None
+        if points_before is not None and points_after is not None:
+            delta = points_after - points_before
+            spent = delta if delta >= 0 else None
+
+        runs = len([o for o in result.runs if o.status == "complete"])
+        self.db.diagnostic(
+            "api_cost",
+            json_or_none(
+                {
+                    "points_spent": spent,
+                    "points_unknown_reason": (
+                        None if spent is not None else "hourly counter reset mid-job or unavailable"
+                    ),
+                    "requests": self.client.stats.requests - requests_before,
+                    "runs_completed": runs,
+                    "points_per_run": (
+                        round(spent / runs, 2) if spent is not None and runs else None
+                    ),
+                }
+            )
+            or "{}",
+            job_id=self.job_id,
+            severity="info",
+        )
+        self.db.conn.commit()

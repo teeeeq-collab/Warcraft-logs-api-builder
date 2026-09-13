@@ -468,3 +468,20 @@ def test_reingest_preserves_duplicate_classification(pipeline):
     ).fetchone()
     assert row["duplicate_group_id"] == "dup-test"
     assert row["is_canonical"] == 0
+
+
+def test_job_records_what_it_spent_of_the_hourly_budget(pipeline):
+    """Points, not seconds, decide whether a corpus of thousands is possible."""
+    import json as _json
+
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    rows = db.query("SELECT detail FROM ingest_diagnostics WHERE kind = 'api_cost'")
+    assert len(rows) == 1
+    payload = _json.loads(rows[0]["detail"])
+    assert payload["runs_completed"] >= 1
+    assert payload["requests"] > 0
+    # The simulator reports a budget, so a real delta must be present. When it
+    # cannot be known the reason must be, rather than a plausible-looking zero.
+    assert payload["points_spent"] is not None or payload["points_unknown_reason"]

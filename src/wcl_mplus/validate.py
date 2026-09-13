@@ -231,6 +231,34 @@ def _ability_name(db: Database, game_id: int | None) -> str | None:
     return db.scalar("SELECT name FROM abilities WHERE game_id = ?", (game_id,))
 
 
+def _api_cost(db: Database) -> dict[str, Any]:
+    """Hourly-budget spend per run, as observed across collection jobs."""
+    rows = _rows(
+        db,
+        "SELECT detail FROM ingest_diagnostics WHERE kind = 'api_cost' ORDER BY created_at",
+    )
+    points = 0.0
+    runs = 0
+    unknown_jobs = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["detail"])
+        except (ValueError, TypeError):
+            continue
+        if payload.get("points_spent") is None:
+            unknown_jobs += 1
+            continue
+        points += float(payload["points_spent"])
+        runs += int(payload.get("runs_completed") or 0)
+    return {
+        "jobs_measured": len(rows) - unknown_jobs,
+        "jobs_unmeasured": unknown_jobs,
+        "points_spent": round(points, 1) if runs else None,
+        "runs_covered": runs,
+        "points_per_run": round(points / runs, 2) if runs else None,
+    }
+
+
 def dedupe_coverage(db: Database) -> dict[str, Any]:
     """Whether duplicate detection has actually examined this corpus.
 
@@ -309,6 +337,7 @@ def cost_profile(db: Database) -> dict[str, Any]:
         ),
         "mean_pages_per_run": (round(total_pages / paged_runs, 1) if paged_runs else None),
         "page_limit_used": EVENTS_PAGE_LIMIT,
+        "api_points": _api_cost(db),
         "measurement_caveats": [
             "Per-run span excludes the first page's round trip (understates by one page).",
             "Span includes metadata queries and database writes, not API latency alone.",
@@ -590,6 +619,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Seconds per run (mean): {cost['mean_seconds_per_run']}",
         f"- Seconds per page (mean): {cost['mean_seconds_per_page']}",
         f"- Events requested per page: {cost['page_limit_used']:,}",
+        f"- API points per run: {cost['api_points']['points_per_run']}"
+        + (
+            f"  (over {cost['api_points']['runs_covered']} run(s); "
+            f"{cost['api_points']['jobs_unmeasured']} job(s) unmeasured)"
+            if cost["api_points"]["points_per_run"] is not None
+            else "  ← not yet measured"
+        ),
         "",
         "| Stream | Pages | Pages/run | Events |",
         "| --- | ---: | ---: | ---: |",
