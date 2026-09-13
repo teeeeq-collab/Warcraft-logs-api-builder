@@ -22,8 +22,8 @@ from wcl_mplus.rawcache import RawCache
 from wcl_mplus.reportsource import ManualReportSource
 from wcl_mplus.validate import (
     collect_validation,
-    paired_abilities,
     npc_instance_evidence,
+    paired_abilities,
     render_markdown,
     write_reports,
 )
