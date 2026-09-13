@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from wcl_mplus.db import (
+    EXPECTED_SCHEMA_VERSION,
     Database,
     DatabaseError,
     SchemaVersionError,
@@ -40,12 +41,12 @@ def test_duplicate_migration_versions_are_rejected(tmp_path):
 
 def test_migrations_are_idempotent(tmp_path):
     db = Database(tmp_path / "a.sqlite")
-    assert schema_version(db.conn) == 1
+    assert schema_version(db.conn) == EXPECTED_SCHEMA_VERSION
     assert migrate(db.conn) == [], "nothing left to apply"
     db.close()
 
     again = Database(tmp_path / "a.sqlite")
-    assert schema_version(again.conn) == 1
+    assert schema_version(again.conn) == EXPECTED_SCHEMA_VERSION
 
 
 def test_schema_version_mismatch_is_refused(tmp_path, monkeypatch):

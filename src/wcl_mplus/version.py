@@ -11,17 +11,17 @@ from functools import lru_cache
 from pathlib import Path
 
 #: Software version. Bump on any behavioural change to collection.
-SOFTWARE_VERSION = "0.2.0"
+SOFTWARE_VERSION = "0.3.0"
 
 #: Normalizer version. Bump whenever raw -> normalized mapping changes, so a
 #: rebuild from raw cache is distinguishable from the original ingest.
 NORMALIZER_VERSION = 1
 
 #: GraphQL query-set version. Bump when files in queries/ change meaningfully.
-QUERY_VERSION = 4
+QUERY_VERSION = 5
 
 #: Database schema version; matches the highest applied migration.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @lru_cache(maxsize=1)

@@ -74,13 +74,33 @@ class CollectionError(RedactedError):
 
 @dataclass
 class EventRequest:
-    """One event stream to fetch: a category, optionally hostility-filtered."""
+    """One event stream to fetch: a category, optionally narrowed.
+
+    `source_id` / `target_id` restrict the stream to a single actor. A narrowed
+    stream answers a different question from the same stream unnarrowed, so the
+    narrowing travels with the request into `run_stream_coverage` rather than
+    being applied and forgotten.
+    """
 
     data_type: str
     hostility: str | None = None
+    source_id: int | None = None
+    target_id: int | None = None
+    #: "all" or "focus" -- why this stream was requested, not just how.
+    scope: str = "all"
 
     @property
     def label(self) -> str:
+        base = f"{self.data_type}@{self.hostility}" if self.hostility else self.data_type
+        if self.source_id is not None:
+            base += f"[source={self.source_id}]"
+        if self.target_id is not None:
+            base += f"[target={self.target_id}]"
+        return base
+
+    @property
+    def stream_key(self) -> str:
+        """Identity of the stream itself, without the actor narrowing."""
         return f"{self.data_type}@{self.hostility}" if self.hostility else self.data_type
 
 
@@ -198,12 +218,44 @@ class Collector:
 
     # -- event profile ----------------------------------------------------
 
-    def event_requests(self, event_profile: str) -> list[EventRequest]:
+    def event_requests(
+        self, event_profile: str, *, focus_actor_id: int | None = None
+    ) -> list[EventRequest]:
+        """Streams this profile asks for, including any focus-player streams.
+
+        A focus stream is only emitted when an actor was actually resolved.
+        Emitting it unnarrowed instead would quietly collect five players'
+        telemetry under a profile that promised one player's, which is the
+        expensive mistake this whole layering exists to avoid.
+        """
         profile = self.config.sampling.event_profile(event_profile)
         requests: list[EventRequest] = []
+        seen: set[str] = set()
         for spec in profile.event_types:
             data_type, hostility = SamplingConfig.parse_event_type(spec)
-            requests.append(EventRequest(data_type=data_type, hostility=hostility))
+            request = EventRequest(data_type=data_type, hostility=hostility)
+            requests.append(request)
+            seen.add(request.stream_key)
+
+        # The flag has existed in every profile since the first release and was
+        # never read, so no CombatantInfo was ever collected while the config
+        # said otherwise. Honouring it here keeps both spellings working: the
+        # flag, and naming CombatantInfo outright in event_types.
+        if profile.include_combatant_info and "CombatantInfo" not in seen:
+            requests.append(EventRequest(data_type="CombatantInfo"))
+            seen.add("CombatantInfo")
+
+        if focus_actor_id is not None:
+            for spec in profile.focus_event_types:
+                data_type, hostility = SamplingConfig.parse_event_type(spec)
+                requests.append(
+                    EventRequest(
+                        data_type=data_type,
+                        hostility=hostility,
+                        source_id=focus_actor_id,
+                        scope="focus",
+                    )
+                )
         return requests
 
     # -- report -----------------------------------------------------------
@@ -215,6 +267,7 @@ class Collector:
         event_profile: str = "mechanics",
         dungeon_key: str | None = None,
         max_runs: int | None = None,
+        focus_player: str | None = None,
     ) -> list[RunOutcome]:
         """Ingest one report: metadata, its Mythic+ runs, and their events."""
         code = candidate.code
@@ -262,7 +315,7 @@ class Collector:
         with self.db.transaction():
             self.db.upsert("reports", report_row)
 
-        fights = self._fetch_fights(code)
+        fights = self.fetch_fights(code)
         runs = [f for f in fights if is_mythic_plus(f)]
         if dungeon_key is not None:
             entry = self.config.dungeons.resolve(dungeon_key)
@@ -301,6 +354,7 @@ class Collector:
                     master=master,
                     event_profile=event_profile,
                     archived=bool(report_row.get("is_archived")),
+                    focus_player=focus_player,
                 )
             )
         return outcomes
@@ -316,6 +370,7 @@ class Collector:
         master: dict[str, Any],
         event_profile: str,
         archived: bool,
+        focus_player: str | None = None,
     ) -> RunOutcome:
         fight_id = int(fight.get("id") or 0)
         run_id = run_id_for(report_code, fight_id)
@@ -380,20 +435,38 @@ class Collector:
             )
 
         try:
-            for request in self.event_requests(event_profile):
-                written, pages = self._collect_events(
-                    request,
-                    run_id=run_id,
-                    report_code=report_code,
-                    report_start_ms=report_start_ms,
-                    run_rel_start_ms=int(run_row["rel_start_ms"]),
-                    rel_start_ms=int(run_row["rel_start_ms"]),
-                    rel_end_ms=int(run_row["rel_end_ms"]),
-                    assigner=assigner,
-                    pull_starts={p["pull_id"]: int(p["rel_start_ms"]) for p in pull_rows},
-                )
-                outcome.events_written += written
-                outcome.pages_fetched += pages
+            focus_actor_id = self._resolve_focus_actor(
+                focus_player, run_id=run_id, report_code=report_code
+            )
+            for request in self.event_requests(event_profile, focus_actor_id=focus_actor_id):
+                stream_error: str | None = None
+                try:
+                    written, pages = self._collect_events(
+                        request,
+                        run_id=run_id,
+                        report_code=report_code,
+                        report_start_ms=report_start_ms,
+                        run_rel_start_ms=int(run_row["rel_start_ms"]),
+                        rel_start_ms=int(run_row["rel_start_ms"]),
+                        rel_end_ms=int(run_row["rel_end_ms"]),
+                        assigner=assigner,
+                        pull_starts={p["pull_id"]: int(p["rel_start_ms"]) for p in pull_rows},
+                    )
+                    outcome.events_written += written
+                    outcome.pages_fetched += pages
+                finally:
+                    # Written whatever happened. A stream that failed must leave
+                    # a row saying so -- a missing row means "never requested",
+                    # and a failure silently wearing that meaning is exactly the
+                    # confusion this manifest exists to prevent.
+                    self._record_coverage(
+                        request,
+                        run_id=run_id,
+                        event_profile=event_profile,
+                        rel_start_ms=int(run_row["rel_start_ms"]),
+                        rel_end_ms=int(run_row["rel_end_ms"]),
+                        error=stream_error,
+                    )
         except ApiError as exc:
             outcome.errors.append(str(exc))
             outcome.status = "collection-failed"
@@ -457,7 +530,7 @@ class Collector:
         )
         return ((data.get("reportData") or {}).get("report")) or None
 
-    def _fetch_fights(self, code: str) -> list[dict[str, Any]]:
+    def fetch_fights(self, code: str) -> list[dict[str, Any]]:
         data = self.client.execute(
             render(
                 "report_fights",
@@ -482,6 +555,104 @@ class Collector:
     def _store_master_data(self, master: dict[str, Any], *, report_code: str) -> None:
         self.db.upsert_many("actors", normalize_actors(master, report_code=report_code))
         self.db.upsert_many("abilities", normalize_abilities(master, seen_at=time.time()))
+
+    def _resolve_focus_actor(
+        self, focus_player: str | None, *, run_id: str, report_code: str
+    ) -> int | None:
+        """Find the actor ID for a named focus player in this run.
+
+        Returns None when no focus player was asked for, and also when one was
+        asked for but is not in this run's roster -- a player does not appear in
+        every report on a list. The diagnostic matters: without it the run would
+        silently collect only its unnarrowed streams and look, later, exactly
+        like a run where the focus streams returned nothing.
+        """
+        if not focus_player:
+            return None
+        row = self.db.execute(
+            "SELECT a.actor_id FROM actors a "
+            "  JOIN run_players rp ON rp.run_id = ? AND rp.actor_id = a.actor_id "
+            " WHERE a.report_code = ? AND LOWER(a.name) = LOWER(?) LIMIT 1",
+            (run_id, report_code, focus_player),
+        ).fetchone()
+        if row is None:
+            self.db.diagnostic(
+                "focus_player_absent",
+                f"{focus_player!r} is not in the roster of {run_id}; "
+                "focus streams were not collected for this run.",
+                run_id=run_id,
+                job_id=self.job_id,
+                severity="warning",
+            )
+            return None
+        return int(row["actor_id"])
+
+    def _record_coverage(
+        self,
+        request: EventRequest,
+        *,
+        run_id: str,
+        event_profile: str,
+        rel_start_ms: int,
+        rel_end_ms: int,
+        error: str | None,
+    ) -> None:
+        """Record that this stream was requested, and how it ended.
+
+        Totals are read back from `event_pages` rather than accumulated in
+        memory, so a resumed collection reports the whole stream rather than
+        only the part this process fetched. `status` is 'ok' only when the
+        stream paginated to exhaustion -- which is what licenses reading its
+        zero as a real zero.
+        """
+        row = self.db.execute(
+            "SELECT COUNT(*) AS pages, IFNULL(SUM(event_count), 0) AS events, "
+            "       SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS bad "
+            "  FROM event_pages "
+            " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility, '') = ?",
+            (run_id, request.data_type, request.hostility or ""),
+        ).fetchone()
+        # Exhaustion is a property of the LAST page only. Every earlier page
+        # carries a forward cursor by definition, so counting pages with a
+        # cursor marks every multi-page stream partial.
+        last = self.db.execute(
+            "SELECT next_cursor_ms FROM event_pages "
+            " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility, '') = ? "
+            " ORDER BY page_index DESC LIMIT 1",
+            (run_id, request.data_type, request.hostility or ""),
+        ).fetchone()
+
+        pages = int(row["pages"] or 0)
+        if error is not None or int(row["bad"] or 0):
+            status = "failed"
+        elif pages == 0 or last is None or last["next_cursor_ms"] is not None:
+            status = "partial"
+        else:
+            status = "ok"
+
+        self.db.upsert(
+            "run_stream_coverage",
+            {
+                "run_id": run_id,
+                "data_type": request.data_type,
+                "hostility": request.hostility,
+                "collection_profile": event_profile,
+                "scope": request.scope,
+                "source_id": request.source_id,
+                "target_id": request.target_id,
+                "requested_start_ms": rel_start_ms,
+                "requested_end_ms": rel_end_ms,
+                "pages": pages,
+                "events": int(row["events"] or 0),
+                "status": status,
+                "error": error,
+                "job_id": self.job_id,
+                "query_version": QUERY_VERSION,
+                "normalizer_version": NORMALIZER_VERSION,
+                "software_version": SOFTWARE_VERSION,
+                "collected_at": time.time(),
+            },
+        )
 
     def _store_roster(self, master: dict[str, Any], *, run_id: str, fight: dict[str, Any]) -> None:
         friendly = [int(p) for p in (fight.get("friendlyPlayers") or []) if isinstance(p, int)]
@@ -625,6 +796,8 @@ class Collector:
                     "hostilityType": request.hostility,
                     "limit": self.page_limit,
                     "fightIDs": [int(run_id.split(":")[-1])],
+                    "sourceID": request.source_id,
+                    "targetID": request.target_id,
                 },
                 kind=f"events_{request.label}_{int(cursor)}",
                 report_code=report_code,
@@ -747,6 +920,7 @@ class Collector:
         event_profile: str = "mechanics",
         dungeon_key: str | None = None,
         max_runs_per_report: int | None = None,
+        focus_player: str | None = None,
     ) -> CollectionResult:
         result = CollectionResult(job_id=self.job_id)
         self.start_job(sample_profile=None, event_profile=event_profile)
@@ -770,6 +944,7 @@ class Collector:
                         event_profile=event_profile,
                         dungeon_key=dungeon_key,
                         max_runs=max_runs_per_report,
+                        focus_player=focus_player,
                     )
                 except ApiError as exc:
                     result.reports_failed += 1

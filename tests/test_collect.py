@@ -485,3 +485,48 @@ def test_job_records_what_it_spent_of_the_hourly_budget(pipeline):
     # The simulator reports a budget, so a real delta must be present. When it
     # cannot be known the reason must be, rather than a plausible-looking zero.
     assert payload["points_spent"] is not None or payload["points_unknown_reason"]
+
+
+def test_combatant_info_is_actually_collected(pipeline):
+    """The config flag was a no-op for the whole life of the project."""
+    collector, db, _ = pipeline()
+    requests = collector.event_requests("mechanics")
+    assert any(r.data_type == "CombatantInfo" for r in requests), (
+        "include_combatant_info is set in the profile but produced no request"
+    )
+
+
+def test_coverage_row_written_for_every_requested_stream(pipeline):
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    requested = {r.stream_key for r in collector.event_requests("mechanics")}
+    rows = db.query(
+        "SELECT data_type, hostility, status, collection_profile FROM run_stream_coverage"
+    )
+    recorded = {r["data_type"] + (f"@{r['hostility']}" if r["hostility"] else "") for r in rows}
+    assert requested <= recorded, f"missing coverage for {requested - recorded}"
+    assert all(r["collection_profile"] == "mechanics" for r in rows)
+    assert all(r["status"] in ("ok", "partial", "failed") for r in rows)
+
+
+def test_focus_streams_are_skipped_when_the_player_is_absent(pipeline):
+    """A focus stream must never silently widen to the whole party."""
+    collector, db, _ = pipeline()
+    collector.collect(candidates(), focus_player="NobodyHere")
+
+    focus_rows = db.query("SELECT * FROM run_stream_coverage WHERE scope = 'focus'")
+    assert focus_rows == [], "focus streams collected without a resolved actor"
+    notes = db.query("SELECT detail FROM ingest_diagnostics WHERE kind = 'focus_player_absent'")
+    assert notes, "an absent focus player must be recorded, not passed over"
+
+
+def test_focus_requests_carry_the_actor_filter(pipeline):
+    collector, _, _ = pipeline()
+    requests = collector.event_requests("mechanics", focus_actor_id=42)
+    focus = [r for r in requests if r.scope == "focus"]
+    for r in focus:
+        assert r.source_id == 42
+        assert "[source=42]" in r.label
+        # The stream key stays clean so coverage groups by stream, not by actor.
+        assert "source" not in r.stream_key

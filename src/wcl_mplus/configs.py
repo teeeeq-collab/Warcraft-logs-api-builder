@@ -242,6 +242,10 @@ class EventProfile:
     name: str
     description: str
     event_types: list[str]
+    #: Streams collected only for a named focus player, narrowed to their actor
+    #: ID. Requested only when a focus player is actually resolved -- never
+    #: silently widened to the whole party.
+    focus_event_types: list[str] = field(default_factory=list)
     include_combatant_info: bool = False
 
 
@@ -289,6 +293,7 @@ class SamplingConfig:
                 name=str(name),
                 description=str((raw or {}).get("description") or ""),
                 event_types=[str(t) for t in (raw or {}).get("event_types") or []],
+                focus_event_types=[str(t) for t in (raw or {}).get("focus_event_types") or []],
                 include_combatant_info=bool((raw or {}).get("include_combatant_info")),
             )
             for name, raw in (data.get("event_profiles") or {}).items()

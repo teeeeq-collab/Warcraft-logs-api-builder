@@ -4,6 +4,12 @@
 # forced into a fixed selection set -- exactly what a research dataset needs
 # (brief section 13: do not force every event into a lossy schema).
 #
+# `sourceID` / `targetID` restrict a stream to one actor. This is what makes a
+# focus-player corpus affordable: full telemetry for the player being studied,
+# cheap party context for everyone else. A stream narrowed this way is NOT the
+# same stream -- `run_stream_coverage` records the filter so nothing downstream
+# can read a filtered stream as a complete one.
+#
 # `nextPageTimestamp` is the pagination cursor. Whether it is inclusive is
 # determined empirically by `wclmplus recon`; see src/wcl_mplus/paginate.py,
 # which is correct either way.
@@ -15,6 +21,8 @@ query ReportEvents(
   $hostilityType: HostilityType
   $limit: Int
   $fightIDs: [Int]
+  $sourceID: Int
+  $targetID: Int
 ) {
   reportData {
     report(code: $code) {
@@ -25,6 +33,8 @@ query ReportEvents(
         hostilityType: $hostilityType
         limit: $limit
         fightIDs: $fightIDs
+        sourceID: $sourceID
+        targetID: $targetID
         includeResources: true
         translate: true
       ) {

@@ -163,19 +163,34 @@ def stream_coverage(db: Database) -> dict[str, Any]:
     config edits and interrupted jobs, none of which the label does. So this
     groups runs by the streams they hold and reports every distinct shape.
     """
+    # Read from the manifest, not from event_pages. A stream that was requested
+    # and genuinely returned nothing writes no pages, so inferring coverage from
+    # pages reports it as never collected -- turning a real zero into a gap and
+    # a gap into a zero, in whichever direction happens to mislead.
     rows = _rows(
         db,
-        "SELECT run_id, data_type, IFNULL(hostility, '') AS hostility "
-        "  FROM event_pages WHERE status = 'ok' "
-        " GROUP BY run_id, data_type, hostility",
+        "SELECT run_id, data_type, IFNULL(hostility, '') AS hostility, "
+        "       scope, source_id, target_id, status "
+        "  FROM run_stream_coverage",
     )
     per_run: dict[str, set[str]] = {}
+    incomplete: list[dict[str, Any]] = []
     for row in rows:
         label = row["data_type"] + (f"@{row['hostility']}" if row["hostility"] else "")
+        if row["source_id"] is not None or row["target_id"] is not None:
+            label += " (focus)"
         per_run.setdefault(row["run_id"], set()).add(label)
+        if row["status"] != "ok":
+            incomplete.append({"run_id": row["run_id"], "stream": label, "status": row["status"]})
 
     if not per_run:
-        return {"shapes": [], "distinct_shapes": 0, "streams_seen": []}
+        return {
+            "shapes": [],
+            "distinct_shapes": 0,
+            "streams_seen": [],
+            "incomplete_streams": [],
+            "manifest_rows": 0,
+        }
 
     widest = max(per_run.values(), key=len)
     shapes: dict[tuple[str, ...], list[str]] = {}
@@ -184,6 +199,8 @@ def stream_coverage(db: Database) -> dict[str, Any]:
 
     return {
         "distinct_shapes": len(shapes),
+        "manifest_rows": len(rows),
+        "incomplete_streams": incomplete[:50],
         "streams_seen": sorted({s for streams in per_run.values() for s in streams}),
         "shapes": sorted(
             (
@@ -525,6 +542,18 @@ def known_limitations(db: Database) -> list[str]:
         )
 
     coverage = stream_coverage(db)
+    if coverage["manifest_rows"] == 0 and (db.scalar("SELECT COUNT(*) FROM dungeon_runs") or 0):
+        limitations.append(
+            "No stream-coverage manifest exists for these runs: they were collected before the "
+            "manifest was added. A stream holding zero events cannot be distinguished from a "
+            "stream that was never requested. Re-collect to populate it."
+        )
+    if coverage["incomplete_streams"]:
+        limitations.append(
+            f"{len(coverage['incomplete_streams'])} stream(s) did not paginate to exhaustion. "
+            "A count of zero events in those streams means the collection stopped, not that "
+            "nothing happened; exclude them or re-collect before using them."
+        )
     if coverage["distinct_shapes"] > 1:
         thin = [s for s in coverage["shapes"] if s["missing_vs_widest"]]
         detail = "; ".join(
@@ -728,6 +757,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Distinct stream shapes in this corpus: {coverage['distinct_shapes']}"
         + ("  ← mixed fidelity" if coverage["distinct_shapes"] > 1 else ""),
+        f"- Coverage manifest rows: {coverage['manifest_rows']:,}",
+        f"- Streams not collected to exhaustion: {len(coverage['incomplete_streams'])}"
+        + ("  ← a zero in these is not a real zero" if coverage["incomplete_streams"] else ""),
     ]
     if coverage["distinct_shapes"] > 1:
         lines += ["", "| Runs | Missing streams |", "| ---: | --- |"]

@@ -16,6 +16,7 @@ from wcl_simulator import REPORT_CODE, WclSimulator
 
 from wcl_mplus import cli
 from wcl_mplus.auth import Token
+from wcl_mplus.version import SCHEMA_VERSION
 
 runner = CliRunner()
 
@@ -86,7 +87,7 @@ def test_version_reports_provenance():
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["software_version"]
-    assert payload["schema_version"] == 1, "matches the highest applied migration"
+    assert payload["schema_version"] == SCHEMA_VERSION, "matches the highest migration"
 
 
 def test_config_check_reports_unverified_dungeons():

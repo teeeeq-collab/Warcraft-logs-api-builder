@@ -421,21 +421,20 @@ def test_mixed_fidelity_corpus_is_flagged_not_averaged(populated):
     """Runs collected under a reduced profile must not read as runs with no such events."""
     db = populated()
     run_id = db.query("SELECT run_id FROM dungeon_runs LIMIT 1")[0]["run_id"]
-    row = db.execute(
-        "SELECT * FROM event_pages WHERE run_id = ? AND status = 'ok' LIMIT 1", (run_id,)
-    ).fetchone()
-    assert row is not None
+    rows = db.query("SELECT * FROM run_stream_coverage WHERE run_id = ?", (run_id,))
+    assert len(rows) > 1, "fixture needs several streams to drop one"
 
-    # A second run carrying strictly fewer streams: the shape a leaner profile
-    # would leave behind.
+    # A second run collected under a leaner profile: same streams minus one.
     later = dict(db.execute("SELECT * FROM dungeon_runs WHERE run_id = ?", (run_id,)).fetchone())
     later["run_id"] = run_id + ":lean"
     later["fight_id"] = int(later["fight_id"]) + 2000
     db.upsert("dungeon_runs", later)
-    page = dict(row)
-    page.pop("page_id")
-    page["run_id"] = later["run_id"]
-    db.upsert("event_pages", page)
+    for row in rows[:-1]:
+        entry = dict(row)
+        entry.pop("coverage_id")
+        entry["run_id"] = later["run_id"]
+        entry["collection_profile"] = "lean"
+        db.upsert("run_stream_coverage", entry)
     db.conn.commit()
 
     report = collect_validation(db)
@@ -445,6 +444,40 @@ def test_mixed_fidelity_corpus_is_flagged_not_averaged(populated):
     assert thin, "the narrower shape was not identified"
     assert any("different event profiles" in lim for lim in report["limitations"])
     assert "mixed fidelity" in render_markdown(report)
+
+
+def test_requested_stream_with_no_events_is_not_a_gap(populated):
+    """A real zero and a never-requested stream must not look the same."""
+    db = populated()
+    run_id = db.query("SELECT run_id FROM dungeon_runs LIMIT 1")[0]["run_id"]
+    db.upsert(
+        "run_stream_coverage",
+        {
+            "run_id": run_id,
+            "data_type": "Threat",
+            "hostility": None,
+            "collection_profile": "test",
+            "scope": "all",
+            "source_id": None,
+            "target_id": None,
+            "requested_start_ms": 0,
+            "requested_end_ms": 1,
+            "pages": 1,
+            "events": 0,
+            "status": "ok",
+            "error": None,
+            "job_id": None,
+            "query_version": 1,
+            "normalizer_version": 1,
+            "software_version": "t",
+            "collected_at": 0.0,
+        },
+    )
+    db.conn.commit()
+
+    coverage = collect_validation(db)["stream_coverage"]
+    assert "Threat" in coverage["streams_seen"], "a requested stream must appear even at zero"
+    assert not coverage["incomplete_streams"]
 
 
 def test_pair_rates_cannot_exceed_one(populated):

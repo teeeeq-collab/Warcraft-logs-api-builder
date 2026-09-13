@@ -22,12 +22,20 @@ from typing import Any
 
 import typer
 
+from .benchmark import (
+    HostilityComparison,
+    StreamBenchmark,
+    StreamMeasurement,
+    render_json,
+    render_report,
+)
 from .client import ApiError, GraphQLClient
 from .collect import Collector
 from .configs import ConfigFileError, ProjectConfig
 from .db import Database, DatabaseError
 from .dedupe import group_duplicates
 from .discover import discover_dungeons
+from .normalize import is_mythic_plus
 from .querybuild import WANTED_FIGHT_FIELDS, WANTED_REPORT_FIELDS, QueryError, render
 from .rawcache import RawCache
 from .recon import Recon
@@ -618,6 +626,13 @@ def collect(
     dungeon: str | None = typer.Option(
         None, "--dungeon", help='Only collect runs of this dungeon, e.g. "Murder Row".'
     ),
+    focus_player: str | None = typer.Option(
+        None,
+        "--focus-player",
+        help="Character name. Collects the profile's focus_event_types narrowed to "
+        "that player only. Runs where the name is absent collect no focus streams "
+        "and record a diagnostic saying so.",
+    ),
     max_runs: int | None = typer.Option(
         None, "--max-runs-per-report", help="Cap runs taken from each report."
     ),
@@ -681,6 +696,7 @@ def collect(
                 event_profile=profile,
                 dungeon_key=dungeon,
                 max_runs_per_report=max_runs,
+                focus_player=focus_player,
             )
         except KeyboardInterrupt:
             typer.secho(
@@ -709,6 +725,101 @@ def collect(
     typer.echo(f"  Job ID:         {summary['job_id']}")
     typer.echo("\nNext: wclmplus validate")
     db.close()
+
+
+@app.command()
+def benchmark(
+    report_list: Path = typer.Option(
+        ..., "--report-list", help="File with report codes or URLs. 3-5 is enough."
+    ),
+    streams: str = typer.Option(
+        "DamageDone,Healing,Resources,Threat,CombatantInfo",
+        "--streams",
+        help="Comma-separated EventDataType values to probe.",
+    ),
+    hostility_check: bool = typer.Option(
+        True,
+        "--hostility-check/--no-hostility-check",
+        help="Also request each stream unfiltered, @Enemies and @Friendlies, and compare.",
+    ),
+    max_runs: int = typer.Option(1, "--runs-per-report", help="Fights probed per report."),
+    max_pages: int = typer.Option(
+        12, "--max-pages", help="Page cap per stream. Caps cost; a capped stream is a lower bound."
+    ),
+    out: Path = typer.Option(
+        Path("data/exports/benchmark"), "--out", help="Where the report is written."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Measure what uncollected streams cost, without touching the corpus.
+
+    Writes nothing to the collection database. Five stream categories are
+    currently unmeasured and two of them are plausibly larger than everything
+    already stored, so this exists to replace an estimate with a number before
+    any of them becomes a default.
+    """
+    _setup_logging(verbose)
+    settings = _load_settings()
+    client = _client(settings)
+    bench = StreamBenchmark(client)
+
+    try:
+        candidates = list(ManualReportSource.from_file(report_list).discover())
+    except DiscoveryError as exc:
+        _fail(exc, "Check the report list path.")
+        return
+
+    wanted = [s.strip() for s in streams.split(",") if s.strip()]
+    measurements: list[StreamMeasurement] = []
+    comparisons: list[HostilityComparison] = []
+    probed = 0
+
+    collector = Collector(client, _database(settings), ProjectConfig.load())
+    try:
+        for candidate in candidates:
+            fights = [f for f in collector.fetch_fights(candidate.code) if is_mythic_plus(f)]
+            for fight in fights[:max_runs]:
+                fight_id = int(fight.get("id") or 0)
+                start = int(fight.get("startTime") or 0)
+                end = int(fight.get("endTime") or 0)
+                probed += 1
+                typer.echo(f"Probing {candidate.code} fight {fight_id}…")
+
+                for data_type in wanted:
+                    if hostility_check:
+                        comparison, runs = bench.compare_hostility(
+                            report_code=candidate.code,
+                            fight_id=fight_id,
+                            rel_start_ms=start,
+                            rel_end_ms=end,
+                            data_type=data_type,
+                            max_pages=max_pages,
+                        )
+                        comparisons.append(comparison)
+                        measurements.extend(runs)
+                        typer.echo(f"  {data_type}: {comparison.verdict}")
+                    else:
+                        m = bench.measure(
+                            report_code=candidate.code,
+                            fight_id=fight_id,
+                            rel_start_ms=start,
+                            rel_end_ms=end,
+                            data_type=data_type,
+                            max_pages=max_pages,
+                        )
+                        measurements.append(m)
+                        typer.echo(f"  {m.label}: {m.events:,} events, {m.pages} pages")
+    except (ApiError, DiscoveryError) as exc:
+        _fail(exc, "The probe stopped; partial results are still written.")
+
+    out.mkdir(parents=True, exist_ok=True)
+    md = out / "STREAM_BENCHMARK.md"
+    js = out / "stream_benchmark.json"
+    md.write_text(render_report(measurements, comparisons, runs_probed=probed), encoding="utf-8")
+    js.write_text(render_json(measurements, comparisons, runs_probed=probed), encoding="utf-8")
+    typer.secho(f"\nWrote {md}", fg=typer.colors.GREEN)
+    typer.secho(f"Wrote {js}", fg=typer.colors.GREEN)
+    client.close()
 
 
 @app.command()

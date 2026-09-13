@@ -102,6 +102,88 @@ event_profiles:
       - Resources
     include_combatant_info: true
 
+  # -------------------------------------------------------------------------
+  # Purpose-built profiles. The collector is a selectable instrument: the right
+  # streams depend on the question, and one universal maximum-fidelity profile
+  # is both unaffordable at corpus scale and insufficient for coaching.
+  #
+  # NONE of these is the default yet. Their costs are unmeasured -- see
+  # `wclmplus benchmark`. Do not promote one to the large-corpus default until
+  # the measurements are reviewed.
+  # -------------------------------------------------------------------------
+
+  mechanics_research:
+    description: "Large corpus. What did the dungeon and its mobs do?"
+    # Environment and party context at full fidelity; no per-player rotational
+    # telemetry. Deliberately omits DamageDone, Healing and friendly Buffs,
+    # which answer questions about players rather than about the dungeon.
+    event_types:
+      - Casts@Enemies
+      - Buffs@Enemies
+      - Resources@Enemies    # UNVERIFIED: may expose NPC energy mechanics. Benchmark first.
+      - Summons
+      - Debuffs
+      - DamageTaken
+      - Casts@Friendlies     # defensives, interrupts, dispels -- not full rotation
+      - Interrupts
+      - Dispels
+      - Deaths
+    include_combatant_info: true
+
+  reference_player:
+    description: "Behavioural reference corpus: full telemetry for one player, context for the rest."
+    # The layering that makes a large reference corpus affordable. Everything in
+    # event_types is collected for the whole party; everything in
+    # focus_event_types is narrowed to the focus player's actor ID and is only
+    # requested when --focus-player resolves in that run.
+    event_types:
+      - Casts@Enemies
+      - Buffs@Enemies
+      - Resources@Enemies
+      - Summons
+      - Debuffs
+      - DamageTaken
+      - Interrupts
+      - Dispels
+      - Deaths
+    focus_event_types:
+      - Casts@Friendlies
+      - Buffs@Friendlies
+      - DamageDone
+      - Healing
+      - Resources@Friendlies
+    include_combatant_info: true
+
+  user_coaching:
+    description: "One user's own run, analysed in depth. Storage is not the constraint here."
+    # A user may ask a new question after the report has been analysed, and
+    # re-fetching is the only way to answer it. Asymmetry favours keeping
+    # everything, for every party member, on the handful of runs this touches.
+    event_types:
+      - Casts@Enemies
+      - Casts@Friendlies
+      - Buffs@Enemies
+      - Buffs@Friendlies
+      - Debuffs
+      - DamageTaken
+      - DamageDone
+      - Healing
+      - Resources@Friendlies
+      - Resources@Enemies
+      - Interrupts
+      - Dispels
+      - Summons
+      - Deaths
+      - Threat
+    include_combatant_info: true
+
+  forensic_full:
+    description: "Everything the API exposes. Small samples only -- never a 5,000-run corpus."
+    # For discovering undocumented relationships, validating analysis, building
+    # fixtures, and answering "does this stream carry a field we need?".
+    event_types: [All]
+    include_combatant_info: true
+
   raw-all:
     description: "Every event. Validation samples only until cost is measured."
     event_types: [All]
