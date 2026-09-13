@@ -137,6 +137,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "cost": cost_profile(db),
         "dedupe": dedupe_coverage(db),
         "paired_abilities": paired_abilities(db),
+        "stream_coverage": stream_coverage(db),
         "duplicates": {
             "groups": len(duplicate_groups),
             "runs_in_groups": sum(int(g["members"]) for g in duplicate_groups),
@@ -145,6 +146,58 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "diagnostics": diagnostics,
         "npc_instance_evidence": npc_instance_evidence(db),
         "limitations": known_limitations(db),
+    }
+
+
+def stream_coverage(db: Database) -> dict[str, Any]:
+    """Which event streams each run actually holds, observed rather than declared.
+
+    A corpus grown over months will outlive the config that built it. Collect
+    200 runs at full fidelity, switch to a reduced profile for the next 2,000,
+    and every buff statistic pooled across the two is wrong for a reason nothing
+    in the events themselves reveals -- the missing rows look exactly like rows
+    that never happened.
+
+    The profile name a job recorded is an assertion about intent. The set of
+    streams a run actually carries is evidence, and it survives re-collection,
+    config edits and interrupted jobs, none of which the label does. So this
+    groups runs by the streams they hold and reports every distinct shape.
+    """
+    rows = _rows(
+        db,
+        "SELECT run_id, data_type, IFNULL(hostility, '') AS hostility "
+        "  FROM event_pages WHERE status = 'ok' "
+        " GROUP BY run_id, data_type, hostility",
+    )
+    per_run: dict[str, set[str]] = {}
+    for row in rows:
+        label = row["data_type"] + (f"@{row['hostility']}" if row["hostility"] else "")
+        per_run.setdefault(row["run_id"], set()).add(label)
+
+    if not per_run:
+        return {"shapes": [], "distinct_shapes": 0, "streams_seen": []}
+
+    widest = max(per_run.values(), key=len)
+    shapes: dict[tuple[str, ...], list[str]] = {}
+    for run_id, streams in per_run.items():
+        shapes.setdefault(tuple(sorted(streams)), []).append(run_id)
+
+    return {
+        "distinct_shapes": len(shapes),
+        "streams_seen": sorted({s for streams in per_run.values() for s in streams}),
+        "shapes": sorted(
+            (
+                {
+                    "streams": list(streams),
+                    "runs": len(members),
+                    "missing_vs_widest": sorted(widest - set(streams)),
+                    "example_run": sorted(members)[0],
+                }
+                for streams, members in shapes.items()
+            ),
+            key=lambda s: int(s["runs"]),
+            reverse=True,
+        ),
     }
 
 
@@ -460,6 +513,20 @@ def known_limitations(db: Database) -> list[str]:
             "treating the analysable count as a count of distinct real runs."
         )
 
+    coverage = stream_coverage(db)
+    if coverage["distinct_shapes"] > 1:
+        thin = [s for s in coverage["shapes"] if s["missing_vs_widest"]]
+        detail = "; ".join(
+            f"{s['runs']} run(s) lack {', '.join(s['missing_vs_widest'])}" for s in thin[:3]
+        )
+        limitations.append(
+            f"This corpus was collected under {coverage['distinct_shapes']} different event "
+            f"profiles ({detail}). Runs holding fewer streams are not runs where those events "
+            "did not occur -- they were never requested. Any statistic over a stream some runs "
+            "lack must be computed only over the runs that carry it, or the absent rows will "
+            "read as zeros."
+        )
+
     inseparable = [p for p in paired_abilities(db) if (p["coincidence_rate"] or 0) >= 0.95]
     if inseparable:
         names = ", ".join(f"{p['ability_a_name']} + {p['ability_b_name']}" for p in inseparable[:3])
@@ -642,6 +709,23 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     lines += ["", "Measurement caveats:"]
     lines += [f"- {c}" for c in cost["measurement_caveats"]]
+
+    coverage = report["stream_coverage"]
+    lines += [
+        "",
+        "## Event streams collected",
+        "",
+        f"- Distinct stream shapes in this corpus: {coverage['distinct_shapes']}"
+        + ("  ← mixed fidelity" if coverage["distinct_shapes"] > 1 else ""),
+    ]
+    if coverage["distinct_shapes"] > 1:
+        lines += ["", "| Runs | Missing streams |", "| ---: | --- |"]
+        lines += [
+            f"| {s['runs']} | {', '.join(s['missing_vs_widest']) or 'none (widest)'} |"
+            for s in coverage["shapes"]
+        ]
+    else:
+        lines += [f"- Streams: {', '.join(coverage['streams_seen'])}"]
 
     pairs = report["paired_abilities"]
     if pairs:

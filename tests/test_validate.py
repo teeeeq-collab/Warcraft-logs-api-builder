@@ -403,3 +403,43 @@ def test_evidence_shows_each_npc_once(populated):
 def test_evidence_reports_the_median_interval(populated):
     for example in npc_instance_evidence(populated()):
         assert "median_interval_ms" in example
+
+
+def test_uniform_corpus_reports_one_stream_shape(populated):
+    db = populated()
+    coverage = collect_validation(db)["stream_coverage"]
+    assert coverage["distinct_shapes"] == 1
+    assert coverage["streams_seen"]
+    assert not any(
+        "different event profiles" in lim for lim in collect_validation(db)["limitations"]
+    )
+
+
+def test_mixed_fidelity_corpus_is_flagged_not_averaged(populated):
+    """Runs collected under a reduced profile must not read as runs with no such events."""
+    db = populated()
+    run_id = db.query("SELECT run_id FROM dungeon_runs LIMIT 1")[0]["run_id"]
+    row = db.execute(
+        "SELECT * FROM event_pages WHERE run_id = ? AND status = 'ok' LIMIT 1", (run_id,)
+    ).fetchone()
+    assert row is not None
+
+    # A second run carrying strictly fewer streams: the shape a leaner profile
+    # would leave behind.
+    later = dict(db.execute("SELECT * FROM dungeon_runs WHERE run_id = ?", (run_id,)).fetchone())
+    later["run_id"] = run_id + ":lean"
+    later["fight_id"] = int(later["fight_id"]) + 2000
+    db.upsert("dungeon_runs", later)
+    page = dict(row)
+    page.pop("page_id")
+    page["run_id"] = later["run_id"]
+    db.upsert("event_pages", page)
+    db.conn.commit()
+
+    report = collect_validation(db)
+    coverage = report["stream_coverage"]
+    assert coverage["distinct_shapes"] == 2
+    thin = [s for s in coverage["shapes"] if s["missing_vs_widest"]]
+    assert thin, "the narrower shape was not identified"
+    assert any("different event profiles" in lim for lim in report["limitations"])
+    assert "mixed fidelity" in render_markdown(report)

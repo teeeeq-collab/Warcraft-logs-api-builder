@@ -59,7 +59,14 @@ event_profiles:
     include_combatant_info: true
 
   mechanics-lean:
-    description: "mechanics minus player buff spam. For corpora in the thousands."
+    description: "REDUCED FIDELITY. mechanics minus player buffs. Storage escape hatch only."
+    # This profile discards data on purpose, which is the one thing this project
+    # otherwise refuses to do. Reach for it only when storage genuinely forbids
+    # the full profile, and never mix it with `mechanics` in one database: the
+    # runs collected under it hold no player buff rows, and nothing in those
+    # runs distinguishes "not collected" from "did not happen". The validation
+    # report detects the mix and says so, but detection after the fact is worse
+    # than not creating it.
     # Measured on 66 runs: Buffs@Friendlies is ~70% of all events and ~60% of
     # all pages. Dropping it takes a run from roughly 23 MB to roughly 7 MB.
     # What is lost is player proc and defensive *aura* timing; DamageTaken still
