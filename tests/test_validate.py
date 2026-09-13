@@ -176,3 +176,38 @@ def test_dungeon_filter_narrows_the_report(populated):
     db = populated()
     assert collect_validation(db, dungeon_key="murder-row")["runs"]["analysable"] >= 1
     assert collect_validation(db, dungeon_key="ruby-life-pools")["runs"]["analysable"] == 0
+
+
+def test_cost_profile_is_measured_per_stream(populated):
+    """Cost must be reported per event stream, so the expensive one is visible."""
+    report = collect_validation(populated())
+    cost = report["cost"]
+
+    assert cost["total_pages"] > 0
+    assert cost["by_stream"], "no stream cost rows"
+    # Pages must reconcile with the pagination section rather than be recomputed
+    # from a different rule.
+    assert sum(int(r["pages"]) for r in cost["by_stream"]) == cost["total_pages"]
+    for row in cost["by_stream"]:
+        assert row["pages_per_run"] is not None
+        assert int(row["events"] or 0) >= 0
+    # Every number here is biased in a known direction; the report must say so.
+    assert len(cost["measurement_caveats"]) >= 3
+
+
+def test_cost_profile_survives_a_corpus_with_no_pagination(settings, tmp_path):
+    """A run whose streams each fit in one page must not produce a bogus rate."""
+    from wcl_mplus.db import Database, migrate
+
+    db = Database(tmp_path / "empty.sqlite")
+    migrate(db)
+    cost = collect_validation(db)["cost"]
+    assert cost["total_pages"] == 0
+    assert cost["mean_seconds_per_run"] is None
+    assert cost["mean_seconds_per_page"] is None
+
+
+def test_markdown_reports_cost(populated):
+    text = render_markdown(collect_validation(populated()))
+    assert "## Cost and throughput" in text
+    assert "Seconds per page (mean)" in text

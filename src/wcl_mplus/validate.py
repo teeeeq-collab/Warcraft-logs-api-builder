@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .collect import EVENTS_PAGE_LIMIT
 from .db import Database
 from .version import provenance
 
@@ -131,6 +132,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
             )
             or 0,
         },
+        "cost": cost_profile(db),
         "duplicates": {
             "groups": len(duplicate_groups),
             "runs_in_groups": sum(int(g["members"]) for g in duplicate_groups),
@@ -139,6 +141,66 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "diagnostics": diagnostics,
         "npc_instance_evidence": npc_instance_evidence(db),
         "limitations": known_limitations(db),
+    }
+
+
+def cost_profile(db: Database) -> dict[str, Any]:
+    """What this corpus cost to fetch, measured rather than estimated.
+
+    Wall clock is derived from `event_pages.fetched_at`, which is stamped when
+    a page lands. Two caveats travel with every number here and are printed
+    alongside them:
+
+    * A run's span is ``MAX(fetched_at) - MIN(fetched_at)``, so it excludes the
+      first page's own round trip and understates the true cost by one page.
+    * The span includes the metadata queries and database writes interleaved
+      with paging, so it is end-to-end cost, not pure API latency.
+
+    Both biases are small and in known directions, which is enough to answer
+    the only question this section exists for: what does one more run cost, and
+    which event stream is buying the least per second spent.
+    """
+    by_stream = _rows(
+        db,
+        "SELECT data_type, hostility, COUNT(*) AS pages, "
+        "       SUM(event_count) AS events, COUNT(DISTINCT run_id) AS runs "
+        "FROM event_pages WHERE status = 'ok' "
+        "GROUP BY data_type, hostility ORDER BY pages DESC",
+    )
+    for row in by_stream:
+        runs = int(row["runs"] or 0)
+        row["pages_per_run"] = round(int(row["pages"]) / runs, 1) if runs else None
+
+    by_run = _rows(
+        db,
+        "SELECT run_id, COUNT(*) AS pages, SUM(event_count) AS events, "
+        "       ROUND(MAX(fetched_at) - MIN(fetched_at), 1) AS span_s "
+        "FROM event_pages WHERE status = 'ok' "
+        "GROUP BY run_id HAVING COUNT(*) > 1 ORDER BY span_s DESC",
+    )
+
+    total_pages = db.scalar("SELECT COUNT(*) FROM event_pages WHERE status = 'ok'") or 0
+    spans = [float(r["span_s"]) for r in by_run if r["span_s"] is not None]
+    paged_runs = len(spans)
+    total_span = sum(spans)
+    measured_pages = sum(int(r["pages"]) - 1 for r in by_run)
+
+    return {
+        "by_stream": by_stream,
+        "by_run": by_run[:20],
+        "total_pages": total_pages,
+        "runs_with_pagination": paged_runs,
+        "mean_seconds_per_run": round(total_span / paged_runs, 1) if paged_runs else None,
+        "mean_seconds_per_page": (
+            round(total_span / measured_pages, 2) if measured_pages > 0 else None
+        ),
+        "mean_pages_per_run": (round(total_pages / paged_runs, 1) if paged_runs else None),
+        "page_limit_used": EVENTS_PAGE_LIMIT,
+        "measurement_caveats": [
+            "Per-run span excludes the first page's round trip (understates by one page).",
+            "Span includes metadata queries and database writes, not API latency alone.",
+            "Collection is strictly serial; these numbers carry no concurrency.",
+        ],
     }
 
 
@@ -332,6 +394,32 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Streams left incomplete: {pages['incomplete_streams']}"
         + ("  ← resume needed" if pages["incomplete_streams"] else ""),
     ]
+
+    cost = report["cost"]
+    lines += [
+        "",
+        "## Cost and throughput",
+        "",
+        f"- Pages fetched per run (mean): {cost['mean_pages_per_run']}",
+        f"- Seconds per run (mean): {cost['mean_seconds_per_run']}",
+        f"- Seconds per page (mean): {cost['mean_seconds_per_page']}",
+        f"- Events requested per page: {cost['page_limit_used']:,}",
+        "",
+        "| Stream | Pages | Pages/run | Events |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    lines += [
+        "| {}{} | {:,} | {} | {:,} |".format(
+            r["data_type"],
+            "@" + r["hostility"] if r["hostility"] else "",
+            int(r["pages"]),
+            r["pages_per_run"],
+            int(r["events"] or 0),
+        )
+        for r in cost["by_stream"]
+    ]
+    lines += ["", "Measurement caveats:"]
+    lines += [f"- {c}" for c in cost["measurement_caveats"]]
 
     dupes = report["duplicates"]
     lines += [
