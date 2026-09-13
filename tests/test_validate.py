@@ -545,3 +545,15 @@ def test_subset_pairs_are_not_called_inseparable(populated):
     assert pair[0]["rate_b"] == 1.0, "every rare cast is accompanied"
     assert pair[0]["rate_a"] < 0.5, "most common casts are alone"
     assert pair[0]["inseparable"] is False
+
+
+def test_epoch_limitation_names_the_calendar_span(populated):
+    """'Unclassified' alone cannot say whether epochs matter yet."""
+    db = populated()
+    report = collect_validation(db)
+    span = report["runs"]["date_span"]
+    assert span["first"] and span["last"]
+    assert span["days"] is not None and span["days"] >= 0
+    epoch_lim = [lim for lim in report["limitations"] if "hotfix epoch" in lim]
+    if epoch_lim:
+        assert "spans" in epoch_lim[0], "the limitation does not say how much time is pooled"

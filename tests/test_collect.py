@@ -530,3 +530,21 @@ def test_focus_requests_carry_the_actor_filter(pipeline):
         assert "[source=42]" in r.label
         # The stream key stays clean so coverage groups by stream, not by actor.
         assert "source" not in r.stream_key
+
+
+def test_pulls_carry_cross_log_identity(pipeline):
+    """Pack identity and dungeon must land on the pull row, not need a join."""
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    rows = db.query(
+        "SELECT species_signature, composition_signature, dungeon_key, npc_species_count "
+        "  FROM pulls WHERE composition_signature IS NOT NULL"
+    )
+    assert rows, "no pulls with a composition"
+    for r in rows:
+        assert r["species_signature"], "species signature missing"
+        # Species count and signature must agree: both derive from one set.
+        assert len(r["species_signature"].split("|")) == r["npc_species_count"]
+        # Species signature is a strict simplification of the exact one.
+        assert len(r["species_signature"]) <= len(r["composition_signature"])

@@ -103,6 +103,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
             "by_collection_status": runs,
             "by_key_bracket": by_bracket,
             "by_hotfix_epoch": by_epoch,
+            "date_span": _date_span(db, where, params),
             "analysable": db.scalar(
                 f"SELECT COUNT(*) FROM dungeon_runs {where or 'WHERE 1=1'} "
                 "AND collection_status = 'complete' AND IFNULL(is_canonical, 1) = 1",
@@ -338,6 +339,32 @@ def _api_cost(db: Database) -> dict[str, Any]:
         "runs_covered": runs,
         "points_per_run": round(points / runs, 2) if runs else None,
     }
+
+
+def _date_span(db: Database, where: str, params: tuple[Any, ...]) -> dict[str, Any]:
+    """How much calendar time this corpus covers.
+
+    "66 runs unclassified" says nothing about whether epochs matter yet. Sixty-six
+    runs from one week almost certainly share a mechanic version; the same sixty-six
+    spread over four months almost certainly do not. The span is the difference, and
+    it costs one query.
+    """
+    row = db.execute(
+        f"SELECT MIN(abs_start_ms) AS first, MAX(abs_start_ms) AS last FROM dungeon_runs {where}",
+        params,
+    ).fetchone()
+    if row is None or row["first"] is None:
+        return {"first": None, "last": None, "days": None}
+    days = (int(row["last"]) - int(row["first"])) / 86_400_000
+    return {
+        "first": _iso(int(row["first"])),
+        "last": _iso(int(row["last"])),
+        "days": round(days, 1),
+    }
+
+
+def _iso(ms: int) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))
 
 
 def dedupe_coverage(db: Database) -> dict[str, Any]:
@@ -598,6 +625,7 @@ def known_limitations(db: Database) -> list[str]:
             "NULL and must be resolved against the pull's instance range, never defaulted."
         )
 
+    span = _date_span(db, "", ())
     unclassified = (
         db.scalar("SELECT COUNT(*) FROM dungeon_runs WHERE hotfix_epoch = 'unclassified'") or 0
     )
@@ -607,6 +635,14 @@ def known_limitations(db: Database) -> list[str]:
             "declared in config/hotfix_epochs.yml. Absolute run dates are retained, so epochs "
             "can be applied retroactively, but results must not be pooled across a mechanic "
             "change until they are."
+            + (
+                f" This corpus spans {span['days']} days ({span['first']} to {span['last']}), "
+                "which is how much calendar time is being pooled."
+                # 0.0 days is falsy and is the most reassuring answer there is:
+                # a corpus collected inside one day cannot straddle a hotfix.
+                if span.get("days") is not None
+                else ""
+            )
         )
 
     incomplete = (

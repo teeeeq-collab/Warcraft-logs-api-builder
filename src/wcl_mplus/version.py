@@ -15,13 +15,13 @@ SOFTWARE_VERSION = "0.3.0"
 
 #: Normalizer version. Bump whenever raw -> normalized mapping changes, so a
 #: rebuild from raw cache is distinguishable from the original ingest.
-NORMALIZER_VERSION = 1
+NORMALIZER_VERSION = 2
 
 #: GraphQL query-set version. Bump when files in queries/ change meaningfully.
 QUERY_VERSION = 5
 
 #: Database schema version; matches the highest applied migration.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @lru_cache(maxsize=1)

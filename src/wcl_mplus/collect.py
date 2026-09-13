@@ -416,6 +416,7 @@ class Collector:
             run_id=run_id,
             report_start_ms=report_start_ms,
             run_rel_start_ms=int(run_row["rel_start_ms"]),
+            dungeon_key=run_row.get("dungeon_key"),
         )
         outcome.pulls = len(pull_rows)
 
@@ -677,6 +678,7 @@ class Collector:
     def _collect_pulls(
         self,
         *,
+        dungeon_key: str | None = None,
         report_code: str,
         fight_id: int,
         run_id: str,
@@ -710,6 +712,7 @@ class Collector:
             run_id=run_id,
             report_start_ms=report_start_ms,
             run_rel_start_ms=run_rel_start_ms,
+            dungeon_key=dungeon_key,
         )
         with self.db.transaction():
             # Replace wholesale: a re-ingest must not leave stale pulls behind.

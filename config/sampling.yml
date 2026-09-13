@@ -157,6 +157,14 @@ event_profiles:
       # damage, and focus-only data cannot tell those apart.
       - Healing@Friendlies
       - Healing@Enemies
+      # DamageDone party-wide, not focus-only. Storage was one of two reasons to
+      # narrow it and is no longer a constraint; the remaining cost is time,
+      # since it roughly doubles points per run. Collecting one player of five
+      # would mean every question about any other player in a stored run needs
+      # that run fetched again -- and the point of the corpus is that it can be
+      # asked questions nobody has thought of yet.
+      - DamageDone@Friendlies
+      - DamageDone@Enemies
     focus_event_types:
       # Every one explicitly @Friendlies. An unfiltered request returns the
       # friendly side anyway -- measured for DamageDone, Healing, Threat, and
@@ -164,10 +172,6 @@ event_profiles:
       # assumption in the API's behaviour instead of stating it here.
       - Casts@Friendlies
       - Buffs@Friendlies
-      # DamageDone stays focus-only: 89,703 events/run party-wide is 1.65x this
-      # project's entire current corpus, per run. One player of five is what
-      # makes a reference corpus of thousands affordable at all.
-      - DamageDone@Friendlies
       - Resources@Friendlies
     include_combatant_info: true
 

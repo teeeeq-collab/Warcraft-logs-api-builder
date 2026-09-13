@@ -424,3 +424,43 @@ def test_no_player_name_appears_in_any_command_output(live, report_list, setting
     for name in ("Tankadin", "Brewhealz", "SomeUploader"):
         assert name not in blob
     assert TOKEN not in blob
+
+
+def test_database_flag_resolves_a_bare_name_inside_the_configured_directory(tmp_path, monkeypatch):
+    """A partition name must never write to whatever directory the user stood in."""
+    from pathlib import Path
+
+    from wcl_mplus.cli import _database
+
+    class FakeSettings:
+        db_dir = tmp_path / "db"
+
+        def ensure_dirs(self):
+            self.db_dir.mkdir(parents=True, exist_ok=True)
+
+    settings = FakeSettings()
+    for given, expected in [
+        (Path("murder-row"), tmp_path / "db" / "murder-row.sqlite"),
+        (Path("murder-row.sqlite"), tmp_path / "db" / "murder-row.sqlite"),
+        (None, tmp_path / "db" / "wclmplus.sqlite"),
+    ]:
+        db = _database(settings, path=given)
+        assert db.path == expected, f"{given} -> {db.path}"
+        db.close()
+
+
+def test_database_flag_honours_an_explicit_path(tmp_path):
+    """An explicit directory is used as given, so an external drive works."""
+    from wcl_mplus.cli import _database
+
+    class FakeSettings:
+        db_dir = tmp_path / "db"
+
+        def ensure_dirs(self):
+            self.db_dir.mkdir(parents=True, exist_ok=True)
+
+    elsewhere = tmp_path / "archive" / "season2.sqlite"
+    elsewhere.parent.mkdir(parents=True)
+    db = _database(FakeSettings(), path=elsewhere)
+    assert db.path == elsewhere
+    db.close()

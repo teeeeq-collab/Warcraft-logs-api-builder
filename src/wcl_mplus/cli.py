@@ -101,10 +101,28 @@ def _client(settings: Settings) -> GraphQLClient:
     return GraphQLClient(settings)
 
 
-def _database(settings: Settings) -> Database:
+def _database(settings: Settings, *, path: Path | None = None) -> Database:
+    """Open a collection database, optionally a named partition.
+
+    Partitioning exists for retrieval, not for space. A corpus of thousands of
+    runs is hundreds of millions of events, and while an indexed lookup stays
+    fast at any size, an aggregate over the whole table does not. One file per
+    season or dungeon keeps each aggregate tractable -- and, unlike thinning a
+    stream, costs nothing: every partition is complete in itself.
+
+    A bare name is resolved inside the configured database directory, so
+    `--database murder-row` and `--database murder-row.sqlite` mean the same
+    file and neither can accidentally write to the working directory.
+    """
     settings.ensure_dirs()
+    if path is None:
+        target = settings.db_dir / "wclmplus.sqlite"
+    elif path.parent == Path("."):
+        target = settings.db_dir / (path.name if path.suffix else f"{path.name}.sqlite")
+    else:
+        target = path
     try:
-        return Database(settings.db_dir / "wclmplus.sqlite")
+        return Database(target)
     except DatabaseError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from None
@@ -646,6 +664,12 @@ def collect(
         False, "--dry-run", help="Show what would be collected and make no API calls."
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    database: Path | None = typer.Option(
+        None,
+        "--database",
+        help="Database file to use. A bare name resolves inside the configured "
+        "database directory. Partition by season or dungeon to keep aggregates fast.",
+    ),
 ) -> None:
     """Collect reports into the local database.
 
@@ -683,7 +707,7 @@ def collect(
             typer.echo(f"  ... and {len(candidates) - 10} more")
         return
 
-    db = _database(settings)
+    db = _database(settings, path=database)
     with _client(settings) as client:
         collector = Collector(client, db, config)
         if refresh:
@@ -823,7 +847,15 @@ def benchmark(
 
 
 @app.command()
-def dedupe(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+def dedupe(
+    database: Path | None = typer.Option(
+        None,
+        "--database",
+        help="Database file to use. A bare name resolves inside the configured "
+        "database directory. Partition by season or dungeon to keep aggregates fast.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
     """Group probable duplicate uploads of the same real run.
 
     Nothing is deleted. One member of each group is marked canonical; the rest
@@ -831,7 +863,7 @@ def dedupe(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
     the data in a way that cannot be undone.
     """
     _setup_logging(verbose)
-    db = _database(_load_settings())
+    db = _database(_load_settings(), path=database)
     groups = group_duplicates(db)
     if not groups:
         typer.secho("No probable duplicate runs found.", fg=typer.colors.GREEN)
@@ -844,12 +876,104 @@ def dedupe(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
 
 
 @app.command()
+def packs(
+    dungeon: str | None = typer.Option(None, "--dungeon", help='e.g. "Murder Row".'),
+    npc: int | None = typer.Option(
+        None, "--npc", help="NPC game ID. Lists every pull anywhere that contained it."
+    ),
+    exact: bool = typer.Option(
+        False, "--exact", help="Group by exact composition (counts) instead of species."
+    ),
+    limit: int = typer.Option(25, "--limit"),
+    database: Path | None = typer.Option(None, "--database", help="Database file to read."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Find packs and NPCs across every collected log.
+
+    A retrieval index, not an analysis. It answers "where is this pack, and how
+    often did it occur" so the analyst can go to those pulls; it says nothing
+    about what any of it means.
+
+    Species grouping is the default: the same trash group pulled with three of
+    something or five is one pack, not two. `--exact` groups by counts instead,
+    which is how oversized pulls separate from ordinary ones.
+    """
+    _setup_logging(verbose)
+    db = _database(_load_settings(), path=database)
+
+    if npc is not None:
+        rows = db.query(
+            "SELECT p.dungeon_key, p.pull_id, p.name, p.is_boss, p.duration_ms, "
+            "       n.instance_count, n.instance_count_confidence "
+            "  FROM pull_npcs n JOIN pulls p ON p.pull_id = n.pull_id "
+            " WHERE n.npc_game_id = ? ORDER BY p.dungeon_key, p.pull_id LIMIT ?",
+            (npc, limit),
+        )
+        if not rows:
+            typer.secho(f"NPC {npc} appears in no collected pull.", fg=typer.colors.YELLOW)
+        else:
+            typer.echo(f"NPC {npc} appears in {len(rows)} pull(s) (showing up to {limit}):\n")
+            for r in rows:
+                count = r["instance_count"]
+                conf = r["instance_count_confidence"]
+                shown = "?" if count is None else str(count)
+                typer.echo(
+                    f"  {r['dungeon_key'] or '?':20} {r['pull_id']:26} "
+                    f"x{shown} ({conf})  {r['duration_ms'] / 1000:6.1f}s"
+                    + ("  [boss]" if r["is_boss"] else "")
+                )
+        db.close()
+        return
+
+    column = "composition_signature" if exact else "species_signature"
+    where = "WHERE dungeon_key = ?" if dungeon else ""
+    params: tuple[Any, ...] = (dungeon,) if dungeon else ()
+    rows = db.query(
+        f"SELECT dungeon_key, {column} AS sig, COUNT(*) AS occurrences, "
+        "       COUNT(DISTINCT run_id) AS runs, "
+        "       ROUND(AVG(duration_ms) / 1000.0, 1) AS mean_s, "
+        "       MAX(is_boss) AS boss, MIN(name) AS a_name "
+        f"  FROM pulls {where} "
+        f" {'AND' if where else 'WHERE'} {column} IS NOT NULL AND {column} != '' "
+        f" GROUP BY dungeon_key, {column} "
+        " ORDER BY occurrences DESC LIMIT ?",
+        (*params, limit),
+    )
+    if not rows:
+        typer.secho(
+            "No packs found. Runs collected before schema 3 carry no species "
+            "signature; re-collect to populate it.",
+            fg=typer.colors.YELLOW,
+        )
+        db.close()
+        return
+
+    typer.echo(f"{'dungeon':20} {'occ':>5} {'runs':>5} {'mean':>7}  pack")
+    for r in rows:
+        species = len((r["sig"] or "").split("|"))
+        typer.echo(
+            f"{(r['dungeon_key'] or '?'):20} {r['occurrences']:5} {r['runs']:5} "
+            f"{r['mean_s']:6.1f}s  {species} species"
+            + ("  [boss]" if r["boss"] else "")
+            + f"  {r['a_name'] or ''}"
+        )
+    typer.echo("\n  ids: use --npc <gameID> to list every pull containing one NPC.")
+    db.close()
+
+
+@app.command()
 def validate(
     dungeon: str | None = typer.Option(
         None, "--dungeon", help="Restrict the report to one dungeon."
     ),
     json_output: bool = typer.Option(False, "--json"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    database: Path | None = typer.Option(
+        None,
+        "--database",
+        help="Database file to use. A bare name resolves inside the configured "
+        "database directory. Partition by season or dungeon to keep aggregates fast.",
+    ),
 ) -> None:
     """Write the validation report for the collected corpus.
 
@@ -859,7 +983,7 @@ def validate(
     """
     _setup_logging(verbose)
     settings = _load_settings()
-    db = _database(settings)
+    db = _database(settings, path=database)
 
     dungeon_key = _load_config().dungeons.resolve(dungeon).key if dungeon else None
     report = collect_validation(db, dungeon_key=dungeon_key)
@@ -912,11 +1036,19 @@ def validate(
 
 
 @app.command()
-def stats(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+def stats(
+    database: Path | None = typer.Option(
+        None,
+        "--database",
+        help="Database file to use. A bare name resolves inside the configured "
+        "database directory. Partition by season or dungeon to keep aggregates fast.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
     """Show what is in the local database."""
     _setup_logging(verbose)
     settings = _load_settings()
-    db = _database(settings)
+    db = _database(settings, path=database)
 
     counts = db.table_counts()
     typer.echo(f"Database: {db.path}  ({db.size_bytes() / 1_048_576:.1f} MiB)")

@@ -363,6 +363,23 @@ def pull_id_for(run_id: str, wcl_pull_id: int) -> str:
     return f"{run_id}:{wcl_pull_id}"
 
 
+def species_signature(npcs: list[dict[str, Any]]) -> str:
+    """The set of NPC types in a pull, counts deliberately discarded.
+
+    This is what makes one pack recognisable as itself across logs. The exact
+    `composition_signature` splits a single trash group into as many identities
+    as there are ways a tank can grab it -- three of something or five -- which
+    is precisely the variation the corpus exists to measure, not a difference in
+    which pack it is.
+
+    Both signatures are stored. This one answers "which pack is this"; the exact
+    one answers "how was it pulled", and the gap between them is the oversized
+    pull.
+    """
+    ids = sorted({gid for npc in npcs if (gid := _as_int(npc.get("gameID"))) is not None})
+    return "|".join(str(i) for i in ids)
+
+
 def composition_signature(npcs: list[dict[str, Any]]) -> tuple[str, int, int]:
     """Canonical composition string plus species and total counts.
 
@@ -409,6 +426,7 @@ def normalize_pulls(
     run_id: str,
     report_start_ms: int,
     run_rel_start_ms: int,
+    dungeon_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """`pulls` and `pull_npcs` rows for one run.
 
@@ -431,6 +449,7 @@ def normalize_pulls(
         rel_end = _as_int(pull.get("endTime")) or 0
         npcs = [n for n in (pull.get("enemyNPCs") or []) if isinstance(n, dict)]
         signature, species, total = composition_signature(npcs)
+        species_sig = species_signature(npcs)
         encounter_id = _as_int(pull.get("encounterID"))
 
         pull_rows.append(
@@ -458,6 +477,8 @@ def normalize_pulls(
                 ),
                 "bounding_box": json_or_none(pull.get("boundingBox")),
                 "composition_signature": signature or None,
+                "species_signature": species_sig or None,
+                "dungeon_key": dungeon_key,
                 "npc_species_count": species,
                 "npc_total_count": total,
                 "prev_pull_id": None,
