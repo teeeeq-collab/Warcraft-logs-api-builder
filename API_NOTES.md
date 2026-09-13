@@ -530,8 +530,24 @@ Measured by `wclmplus benchmark`, one Mythic+ fight per report. Medians.
 | `CombatantInfo` | 5 | 10/10 | 7.34 | 2.0 | 0.3 |
 | `Resources@Enemies` | **0** | 10/10 | — | 2.0 | 0.3 |
 
-`DamageDone` and `Healing` hit the 12-page cap on most fights: those figures are
-**lower bounds**, not totals.
+### Deep probe: real totals for the two capped streams
+
+Re-probed at 60 pages. Medians per fight, over 10 fights:
+
+| Stream | Events/fight | MB/run stored | Points | Seconds | Exhausted |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| `DamageDone` | **89,703** | 39.2 | ~37 | 17.6 | 8/10 |
+| `Healing` | **29,083** | 12.7 | ~5 | 2.0 | 10/10 |
+
+Storage uses the corpus's own measured rate of 437 bytes/event. Two DamageDone
+probes were still capped at 120,242 events, so even this median may understate.
+
+For scale, the whole `mechanics` profile is 54,331 events and 23.7 MB per run.
+**`DamageDone` alone is 1.65x the entire current corpus, per run.** `Healing` is
+cheaper than the `Buffs@Friendlies` already being collected (38,628/run).
+
+Point costs above include roughly 2 points of instrumentation: the probe reads
+the rate-limit budget at both ends of each measurement, and each read costs.
 
 ### hostilityType defaults to Friendlies. It never means "both".
 
