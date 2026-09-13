@@ -157,3 +157,29 @@ def test_capped_probes_returning_equal_counts_are_not_called_ignored():
     )
     assert capped.filter_ignored is False
     assert "inconclusive" in capped.verdict
+
+
+def test_benchmark_never_measures_the_cache(bench):
+    """A cached page costs nothing, so a cached probe understates the API.
+
+    Re-probing a stream measured earlier reported ~98 bytes and 1 point for
+    22,843 events, because the pages came from the raw cache. Cost figures must
+    come from the wire or be marked as not a measurement.
+    """
+    probe, _ = bench(event_page_limit=25)
+    kwargs = dict(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=10_000_000,
+        data_type="Casts",
+    )
+    first = probe.measure(**kwargs)
+    second = probe.measure(**kwargs)
+
+    assert first.cache_hits == 0
+    assert second.cache_hits == 0, "the second probe was served from the cache"
+    assert second.bytes_received > 0
+    # Same stream, same fight: the wire cost must reproduce, not collapse.
+    assert second.bytes_received == first.bytes_received
+    assert second.summary()["cost_is_measured"] is True

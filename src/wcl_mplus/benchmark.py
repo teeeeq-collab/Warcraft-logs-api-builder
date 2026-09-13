@@ -54,6 +54,9 @@ class StreamMeasurement:
     points_spent: float | None = None
     exhausted: bool = False
     error: str | None = None
+    #: Pages served from the raw cache. Must be zero: any other value means the
+    #: cost figures on this row describe the cache rather than the API.
+    cache_hits: int = 0
     #: Field names actually observed, and how many events carried each. This is
     #: what answers "does this stream carry what we need?" without guessing.
     fields_seen: dict[str, int] = field(default_factory=dict)
@@ -76,6 +79,8 @@ class StreamMeasurement:
             "seconds": round(self.seconds, 2),
             "points_spent": self.points_spent,
             "exhausted": self.exhausted,
+            "cache_hits": self.cache_hits,
+            "cost_is_measured": self.cache_hits == 0,
             "bytes_per_event": (
                 round(self.bytes_received / self.events, 1) if self.events else None
             ),
@@ -171,6 +176,7 @@ class StreamBenchmark:
             fight_id=fight_id,
         )
         before_bytes = self.client.stats.bytes_received
+        before_cache_hits = self.client.stats.cache_hits
         points_before = self._points()
         started = time.monotonic()
         cursor: float = float(rel_start_ms)
@@ -192,6 +198,13 @@ class StreamBenchmark:
                     },
                     kind=f"benchmark_{data_type}_{hostility or 'any'}_{int(cursor)}",
                     report_code=report_code,
+                    # A cached page costs no bytes, no points and no time, so a
+                    # re-probe of a stream measured earlier reported ~98 bytes
+                    # and 1 point for tens of thousands of events. That is a
+                    # measurement of the cache, presented as the cost of the
+                    # API, understating it -- the one direction this tool must
+                    # never fail in. Benchmarks always go to the wire.
+                    use_cache=False,
                 )
                 block = (((data.get("reportData") or {}).get("report")) or {}).get("events") or {}
                 events = block.get("data") or []
@@ -211,6 +224,7 @@ class StreamBenchmark:
 
         result.seconds = time.monotonic() - started
         result.bytes_received = self.client.stats.bytes_received - before_bytes
+        result.cache_hits = self.client.stats.cache_hits - before_cache_hits
         points_after = self._points()
         if points_before is not None and points_after is not None:
             delta = points_after - points_before
@@ -297,6 +311,11 @@ def render_report(
             f"| {m.seconds:.1f} | {'—' if m.points_spent is None else m.points_spent:} "
             f"| {'yes' if m.exhausted else '**no — lower bound**'} |"
         )
+        if m.cache_hits:
+            lines.append(
+                f"| ↳ **{m.cache_hits} cached page(s)** — cost above is the cache, "
+                f"not the API | | | | | | |"
+            )
         if m.error:
             lines.append(f"| ↳ error | colspan | | | | | {m.error} |")
 
