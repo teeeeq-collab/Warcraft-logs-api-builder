@@ -14,6 +14,7 @@ readable summary (brief section 48). Two rules shape what goes in:
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -135,6 +136,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         },
         "cost": cost_profile(db),
         "dedupe": dedupe_coverage(db),
+        "paired_abilities": paired_abilities(db),
         "duplicates": {
             "groups": len(duplicate_groups),
             "runs_in_groups": sum(int(g["members"]) for g in duplicate_groups),
@@ -144,6 +146,89 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "npc_instance_evidence": npc_instance_evidence(db),
         "limitations": known_limitations(db),
     }
+
+
+def paired_abilities(
+    db: Database,
+    *,
+    window_ms: int = 50,
+    min_pairs: int = 10,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Find ability pairs that fire from one NPC copy at the same instant.
+
+    Two distinct ability IDs landing within milliseconds of each other, from the
+    same copy, over and over, are very unlikely to be two independent mechanics.
+    They are usually one game action that Warcraft Logs surfaces twice -- a cast
+    and its linked effect, or an ability and the damage component that shares its
+    animation.
+
+    This matters because it is the "cast start plus completion counted twice"
+    hazard in a different costume, and it is invisible in aggregate: every
+    per-ability count looks plausible on its own, while any statistic that sums
+    across abilities silently doubles. The detector reports the coincidence rate
+    and stops there. Whether a pair is one action or two genuinely simultaneous
+    ones is a question about the game, not about the data, and merging them here
+    would destroy the evidence needed to answer it.
+    """
+    rows = _rows(
+        db,
+        "WITH casts AS ("
+        "  SELECT run_id, source_id, source_instance, ability_game_id, rel_ms"
+        "    FROM events"
+        "   WHERE type = 'cast' AND hostility = 'Enemies'"
+        "     AND ability_game_id IS NOT NULL AND source_id IS NOT NULL"
+        ") "
+        "SELECT a.ability_game_id AS ability_a, b.ability_game_id AS ability_b, "
+        "       COUNT(*) AS coincidences "
+        "  FROM casts a "
+        "  JOIN casts b "
+        "    ON a.run_id = b.run_id AND a.source_id = b.source_id "
+        "   AND IFNULL(a.source_instance, -1) = IFNULL(b.source_instance, -1) "
+        "   AND a.ability_game_id < b.ability_game_id "
+        "   AND ABS(a.rel_ms - b.rel_ms) <= ? "
+        " GROUP BY a.ability_game_id, b.ability_game_id "
+        "HAVING COUNT(*) >= ? "
+        " ORDER BY coincidences DESC LIMIT ?",
+        (window_ms, min_pairs, limit),
+    )
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        totals = {
+            side: db.scalar(
+                "SELECT COUNT(*) FROM events WHERE type = 'cast' AND hostility = 'Enemies' "
+                "AND ability_game_id = ?",
+                (row[f"ability_{side}"],),
+            )
+            or 0
+            for side in ("a", "b")
+        }
+        smaller = min(totals["a"], totals["b"])
+        out.append(
+            {
+                "ability_a_id": row["ability_a"],
+                "ability_a_name": _ability_name(db, row["ability_a"]),
+                "ability_a_casts": totals["a"],
+                "ability_b_id": row["ability_b"],
+                "ability_b_name": _ability_name(db, row["ability_b"]),
+                "ability_b_casts": totals["b"],
+                "coincidences": int(row["coincidences"]),
+                # Of the rarer ability's casts, what share are accompanied by
+                # the other. At ~1.0 the two are effectively never seen apart.
+                "coincidence_rate": (
+                    round(int(row["coincidences"]) / smaller, 3) if smaller else None
+                ),
+                "window_ms": window_ms,
+            }
+        )
+    return out
+
+
+def _ability_name(db: Database, game_id: int | None) -> str | None:
+    if game_id is None:
+        return None
+    return db.scalar("SELECT name FROM abilities WHERE game_id = ?", (game_id,))
 
 
 def dedupe_coverage(db: Database) -> dict[str, Any]:
@@ -281,6 +366,9 @@ def npc_instance_evidence(db: Database, limit: int = 5) -> list[dict[str, Any]]:
         for key, entries in grouped.items()
         if len(entries) > 1
     ]
+    for example in evidence:
+        example["median_interval_ms"] = _median_interval_ms(example["per_copy"])
+
     # Order by what each example proves, not by insertion order. A copy that
     # casts twice shows a recast interval; ten copies casting once each show
     # only that the copies are distinct. Both matter, the first matters more,
@@ -292,7 +380,36 @@ def npc_instance_evidence(db: Database, limit: int = 5) -> list[dict[str, Any]]:
         ),
         reverse=True,
     )
-    return evidence[:limit]
+
+    # One example per NPC. Ranking alone let a single melee-heavy species take
+    # four of five slots -- twice over, because two of its ability IDs fire
+    # together -- which demonstrates the same thing four times and hides every
+    # other species in the corpus. Breadth is the point of a sample.
+    seen: set[Any] = set()
+    diverse = []
+    for example in evidence:
+        if example["npc"] in seen:
+            continue
+        seen.add(example["npc"])
+        diverse.append(example)
+    return diverse[:limit]
+
+
+def _median_interval_ms(per_copy: list[dict[str, Any]]) -> float | None:
+    """Median of each copy's mean gap between its own casts.
+
+    Reported, never filtered on. An interval near one second is almost
+    certainly melee filler rather than a mechanic, but that is the reader's
+    call to make against the game, and a threshold here would quietly decide it.
+    """
+    intervals = [
+        (c["last_cast_ms_into_pull"] - c["first_cast_ms_into_pull"]) / (c["casts"] - 1)
+        for c in per_copy
+        if c["casts"] > 1
+        and c["first_cast_ms_into_pull"] is not None
+        and c["last_cast_ms_into_pull"] is not None
+    ]
+    return round(statistics.median(intervals)) if intervals else None
 
 
 def known_limitations(db: Database) -> list[str]:
@@ -312,6 +429,16 @@ def known_limitations(db: Database) -> list[str]:
             f"{dedupe['runs_not_examined']} run(s) were collected after the last duplicate "
             "detection pass and have not been examined. Re-run `wclmplus dedupe` before "
             "treating the analysable count as a count of distinct real runs."
+        )
+
+    inseparable = [p for p in paired_abilities(db) if (p["coincidence_rate"] or 0) >= 0.95]
+    if inseparable:
+        names = ", ".join(f"{p['ability_a_name']} + {p['ability_b_name']}" for p in inseparable[:3])
+        limitations.append(
+            f"{len(inseparable)} enemy ability pair(s) are effectively never observed apart "
+            f"({names}). Each pair is probably one game action reported under two ability IDs, "
+            "so any statistic that sums casts across abilities will double-count it. Both are "
+            "retained unmerged; per-ability counts are unaffected."
         )
 
     unassigned = db.scalar("SELECT COUNT(*) FROM events WHERE pull_id IS NULL") or 0
@@ -479,6 +606,26 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     lines += ["", "Measurement caveats:"]
     lines += [f"- {c}" for c in cost["measurement_caveats"]]
+
+    pairs = report["paired_abilities"]
+    if pairs:
+        lines += [
+            "",
+            "## Abilities that fire together",
+            "",
+            "Distinct ability IDs cast by the same NPC copy within "
+            f"{pairs[0]['window_ms']} ms. A rate near 1.00 means the two are never seen "
+            "apart, which usually means one game action reported twice. Nothing is merged.",
+            "",
+            "| Ability A | Ability B | Together | Rate |",
+            "| --- | --- | ---: | ---: |",
+        ]
+        lines += [
+            f"| {p['ability_a_name']} ({p['ability_a_casts']:,}) "
+            f"| {p['ability_b_name']} ({p['ability_b_casts']:,}) "
+            f"| {p['coincidences']:,} | {p['coincidence_rate']} |"
+            for p in pairs
+        ]
 
     dupes = report["duplicates"]
     lines += [

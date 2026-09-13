@@ -438,3 +438,33 @@ def test_roster_roles_are_resolved(pipeline):
     collector.collect(candidates())
     roles = {r["role"] for r in db.query("SELECT role FROM run_players")}
     assert "tank" in roles and "healer" in roles
+
+
+def test_reingest_preserves_duplicate_classification(pipeline):
+    """Re-collecting must not silently undo `wclmplus dedupe`.
+
+    normalize_run() writes duplicate_group_id and is_canonical as NULL -- it
+    sees one fight and cannot know a corpus-wide pass ever ran -- and a run row
+    is replaced wholesale on re-ingest. Without the collector carrying the
+    classification across that replace, every re-collect reset the corpus to
+    "never deduplicated" while reporting nothing.
+    """
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    run_id = db.query("SELECT run_id FROM dungeon_runs")[0]["run_id"]
+    db.execute(
+        "UPDATE dungeon_runs SET duplicate_group_id = 'dup-test', is_canonical = 0 "
+        "WHERE run_id = ?",
+        (run_id,),
+    )
+    db.conn.commit()
+
+    collector.collect(candidates())
+
+    row = db.execute(
+        "SELECT duplicate_group_id, is_canonical FROM dungeon_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    assert row["duplicate_group_id"] == "dup-test"
+    assert row["is_canonical"] == 0

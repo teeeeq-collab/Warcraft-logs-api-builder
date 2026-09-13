@@ -336,6 +336,20 @@ class Collector:
             job_id=self.job_id,
         )
 
+        # A run row is replaced wholesale on re-ingest, and the normalizer has
+        # no way to know a duplicate-detection pass ever ran -- it sees one
+        # fight, not a corpus. Carrying the classification across the replace
+        # is this layer's job: without it, every re-collect silently discards
+        # `wclmplus dedupe` and the corpus goes back to counting two uploads of
+        # one real run as two observations.
+        prior = self.db.execute(
+            "SELECT duplicate_group_id, is_canonical FROM dungeon_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if prior is not None:
+            run_row["duplicate_group_id"] = prior["duplicate_group_id"]
+            run_row["is_canonical"] = prior["is_canonical"]
+
         with self.db.transaction():
             self.db.upsert("dungeon_runs", run_row)
             self._store_master_data(master, report_code=report_code)

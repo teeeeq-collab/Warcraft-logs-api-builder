@@ -46,12 +46,35 @@ event_profiles:
       - Casts@Enemies        # the mechanics themselves
       - Casts@Friendlies     # player defensives, interrupt attempts, dispels
       - Debuffs
-      - Buffs
+      # Buffs was 71.7% of a 3.5M-event corpus, unfiltered -- the same shape as
+      # the unfiltered Casts problem above, where players drowned the NPCs.
+      # Split so the two can be measured, and dropped, independently.
+      - Buffs@Enemies        # enrages, empowerments, shields the party must answer
+      - Buffs@Friendlies     # player defensives and procs; the expensive half
       - Interrupts
       - Dispels
       - Deaths
       - Summons
       - DamageTaken          # player-side incoming damage: the danger signal
+    include_combatant_info: true
+
+  mechanics-lean:
+    description: "mechanics minus player buff spam. For corpora in the thousands."
+    # Measured on 66 runs: Buffs@Friendlies is ~70% of all events and ~60% of
+    # all pages. Dropping it takes a run from roughly 23 MB to roughly 7 MB.
+    # What is lost is player proc and defensive *aura* timing; DamageTaken still
+    # carries the auras active at each hit, so "what was up when it landed"
+    # survives. What is kept is every NPC mechanic, unchanged.
+    event_types:
+      - Casts@Enemies
+      - Casts@Friendlies
+      - Debuffs
+      - Buffs@Enemies
+      - Interrupts
+      - Dispels
+      - Deaths
+      - Summons
+      - DamageTaken
     include_combatant_info: true
 
   full:
@@ -60,7 +83,8 @@ event_profiles:
       - Casts@Enemies
       - Casts@Friendlies
       - Debuffs
-      - Buffs
+      - Buffs@Enemies
+      - Buffs@Friendlies
       - Interrupts
       - Dispels
       - Deaths

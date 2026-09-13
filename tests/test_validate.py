@@ -22,6 +22,7 @@ from wcl_mplus.rawcache import RawCache
 from wcl_mplus.reportsource import ManualReportSource
 from wcl_mplus.validate import (
     collect_validation,
+    paired_abilities,
     npc_instance_evidence,
     render_markdown,
     write_reports,
@@ -313,3 +314,92 @@ def test_dedupe_coverage_goes_stale_when_a_run_arrives_after_the_pass(populated)
     report = collect_validation(db)
     assert report["dedupe"]["state"] == "stale"
     assert any("after the last duplicate" in lim for lim in report["limitations"])
+
+
+def test_paired_abilities_are_reported_not_merged(populated):
+    """Two IDs firing from one copy at one instant must be flagged, not summed."""
+    db = populated()
+    row = db.execute(
+        "SELECT page_id, run_id, report_code, source_id, source_instance, ability_game_id, "
+        "       rel_ms, abs_ms, run_rel_ms, pull_id, pull_rel_ms "
+        "  FROM events WHERE type = 'cast' AND hostility = 'Enemies' "
+        "   AND source_instance IS NOT NULL LIMIT 1"
+    ).fetchone()
+    assert row is not None
+
+    twin_ability = int(row["ability_game_id"]) + 900_000
+    db.upsert(
+        "abilities",
+        {"game_id": twin_ability, "name": "Twinned Strike", "first_seen": 0.0, "last_seen": 0.0},
+    )
+    start = db.scalar("SELECT MAX(seq_in_page) FROM events WHERE page_id = ?", (row["page_id"],))
+    for offset in range(1, 13):
+        db.execute(
+            "INSERT INTO events (page_id, seq_in_page, run_id, report_code, pull_id, "
+            " data_type, hostility, rel_ms, abs_ms, run_rel_ms, pull_rel_ms, type, "
+            " source_id, source_instance, ability_game_id, normalizer_version) "
+            "VALUES (?, ?, ?, ?, ?, 'Casts', 'Enemies', ?, ?, ?, ?, 'cast', ?, ?, ?, 1)",
+            (
+                row["page_id"],
+                int(start) + offset,
+                row["run_id"],
+                row["report_code"],
+                row["pull_id"],
+                int(row["rel_ms"]) + offset * 1000,
+                int(row["abs_ms"]) + offset * 1000,
+                int(row["run_rel_ms"]) + offset * 1000,
+                None if row["pull_rel_ms"] is None else int(row["pull_rel_ms"]) + offset * 1000,
+                row["source_id"],
+                row["source_instance"],
+                twin_ability,
+            ),
+        )
+        # The partner, five milliseconds later: one action, two ability IDs.
+        db.execute(
+            "INSERT INTO events (page_id, seq_in_page, run_id, report_code, pull_id, "
+            " data_type, hostility, rel_ms, abs_ms, run_rel_ms, pull_rel_ms, type, "
+            " source_id, source_instance, ability_game_id, normalizer_version) "
+            "VALUES (?, ?, ?, ?, ?, 'Casts', 'Enemies', ?, ?, ?, ?, 'cast', ?, ?, ?, 1)",
+            (
+                row["page_id"],
+                int(start) + 100 + offset,
+                row["run_id"],
+                row["report_code"],
+                row["pull_id"],
+                int(row["rel_ms"]) + offset * 1000 + 5,
+                int(row["abs_ms"]) + offset * 1000 + 5,
+                int(row["run_rel_ms"]) + offset * 1000 + 5,
+                None if row["pull_rel_ms"] is None else int(row["pull_rel_ms"]) + offset * 1000,
+                row["source_id"],
+                row["source_instance"],
+                twin_ability + 1,
+            ),
+        )
+    db.upsert(
+        "abilities",
+        {"game_id": twin_ability + 1, "name": "Twinned Echo", "first_seen": 0.0, "last_seen": 0.0},
+    )
+    db.conn.commit()
+
+    pairs = paired_abilities(db)
+    found = [p for p in pairs if p["ability_a_id"] == twin_ability]
+    assert found, f"paired abilities not detected: {pairs}"
+    assert found[0]["coincidence_rate"] == 1.0
+    assert found[0]["coincidences"] == 12
+
+    report = collect_validation(db)
+    assert any("never observed apart" in lim for lim in report["limitations"])
+    # Reported, never merged: both keep their own cast counts.
+    assert found[0]["ability_a_casts"] == 12
+    assert found[0]["ability_b_casts"] == 12
+
+
+def test_evidence_shows_each_npc_once(populated):
+    db = populated()
+    names = [ev["npc"] for ev in npc_instance_evidence(db)]
+    assert len(names) == len(set(names)), f"one NPC took several slots: {names}"
+
+
+def test_evidence_reports_the_median_interval(populated):
+    for example in npc_instance_evidence(populated()):
+        assert "median_interval_ms" in example
