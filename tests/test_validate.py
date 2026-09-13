@@ -20,7 +20,12 @@ from wcl_mplus.db import Database
 from wcl_mplus.ratelimit import RateLimiter
 from wcl_mplus.rawcache import RawCache
 from wcl_mplus.reportsource import ManualReportSource
-from wcl_mplus.validate import collect_validation, render_markdown, write_reports
+from wcl_mplus.validate import (
+    collect_validation,
+    npc_instance_evidence,
+    render_markdown,
+    write_reports,
+)
 
 
 class FakeTokens:
@@ -211,3 +216,58 @@ def test_markdown_reports_cost(populated):
     text = render_markdown(collect_validation(populated()))
     assert "## Cost and throughput" in text
     assert "Seconds per page (mean)" in text
+
+
+def test_evidence_never_shows_events_outside_a_pull(populated):
+    """Regression: unassigned events must not crowd out the real demonstration.
+
+    `pull_id` sorts NULL-first in SQLite, so ordering the evidence query by it
+    handed the report the ~2% of events that fall outside every pull -- the one
+    slice that has no pull-relative clock. The demonstration the corpus rests on
+    was showing null timings for that reason alone, not because instance
+    identity had failed.
+    """
+    db = populated()
+    row = db.execute(
+        "SELECT page_id, run_id, report_code, source_id, ability_game_id "
+        "  FROM events WHERE type = 'cast' AND hostility = 'Enemies' LIMIT 1"
+    ).fetchone()
+    assert row is not None, "fixture has no enemy casts to build on"
+
+    start = db.scalar("SELECT MAX(seq_in_page) FROM events WHERE page_id = ?", (row["page_id"],))
+    # Two copies of one NPC casting outside every pull: unassigned, untimed,
+    # and -- before the fix -- first in the ordering.
+    for offset, instance in enumerate((41, 42), start=1):
+        db.execute(
+            "INSERT INTO events (page_id, seq_in_page, run_id, report_code, pull_id, "
+            " data_type, hostility, rel_ms, abs_ms, run_rel_ms, pull_rel_ms, type, "
+            " source_id, source_instance, ability_game_id, normalizer_version) "
+            "VALUES (?, ?, ?, ?, NULL, 'Casts', 'Enemies', 1, 1, 1, NULL, 'cast', ?, ?, ?, 1)",
+            (
+                row["page_id"],
+                int(start) + offset,
+                row["run_id"],
+                row["report_code"],
+                row["source_id"],
+                instance,
+                row["ability_game_id"],
+            ),
+        )
+    db.conn.commit()
+
+    evidence = npc_instance_evidence(db)
+    assert evidence, "evidence disappeared entirely"
+    for example in evidence:
+        assert example["pull_id"] is not None
+        for copy in example["per_copy"]:
+            assert copy["first_cast_ms_into_pull"] is not None
+            assert copy["last_cast_ms_into_pull"] is not None
+
+
+def test_evidence_prefers_examples_that_show_a_recast(populated):
+    """A copy casting twice proves more than ten copies casting once."""
+    db = populated()
+    evidence = npc_instance_evidence(db)
+    if len(evidence) > 1:
+        peaks = [max(int(c["casts"]) for c in ev["per_copy"]) for ev in evidence]
+        assert peaks == sorted(peaks, reverse=True)

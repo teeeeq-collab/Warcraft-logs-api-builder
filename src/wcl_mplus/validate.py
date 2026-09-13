@@ -42,7 +42,8 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
     by_bracket = _rows(
         db,
         f"SELECT key_bracket, COUNT(*) AS runs, "
-        "       ROUND(AVG(duration_ms) / 1000.0) AS mean_duration_s "
+        "       ROUND(AVG(duration_ms) / 1000.0) AS mean_duration_s, "
+        "       MIN(keystone_level) AS min_key, MAX(keystone_level) AS max_key "
         f"  FROM dungeon_runs {where} GROUP BY key_bracket ORDER BY key_bracket",
         params,
     )
@@ -221,6 +222,10 @@ def npc_instance_evidence(db: Database, limit: int = 5) -> list[dict[str, Any]]:
         "  LEFT JOIN abilities ab ON ab.game_id = e.ability_game_id "
         " WHERE e.type = 'cast' AND e.hostility = 'Enemies' "
         "   AND e.source_instance IS NOT NULL "
+        # An event outside every pull has no pull-relative clock, so it can
+        # demonstrate separation but never recast timing. Excluded here and
+        # counted in known_limitations() instead of being shown with null times.
+        "   AND e.pull_id IS NOT NULL AND e.pull_rel_ms IS NOT NULL "
         " GROUP BY e.pull_id, e.source_id, e.source_instance, e.ability_game_id "
         " ORDER BY e.pull_id, e.source_id, e.source_instance",
     )
@@ -249,6 +254,17 @@ def npc_instance_evidence(db: Database, limit: int = 5) -> list[dict[str, Any]]:
         for key, entries in grouped.items()
         if len(entries) > 1
     ]
+    # Order by what each example proves, not by insertion order. A copy that
+    # casts twice shows a recast interval; ten copies casting once each show
+    # only that the copies are distinct. Both matter, the first matters more,
+    # so surface the richest examples rather than whichever pull sorted first.
+    evidence.sort(
+        key=lambda ev: (
+            max(int(c["casts"]) for c in ev["per_copy"]),
+            ev["distinct_copies"],
+        ),
+        reverse=True,
+    )
     return evidence[:limit]
 
 
@@ -359,11 +375,12 @@ def render_markdown(report: dict[str, Any]) -> str:
     if runs["by_key_bracket"]:
         lines += [
             "",
-            "| Key bracket | Runs | Mean duration (s) |",
-            "| --- | --- | --- |",
+            "| Key bracket | Runs | Key levels | Mean duration (s) |",
+            "| --- | ---: | --- | ---: |",
         ]
         lines += [
-            f"| {r['key_bracket'] or 'outside brackets'} | {r['runs']} | {r['mean_duration_s']} |"
+            f"| {r['key_bracket'] or 'outside brackets'} | {r['runs']} | "
+            f"{r['min_key']}-{r['max_key']} | {r['mean_duration_s']} |"
             for r in runs["by_key_bracket"]
         ]
 
