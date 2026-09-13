@@ -557,3 +557,76 @@ def test_epoch_limitation_names_the_calendar_span(populated):
     epoch_lim = [lim for lim in report["limitations"] if "hotfix epoch" in lim]
     if epoch_lim:
         assert "spans" in epoch_lim[0], "the limitation does not say how much time is pooled"
+
+
+def test_cost_excludes_pauses_between_collection_sessions(populated):
+    """A run collected over two sittings must not report the gap as its cost.
+
+    MAX(fetched_at) - MIN(fetched_at) measured calendar time. Adding one stream
+    to runs fetched the previous evening made every run report about eight
+    hours, all within a hundred seconds of each other -- the gap between two
+    sittings, presented as the cost of a run.
+    """
+    from wcl_mplus.validate import _working_seconds_per_run
+
+    db = populated()
+    run_id = db.query("SELECT run_id FROM dungeon_runs LIMIT 1")[0]["run_id"]
+    before = {r["run_id"]: r["span_s"] for r in _working_seconds_per_run(db)}
+
+    # Simulate resuming eight hours later: push the last page far into the future.
+    last = db.execute(
+        "SELECT page_id, fetched_at FROM event_pages WHERE run_id = ? "
+        "ORDER BY fetched_at DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    db.execute(
+        "UPDATE event_pages SET fetched_at = ? WHERE page_id = ?",
+        (float(last["fetched_at"]) + 8 * 3600, last["page_id"]),
+    )
+    db.conn.commit()
+
+    after = {r["run_id"]: r["span_s"] for r in _working_seconds_per_run(db)}
+    assert after[run_id] == before[run_id], "the eight-hour pause leaked into the cost"
+
+    rows = {r["run_id"]: r for r in _working_seconds_per_run(db)}
+    assert rows[run_id]["gaps"] == 1, "the resumption was not recorded"
+    assert collect_validation(db)["cost"]["runs_collected_across_sessions"] >= 1
+
+
+def test_a_single_sitting_still_measures_its_own_duration(populated):
+    """Excluding pauses must not zero out an ordinary uninterrupted collection."""
+    from wcl_mplus.validate import _working_seconds_per_run
+
+    db = populated()
+    rows = _working_seconds_per_run(db)
+    assert rows, "no runs measured"
+    for r in rows:
+        assert r["span_s"] >= 0
+        assert r["gaps"] == 0, "an unbroken collection reported a session gap"
+
+
+def test_a_lopsided_pair_is_not_called_one_for_one():
+    """Never seen apart does not mean one-for-one.
+
+    Fingers of Gul'dan appeared as 218 casts of one ID against 55 of another,
+    both fully accompanied. Reading that as "one action under two IDs" invites
+    merging them, which would discard four fifths of the events.
+    """
+    from wcl_mplus.validate import _pair_verdict
+
+    lopsided = {"inseparable": True, "cast_ratio": 3.96}
+    assert "3.96:1" in _pair_verdict(lopsided)
+    assert "repeating component" in _pair_verdict(lopsided)
+
+    twinned = {"inseparable": True, "cast_ratio": 1.0}
+    assert "1:1" in _pair_verdict(twinned)
+
+    loose = {"inseparable": False, "cast_ratio": 1.0}
+    assert _pair_verdict(loose) == "partial overlap"
+
+
+def test_pair_rows_carry_the_cast_ratio(populated):
+    for pair in paired_abilities(populated()):
+        assert "cast_ratio" in pair
+        if pair["cast_ratio"] is not None:
+            assert pair["cast_ratio"] >= 1.0, "ratio must be expressed larger-over-smaller"

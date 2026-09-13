@@ -301,16 +301,85 @@ def paired_abilities(
                 "inseparable": bool(
                     rate_a is not None and rate_b is not None and rate_a >= 0.95 and rate_b >= 0.95
                 ),
+                # Never seen apart does not mean one-for-one. A 4:1 ratio is a
+                # pairing, not a duplicate -- probably one action whose ticking
+                # component fires several times per marker -- and merging the two
+                # would be as wrong as double-counting them.
+                "cast_ratio": (
+                    round(max(totals["a"], totals["b"]) / min(totals["a"], totals["b"]), 2)
+                    if min(totals["a"], totals["b"])
+                    else None
+                ),
                 "window_ms": window_ms,
             }
         )
     return out
 
 
+def _pair_verdict(pair: dict[str, Any]) -> str:
+    """What the numbers support saying, and no more."""
+    if not pair["inseparable"]:
+        return "partial overlap"
+    ratio = pair.get("cast_ratio")
+    if ratio is not None and ratio >= 1.5:
+        return f"never apart, but {ratio}:1 -- one action with a repeating component"
+    return "never apart, 1:1 -- probably one action under two IDs"
+
+
 def _ability_name(db: Database, game_id: int | None) -> str | None:
     if game_id is None:
         return None
     return db.scalar("SELECT name FROM abilities WHERE game_id = ?", (game_id,))
+
+
+#: A gap longer than this between consecutive pages is not collection, it is a
+#: pause. Pages land about half a second apart, so a minute is generous enough
+#: to keep any real hesitation and short enough to exclude a resumed session.
+SESSION_GAP_S = 60.0
+
+
+def _working_seconds_per_run(db: Database) -> list[dict[str, Any]]:
+    """Seconds actually spent fetching each run, excluding pauses between sessions.
+
+    This replaces MAX(fetched_at) - MIN(fetched_at), which measured calendar time
+    and was wrong the moment a run was collected incrementally. Adding one stream
+    to runs fetched the previous evening made every run report about eight hours,
+    all within a hundred seconds of each other -- the gap between two sittings,
+    reported as the cost of a run.
+
+    Summing only the gaps small enough to be work gives a figure that means the
+    same thing whether a corpus was collected in one sitting or twenty.
+    """
+    rows = _rows(
+        db,
+        "SELECT run_id, fetched_at, event_count FROM event_pages "
+        " WHERE status = 'ok' ORDER BY run_id, fetched_at",
+    )
+    per_run: dict[str, dict[str, Any]] = {}
+    previous_run: str | None = None
+    previous_at = 0.0
+    for row in rows:
+        run_id = row["run_id"]
+        entry = per_run.setdefault(
+            run_id, {"run_id": run_id, "pages": 0, "events": 0, "span_s": 0.0, "gaps": 0}
+        )
+        entry["pages"] = int(entry["pages"]) + 1
+        entry["events"] = int(entry["events"]) + int(row["event_count"] or 0)
+        if run_id == previous_run:
+            delta = float(row["fetched_at"]) - previous_at
+            if 0 <= delta <= SESSION_GAP_S:
+                entry["span_s"] = float(entry["span_s"]) + delta
+            else:
+                # A resumed session. Counted rather than silently folded in: a
+                # run collected across many sittings has a less certain figure.
+                entry["gaps"] = int(entry["gaps"]) + 1
+        previous_run, previous_at = run_id, float(row["fetched_at"])
+
+    out = [r for r in per_run.values() if int(r["pages"]) > 1]
+    for entry in out:
+        entry["span_s"] = round(float(entry["span_s"]), 1)
+    out.sort(key=lambda r: float(r["span_s"]), reverse=True)
+    return out
 
 
 def _api_cost(db: Database) -> dict[str, Any]:
@@ -420,13 +489,7 @@ def cost_profile(db: Database) -> dict[str, Any]:
         runs = int(row["runs"] or 0)
         row["pages_per_run"] = round(int(row["pages"]) / runs, 1) if runs else None
 
-    by_run = _rows(
-        db,
-        "SELECT run_id, COUNT(*) AS pages, SUM(event_count) AS events, "
-        "       ROUND(MAX(fetched_at) - MIN(fetched_at), 1) AS span_s "
-        "FROM event_pages WHERE status = 'ok' "
-        "GROUP BY run_id HAVING COUNT(*) > 1 ORDER BY span_s DESC",
-    )
+    by_run = _working_seconds_per_run(db)
 
     total_pages = db.scalar("SELECT COUNT(*) FROM event_pages WHERE status = 'ok'") or 0
     spans = [float(r["span_s"]) for r in by_run if r["span_s"] is not None]
@@ -446,8 +509,11 @@ def cost_profile(db: Database) -> dict[str, Any]:
         "mean_pages_per_run": (round(total_pages / paged_runs, 1) if paged_runs else None),
         "page_limit_used": EVENTS_PAGE_LIMIT,
         "api_points": _api_cost(db),
+        "runs_collected_across_sessions": sum(1 for r in by_run if int(r.get("gaps") or 0)),
         "measurement_caveats": [
             "Per-run span excludes the first page's round trip (understates by one page).",
+            f"Gaps over {SESSION_GAP_S:.0f}s between pages are treated as pauses between "
+            "sessions and excluded, so this is time worked, not time elapsed.",
             "Span includes metadata queries and database writes, not API latency alone.",
             "Collection is strictly serial; these numbers carry no concurrency.",
         ],
@@ -816,14 +882,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{pairs[0]['window_ms']} ms. A rate near 1.00 means the two are never seen "
             "apart, which usually means one game action reported twice. Nothing is merged.",
             "",
-            "| Ability A | Ability B | Rate A | Rate B | Verdict |",
-            "| --- | --- | ---: | ---: | --- |",
+            "| Ability A | Ability B | Rate A | Rate B | Ratio | Reading |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
         ]
         lines += [
             f"| {p['ability_a_name']} ({p['ability_a_casts']:,}) "
             f"| {p['ability_b_name']} ({p['ability_b_casts']:,}) "
-            f"| {p['rate_a']} | {p['rate_b']} "
-            f"| {'one action, two IDs' if p['inseparable'] else 'partial overlap'} |"
+            f"| {p['rate_a']} | {p['rate_b']} | {p['cast_ratio']} "
+            f"| {_pair_verdict(p)} |"
             for p in pairs
         ]
 
