@@ -224,16 +224,22 @@ def paired_abilities(
     ones is a question about the game, not about the data, and merging them here
     would destroy the evidence needed to answer it.
     """
+    # COUNT(*) over this join counts *pairs*, and one ability firing twice inside
+    # the window pairs with the other twice. Counting distinct event_ids on each
+    # side instead keeps both rates in [0, 1] and, more usefully, separates "two
+    # names for one action" (both sides near 1.0) from "B always accompanies A
+    # but A often fires alone" (only one side near 1.0).
     rows = _rows(
         db,
         "WITH casts AS ("
-        "  SELECT run_id, source_id, source_instance, ability_game_id, rel_ms"
+        "  SELECT event_id, run_id, source_id, source_instance, ability_game_id, rel_ms"
         "    FROM events"
         "   WHERE type = 'cast' AND hostility = 'Enemies'"
         "     AND ability_game_id IS NOT NULL AND source_id IS NOT NULL"
         ") "
         "SELECT a.ability_game_id AS ability_a, b.ability_game_id AS ability_b, "
-        "       COUNT(*) AS coincidences "
+        "       COUNT(DISTINCT a.event_id) AS matched_a, "
+        "       COUNT(DISTINCT b.event_id) AS matched_b "
         "  FROM casts a "
         "  JOIN casts b "
         "    ON a.run_id = b.run_id AND a.source_id = b.source_id "
@@ -241,8 +247,8 @@ def paired_abilities(
         "   AND a.ability_game_id < b.ability_game_id "
         "   AND ABS(a.rel_ms - b.rel_ms) <= ? "
         " GROUP BY a.ability_game_id, b.ability_game_id "
-        "HAVING COUNT(*) >= ? "
-        " ORDER BY coincidences DESC LIMIT ?",
+        "HAVING COUNT(DISTINCT a.event_id) >= ? "
+        " ORDER BY matched_a DESC LIMIT ?",
         (window_ms, min_pairs, limit),
     )
 
@@ -257,7 +263,8 @@ def paired_abilities(
             or 0
             for side in ("a", "b")
         }
-        smaller = min(totals["a"], totals["b"])
+        rate_a = round(int(row["matched_a"]) / totals["a"], 3) if totals["a"] else None
+        rate_b = round(int(row["matched_b"]) / totals["b"], 3) if totals["b"] else None
         out.append(
             {
                 "ability_a_id": row["ability_a"],
@@ -266,11 +273,15 @@ def paired_abilities(
                 "ability_b_id": row["ability_b"],
                 "ability_b_name": _ability_name(db, row["ability_b"]),
                 "ability_b_casts": totals["b"],
-                "coincidences": int(row["coincidences"]),
-                # Of the rarer ability's casts, what share are accompanied by
-                # the other. At ~1.0 the two are effectively never seen apart.
-                "coincidence_rate": (
-                    round(int(row["coincidences"]) / smaller, 3) if smaller else None
+                "matched_a": int(row["matched_a"]),
+                "matched_b": int(row["matched_b"]),
+                # Share of each side's casts accompanied by the other. Both near
+                # 1.0 means one action under two IDs. One near 1.0 and the other
+                # low means a subset relationship, which is a different fact.
+                "rate_a": rate_a,
+                "rate_b": rate_b,
+                "inseparable": bool(
+                    rate_a is not None and rate_b is not None and rate_a >= 0.95 and rate_b >= 0.95
                 ),
                 "window_ms": window_ms,
             }
@@ -527,7 +538,7 @@ def known_limitations(db: Database) -> list[str]:
             "read as zeros."
         )
 
-    inseparable = [p for p in paired_abilities(db) if (p["coincidence_rate"] or 0) >= 0.95]
+    inseparable = [p for p in paired_abilities(db) if p["inseparable"]]
     if inseparable:
         names = ", ".join(f"{p['ability_a_name']} + {p['ability_b_name']}" for p in inseparable[:3])
         limitations.append(
@@ -737,13 +748,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{pairs[0]['window_ms']} ms. A rate near 1.00 means the two are never seen "
             "apart, which usually means one game action reported twice. Nothing is merged.",
             "",
-            "| Ability A | Ability B | Together | Rate |",
-            "| --- | --- | ---: | ---: |",
+            "| Ability A | Ability B | Rate A | Rate B | Verdict |",
+            "| --- | --- | ---: | ---: | --- |",
         ]
         lines += [
             f"| {p['ability_a_name']} ({p['ability_a_casts']:,}) "
             f"| {p['ability_b_name']} ({p['ability_b_casts']:,}) "
-            f"| {p['coincidences']:,} | {p['coincidence_rate']} |"
+            f"| {p['rate_a']} | {p['rate_b']} "
+            f"| {'one action, two IDs' if p['inseparable'] else 'partial overlap'} |"
             for p in pairs
         ]
 

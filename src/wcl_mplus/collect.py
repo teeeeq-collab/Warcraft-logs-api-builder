@@ -751,7 +751,15 @@ class Collector:
         result = CollectionResult(job_id=self.job_id)
         self.start_job(sample_profile=None, event_profile=event_profile)
         status = "complete"
-        points_before = self.client.stats.points_spent_observed
+        # Read the budget before any work, not after. stats.points_spent_observed
+        # is None until the first request lands, so sampling it here without
+        # asking recorded "unknown" for every first job -- which is exactly the
+        # job whose cost we most need.
+        points_before: float | None = None
+        try:
+            points_before = self.client.fetch_rate_limit().points_spent
+        except (ApiError, RedactedError) as exc:  # pragma: no cover - network only
+            logger.debug("Could not read the point budget at job start: %s", exc)
         requests_before = self.client.stats.requests
         try:
             for candidate in candidates:
@@ -808,7 +816,13 @@ class Collector:
         suspiciously cheap job -- an underestimate here would license a corpus
         size the quota cannot actually support.
         """
-        points_after = self.client.stats.points_spent_observed
+        points_after: float | None = None
+        try:
+            points_after = self.client.fetch_rate_limit().points_spent
+        except (ApiError, RedactedError) as exc:  # pragma: no cover - network only
+            logger.debug("Could not read the point budget at job end: %s", exc)
+        if points_after is None:
+            points_after = self.client.stats.points_spent_observed
         spent: float | None = None
         if points_before is not None and points_after is not None:
             delta = points_after - points_before

@@ -384,8 +384,10 @@ def test_paired_abilities_are_reported_not_merged(populated):
     pairs = paired_abilities(db)
     found = [p for p in pairs if p["ability_a_id"] == twin_ability]
     assert found, f"paired abilities not detected: {pairs}"
-    assert found[0]["coincidence_rate"] == 1.0
-    assert found[0]["coincidences"] == 12
+    assert found[0]["rate_a"] == 1.0
+    assert found[0]["rate_b"] == 1.0
+    assert found[0]["inseparable"] is True
+    assert found[0]["matched_a"] == 12
 
     report = collect_validation(db)
     assert any("never observed apart" in lim for lim in report["limitations"])
@@ -443,3 +445,70 @@ def test_mixed_fidelity_corpus_is_flagged_not_averaged(populated):
     assert thin, "the narrower shape was not identified"
     assert any("different event profiles" in lim for lim in report["limitations"])
     assert "mixed fidelity" in render_markdown(report)
+
+
+def test_pair_rates_cannot_exceed_one(populated):
+    """A rate above 1.0 meant the join was counting pairs, not events.
+
+    One ability firing twice inside the window pairs with its partner twice, so
+    COUNT(*) over the join overcounted and produced rates like 4.9 -- which made
+    the number unreadable exactly where it mattered most.
+    """
+    for pair in paired_abilities(populated()):
+        for key in ("rate_a", "rate_b"):
+            if pair[key] is not None:
+                assert 0.0 <= pair[key] <= 1.0, f"{key}={pair[key]}"
+
+
+def test_subset_pairs_are_not_called_inseparable(populated):
+    """B always accompanying A is a different fact from A and B being one action."""
+    db = populated()
+    row = db.execute(
+        "SELECT page_id, run_id, report_code, pull_id, source_id, source_instance, "
+        "       rel_ms, abs_ms, run_rel_ms, pull_rel_ms "
+        "  FROM events WHERE type = 'cast' AND hostility = 'Enemies' "
+        "   AND source_instance IS NOT NULL LIMIT 1"
+    ).fetchone()
+    common, rare = 800_001, 800_002
+    for game_id, name in ((common, "Common Strike"), (rare, "Rare Echo")):
+        db.upsert(
+            "abilities", {"game_id": game_id, "name": name, "first_seen": 0.0, "last_seen": 0.0}
+        )
+    start = int(
+        db.scalar("SELECT MAX(seq_in_page) FROM events WHERE page_id = ?", (row["page_id"],))
+    )
+
+    def insert(seq: int, offset: int, game_id: int, skew: int = 0) -> None:
+        db.execute(
+            "INSERT INTO events (page_id, seq_in_page, run_id, report_code, pull_id, "
+            " data_type, hostility, rel_ms, abs_ms, run_rel_ms, pull_rel_ms, type, "
+            " source_id, source_instance, ability_game_id, normalizer_version) "
+            "VALUES (?, ?, ?, ?, ?, 'Casts', 'Enemies', ?, ?, ?, ?, 'cast', ?, ?, ?, 1)",
+            (
+                row["page_id"],
+                seq,
+                row["run_id"],
+                row["report_code"],
+                row["pull_id"],
+                int(row["rel_ms"]) + offset + skew,
+                int(row["abs_ms"]) + offset + skew,
+                int(row["run_rel_ms"]) + offset + skew,
+                None if row["pull_rel_ms"] is None else int(row["pull_rel_ms"]) + offset,
+                row["source_id"],
+                row["source_instance"],
+                game_id,
+            ),
+        )
+
+    # 40 of the common ability; the rare one accompanies only 12 of them.
+    for i in range(40):
+        insert(start + 1 + i, i * 1000, common)
+    for i in range(12):
+        insert(start + 500 + i, i * 1000, rare, skew=5)
+    db.conn.commit()
+
+    pair = [p for p in paired_abilities(db) if p["ability_a_id"] == common]
+    assert pair, "subset pair not detected"
+    assert pair[0]["rate_b"] == 1.0, "every rare cast is accompanied"
+    assert pair[0]["rate_a"] < 0.5, "most common casts are alone"
+    assert pair[0]["inseparable"] is False
