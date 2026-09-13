@@ -172,7 +172,8 @@ def test_bracket_assignment():
     assert sampling.bracket_for(10) == "10"
     assert sampling.bracket_for(14) == "13-14"
     assert sampling.bracket_for(30) == "15+"
-    assert sampling.bracket_for(2) is None, "below every bracket"
+    assert sampling.bracket_for(2) == "2-6", "keystones start at 2; the bottom is closed"
+    assert sampling.bracket_for(1) is None, "below every bracket"
     assert sampling.bracket_for(None) is None
 
 

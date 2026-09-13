@@ -271,3 +271,45 @@ def test_evidence_prefers_examples_that_show_a_recast(populated):
     if len(evidence) > 1:
         peaks = [max(int(c["casts"]) for c in ev["per_copy"]) for ev in evidence]
         assert peaks == sorted(peaks, reverse=True)
+
+
+def test_zero_duplicate_groups_distinguishes_not_looked_from_none_found(populated):
+    """A corpus dedupe never examined must not read as a corpus with no duplicates."""
+    db = populated()
+    report = collect_validation(db)
+
+    assert report["dedupe"]["state"] == "never_run"
+    assert report["duplicates"]["groups"] == 0
+    assert any("never been run" in lim for lim in report["limitations"])
+    assert "not looked" in render_markdown(report)
+
+
+def test_dedupe_coverage_clears_after_a_pass(populated):
+    from wcl_mplus.dedupe import group_duplicates
+
+    db = populated()
+    group_duplicates(db)
+    report = collect_validation(db)
+
+    assert report["dedupe"]["state"] == "current"
+    assert report["dedupe"]["runs_not_examined"] == 0
+    assert not any("never been run" in lim for lim in report["limitations"])
+
+
+def test_dedupe_coverage_goes_stale_when_a_run_arrives_after_the_pass(populated):
+    from wcl_mplus.dedupe import group_duplicates
+
+    db = populated()
+    group_duplicates(db)
+    # A run collected after the pass: present, but never examined by it.
+    row = dict(db.execute("SELECT * FROM dungeon_runs LIMIT 1").fetchone())
+    row["run_id"] = row["run_id"] + ":later"
+    row["fight_id"] = int(row["fight_id"]) + 1000
+    row["is_canonical"] = None
+    row["duplicate_group_id"] = None
+    db.upsert("dungeon_runs", row)
+    db.conn.commit()
+
+    report = collect_validation(db)
+    assert report["dedupe"]["state"] == "stale"
+    assert any("after the last duplicate" in lim for lim in report["limitations"])

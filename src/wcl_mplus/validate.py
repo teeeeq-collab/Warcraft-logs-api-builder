@@ -134,6 +134,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
             or 0,
         },
         "cost": cost_profile(db),
+        "dedupe": dedupe_coverage(db),
         "duplicates": {
             "groups": len(duplicate_groups),
             "runs_in_groups": sum(int(g["members"]) for g in duplicate_groups),
@@ -142,6 +143,32 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "diagnostics": diagnostics,
         "npc_instance_evidence": npc_instance_evidence(db),
         "limitations": known_limitations(db),
+    }
+
+
+def dedupe_coverage(db: Database) -> dict[str, Any]:
+    """Whether duplicate detection has actually examined this corpus.
+
+    `group_duplicates()` sets `is_canonical` on every run it considers --
+    1 for a run in no group at all -- so a NULL there means no pass has ever
+    looked at that run. Without this distinction a report saying "0 duplicate
+    groups" reads as "none exist" when it may mean "never checked", and
+    `analysable` silently counts both uploads of one real run as two.
+    """
+    total = db.scalar("SELECT COUNT(*) FROM dungeon_runs") or 0
+    uncovered = db.scalar("SELECT COUNT(*) FROM dungeon_runs WHERE is_canonical IS NULL") or 0
+    if total == 0:
+        state = "empty"
+    elif uncovered == total:
+        state = "never_run"
+    elif uncovered:
+        state = "stale"
+    else:
+        state = "current"
+    return {
+        "state": state,
+        "runs_total": total,
+        "runs_not_examined": uncovered,
     }
 
 
@@ -271,6 +298,21 @@ def npc_instance_evidence(db: Database, limit: int = 5) -> list[dict[str, Any]]:
 def known_limitations(db: Database) -> list[str]:
     """Everything the report should not be read as claiming."""
     limitations: list[str] = []
+
+    dedupe = dedupe_coverage(db)
+    if dedupe["state"] == "never_run":
+        limitations.append(
+            f"Duplicate detection has never been run over these {dedupe['runs_total']} run(s). "
+            "A reported count of 0 duplicate groups means 'not looked', not 'none found', and "
+            "the analysable count may hold two uploads of the same real run as two "
+            "observations. Run `wclmplus dedupe`."
+        )
+    elif dedupe["state"] == "stale":
+        limitations.append(
+            f"{dedupe['runs_not_examined']} run(s) were collected after the last duplicate "
+            "detection pass and have not been examined. Re-run `wclmplus dedupe` before "
+            "treating the analysable count as a count of distinct real runs."
+        )
 
     unassigned = db.scalar("SELECT COUNT(*) FROM events WHERE pull_id IS NULL") or 0
     if unassigned:
@@ -443,7 +485,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Duplicate runs",
         "",
-        f"- Probable duplicate groups: {dupes['groups']}",
+        f"- Probable duplicate groups: {dupes['groups']}"
+        + (
+            "  ← duplicate detection has never been run; this is 'not looked', not 'none'"
+            if report["dedupe"]["state"] == "never_run"
+            else f"  ← {report['dedupe']['runs_not_examined']} run(s) not yet examined"
+            if report["dedupe"]["state"] == "stale"
+            else ""
+        ),
         f"- Runs inside a group: {dupes['runs_in_groups']} (none deleted; one per group "
         "is marked canonical)",
     ]

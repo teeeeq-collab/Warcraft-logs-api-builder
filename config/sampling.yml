@@ -5,6 +5,10 @@
 
 # Key-level strata. NOT hardcoded in source; change freely.
 key_brackets:
+  # The first pilot collected two +6 runs, which fell outside every bracket and
+  # so out of every per-bracket comparison. Keys start at 2, so this bracket
+  # closes the bottom rather than leaving low keys silently unclassified.
+  - { key: "2-6",   min: 2,  max: 6 }
   - { key: "7-8",   min: 7,  max: 8 }
   # 9 was missing from this list until the first pilot put runs in no bracket at
   # all. A gap here does not lose a run -- it lands in "outside brackets" and the
