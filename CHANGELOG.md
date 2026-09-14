@@ -9,6 +9,63 @@ recorded here.
 
 ---
 
+## Unreleased — 2026-09-14 — **focus resolution, identity versioning, design package**
+
+- `schema_version` 3 → **4** (`migrations/004_identity_scheme.sql`)
+- 361 → **377 tests**, all offline
+- New: `identity_scheme_version`, carried in `provenance()`
+
+### Fixed
+
+**`--focus-player` could never resolve an actor.** `normalize_actors` stores
+players as `pseudonym(name)`, and `_resolve_focus_actor` compared the supplied
+character name against `actors.name` directly. No real name can match a salted
+hash, so every focus stream was skipped on every run, for every focus player.
+A `reference_player` collection reported success and contained no focus data;
+the only trace was a per-run diagnostic that read like an ordinary absence.
+
+The typed name now goes through the same pseudonym function before matching,
+and both spellings a person has to hand are accepted: a character name with or
+without a `-Realm` suffix, and a pseudonym copied from a validation report.
+
+**Absence and failure are now different things.** Missing from one run is
+normal and stays a warning. Matching nothing in *any* run is a failed request
+and ends the job with an error diagnostic, an error on the result and exit
+code 2.
+
+**A real character name no longer reaches the database.** The absence
+diagnostic recorded the name the operator typed. It now records the pseudonym,
+which is enough to check the lookup and keeps the corpus free of real names.
+
+### Added
+
+**Identity scheme versioning.** Pseudonyms are the only handle the corpus has
+on a person, so the pseudonym function is part of the data format: change the
+salt and every stored player silently becomes someone else. `corpus_identity`
+records the scheme and salt fingerprint a database's names were written under,
+and a job run under a different scheme stops with a message naming the recovery
+path. A pinned test asserts the digest, so the scheme cannot drift unnoticed.
+
+`idx_actors_name`, so focus resolution is an index lookup rather than a scan of
+the largest dimension table.
+
+### Documentation
+
+Four design documents answering the expanded architecture brief:
+`SHIFU_ARCHITECTURE_PLAN.md`, `ANALYTICAL_DATA_MODEL.md`,
+`SCL_EXPERIMENT_PLAN.md`, `IMPLEMENTATION_PHASES.md`. All are proposals; none
+of the work they describe has been built.
+
+`API_NOTES.md` corrected: the per-page probe implied ~37 points/run and the
+conclusion "quota, not wall clock, is the binding constraint". A real 94-run
+corpus measured **13.19 points/run**, which reverses it. The estimate is kept
+beside the measurement, with the reason it was wrong.
+
+`PROJECT_STATE.md` rewritten — it still described schema 1, normalizer 1 and a
+pipeline that had never ingested a real report.
+
+---
+
 ## 0.2.0 — 2026-09-12 — **Phase 1: the collector**
 
 Storage, ingestion and validation. Built against the event shapes observed in

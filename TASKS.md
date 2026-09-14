@@ -25,10 +25,10 @@ this repository; `user` means a step only the credential holder can perform.
 | P0-14 | Fixture sanitizer | coordinator | DONE | — | Player and uploader names pseudonymized stably; NPC and ability names kept |
 | P0-15 | Recon engine | coordinator | DONE | P0-9…P0-13 | Runs every probe; writes JSON + Markdown even on failure; measures pagination semantics and query cost; records limitations |
 | P0-16 | CLI | coordinator | DONE | P0-15 | 10 commands; 5 need no credentials; every command has help; no secrets in output; clear exit codes |
-| P0-17 | Offline test suite | coordinator | DONE | all above | 216 tests pass with no credentials and no network; live tests opt-in |
-| P0-18 | **Live schema verification** | user | **BLOCKED** | B1 | `wclmplus recon --report <CODE>` completes; `recon_findings.json` written |
-| P0-19 | Fold findings into API_NOTES.md | coordinator | BLOCKED | P0-18 | Every hypothesis marked VERIFIED or CORRECTED with evidence |
-| P0-20 | Gate A decision | coordinator | BLOCKED | P0-19 | All six Gate A questions answered from evidence |
+| P0-17 | Offline test suite | coordinator | DONE | all above | 377 tests pass with no credentials and no network; live tests opt-in |
+| P0-18 | **Live schema verification** | user | DONE | B1 | `wclmplus recon --report <CODE>` completes; `recon_findings.json` written |
+| P0-19 | Fold findings into API_NOTES.md | coordinator | DONE | P0-18 | Every hypothesis marked VERIFIED or CORRECTED with evidence |
+| P0-20 | Gate A decision | coordinator | DONE (passed) | P0-19 | All six Gate A questions answered from evidence |
 
 ---
 
@@ -46,8 +46,45 @@ this repository; `user` means a step only the credential holder can perform.
 | P1-8 | Duplicate-run detection | coordinator | DONE | Multi-field fingerprint; transitive grouping; nothing deleted; one canonical member per group |
 | P1-9 | Validation report | coordinator | DONE | JSON + Markdown with counts, assignment rate, unknown actors/abilities, diagnostics, limitations, and a reconstructed per-copy timeline |
 | P1-10 | CLI | coordinator | DONE | `collect` (with `--dry-run`, `--refresh`, `--dungeon`), `dedupe`, `validate`, `stats` |
-| P1-11 | **Pilot collection on real reports** | user | **BLOCKED** | 5-10 Murder Row runs ingested; validation report produced from live data |
-| P1-12 | Gate C decision | coordinator | BLOCKED | Normalization stable, resume reliable, known mechanics visible, dedupe plausible, volume manageable |
+| P1-11 | **Pilot collection on real reports** | user | DONE | 5-10 Murder Row runs ingested; validation report produced from live data |
+| P1-12 | Gate C decision | coordinator | DONE (passed) | Normalization stable, resume reliable, known mechanics visible, dedupe plausible, volume manageable |
 
-Phases 2-5 are described in the research brief and are not broken down until
-Gate C passes: their shape depends on what the pilot measures.
+Gate C passed on a real 94-run corpus. What follows was reshaped by the
+expanded brief; the breakdown lives in
+[`IMPLEMENTATION_PHASES.md`](IMPLEMENTATION_PHASES.md).
+
+---
+
+## Phase 2 — corpus expansion and instrumentation
+
+| ID | Description | Owner | Status | Acceptance criteria |
+| --- | --- | --- | --- | --- |
+| P2-1 | Stream coverage manifest | coordinator | DONE | "asked, none" is distinguishable from "never asked", per run, per stream |
+| P2-2 | Actor filtering on event requests | coordinator | DONE | `sourceID`/`targetID` travel into the query and into coverage |
+| P2-3 | Stream cost benchmark | coordinator | DONE | uncollected streams measured without touching the corpus; probes bypass the cache |
+| P2-4 | Seven collection profiles | coordinator | DONE | `metadata` through `forensic_full`, config-driven |
+| P2-5 | Cross-log pack identity | coordinator | DONE | `species_signature` + `composition_signature`, indexed, `packs` command |
+| P2-6 | Database partitioning | coordinator | DONE | `--database` on every read/write command; bare names resolve in `db_dir` |
+| P2-7 | Fix `--focus-player` resolution | coordinator | DONE | a real name resolves to its pseudonymized actor; unresolvable is an explicit failure |
+| P2-8 | Version the identity scheme | coordinator | DONE | scheme + salt fingerprint recorded; mismatched corpus refused |
+| P2-9 | **Run `dedupe` on the live corpus** | user | **TODO** | `is_canonical` populated; `dedupe_coverage` reports `current` |
+| P2-10 | Regenerate `validate` after dedupe | user | TODO | report shows corrected worked-seconds and a real canonical count |
+| P2-11 | Fill `config/hotfix_epochs.yml` | user | **BLOCKED** | real patch dates; will not be invented |
+| P2-12 | Investigate 2 `overlapping_pulls` warnings | coordinator | TODO | either explained as legitimate WCL behaviour or fixed |
+| P2-13 | Grow the corpus | user | ONGOING | depth in one spec/dungeon/bracket before breadth |
+
+---
+
+## Phase 3 — Shifu architecture
+
+| ID | Description | Owner | Status | Acceptance criteria |
+| --- | --- | --- | --- | --- |
+| P3-1 | Current-state technical audit | coordinator | DONE | 40 parts, evidence-classed, inspection only |
+| P3-2 | Design package | coordinator | DONE | four documents, every change mapped to an existing component |
+| P3-3 | **Review the design package** | user | **TODO** | the three questions at the end of `IMPLEMENTATION_PHASES.md` answered |
+| P3-4 | Repository/query layer | coordinator | TODO | canonical by default; coverage-checked; `packs` SQL relocated |
+| P3-5 | Build snapshots from CombatantInfo | coordinator | TODO | known fixture → known build; identical builds dedupe |
+| P3-6 | Compression experiment framework | coordinator | TODO | encoders **and** decoders; measured tokens, never estimated |
+
+Phases 4-8 are specified in `IMPLEMENTATION_PHASES.md` and are not broken down
+here until P3-3 closes: their shape depends on what the review decides.

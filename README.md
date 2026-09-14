@@ -279,10 +279,22 @@ in `tests/fixtures/` when you run `wclmplus recon`.
 | --- | --- |
 | `PROJECT_STATE.md` | Current milestone, decisions, blockers, next actions |
 | `TASKS.md` | Task IDs, owners, status, acceptance criteria |
-| `API_NOTES.md` | Verified API behaviour. **Hypotheses until recon runs.** |
+| `API_NOTES.md` | Verified API behaviour, with corrections where measurement beat the estimate |
 | `DATA_DICTIONARY.md` | Tables, columns, units, null and timestamp semantics |
 | `VALIDATION.md` | Mechanic test cases, expected vs observed evidence, limitations |
 | `CHANGELOG.md` | Collector, schema and normalization changes |
+
+### Architecture package
+
+| File | Purpose |
+| --- | --- |
+| `CURRENT_STATE_ARCHITECTURE_AUDIT.md` | 40-part inspection of the code as it stands, evidence-classed |
+| `SHIFU_ARCHITECTURE_PLAN.md` | Proposed layering, component dispositions, and the limits of what WCL data can answer |
+| `ANALYTICAL_DATA_MODEL.md` | Schemas for builds, canonical actions, archetypes, state, cohorts, projection |
+| `SCL_EXPERIMENT_PLAN.md` | Compression candidates, metrics, comprehension benchmark, standardization gate |
+| `IMPLEMENTATION_PHASES.md` | Ordering, acceptance gates, effort, dependencies |
+
+These four are **proposals awaiting review**. Nothing in them is built.
 
 ---
 

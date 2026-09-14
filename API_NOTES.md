@@ -586,6 +586,24 @@ and every stat. Everything class-specific depends on it.
 ### Cost per page
 
 About 1.1 points per page across every stream (a 12-page probe cost 13 points,
-a 1-page probe 2). Quota, not wall clock, is the binding constraint: at 34
-pages/run the existing `mechanics` profile costs ~37 points/run, so 3,600
-points/hour allows ~97 runs/hour while 17.5 s/run would allow ~205.
+a 1-page probe 2).
+
+**Estimated at the time:** ~37 points/run for the `mechanics` profile at 34
+pages/run, which would make quota the binding constraint at ~97 runs/hour.
+
+**CORRECTED by measurement.** A real 94-run corpus cost **13.19 points/run**,
+read from `pointsSpentThisHour` at both ends of each job. That is roughly a
+third of the estimate and it reverses the conclusion: 3,600 points/hour allows
+~270 runs/hour, which the collector cannot reach. **Wall clock is the binding
+constraint, not quota.**
+
+The estimate was wrong because it multiplied a probe's per-page cost by a page
+count taken from a deliberately tiny page limit. Real collection fetches far
+fewer, larger pages for the same events. The lesson is the one this file keeps
+recording: a cost model built from a probe is a hypothesis until a real job
+measures it.
+
+Per-run wall clock should be read from `validate`'s worked-seconds metric, which
+sums inter-page gaps and excludes pauses between sessions -- the naive
+`MAX(fetched_at) - MIN(fetched_at)` measures calendar time and reported 5.5
+hours for a run that was re-collected the next day.

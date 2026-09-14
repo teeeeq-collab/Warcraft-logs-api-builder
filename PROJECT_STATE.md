@@ -2,112 +2,116 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-12 (Phase 1 implementation complete)
-- **Software version:** 0.2.0
-- **Database schema version:** 1 (`migrations/001_initial.sql`)
-- **Normalizer version:** 1
-- **Query set version:** 4
+- **Last updated:** 2026-09-14 (design package delivered; awaiting review)
+- **Software version:** 0.3.0
+- **Database schema version:** 4 (`migrations/004_identity_scheme.sql`)
+- **Normalizer version:** 2
+- **Query set version:** 5
+- **Identity scheme version:** 1
+- **Tests:** 377, all offline, all passing
 
 ---
 
 ## Current milestone
 
-**Phase 1 — Murder Row pilot. Implementation complete; awaiting real runs.**
+**Architecture phase. The design package is written and waiting for review.**
 
-Phase 0 closed with Gate A passed after five live runs. Phase 1 is now built
-and tested end to end against the synthetic API: schema, ingestion, pull
-assignment, resume, duplicate detection, validation reporting and CLI.
+Gate A closed on live data (five recon runs). Gate C closed on a real corpus:
+94 Mythic+ runs from 10 reports, 4,973,745 events, 2.18 GB, 97.83% of events
+assigned to a Warcraft Logs pull boundary, and twelve independent copies of one
+NPC species converging on 2.97-4.93 s recast intervals — which is the
+measurement that proves instance identity is real and not conflated.
 
-**300 tests pass**, all offline.
+The project has since been given a much larger scope: evolve the collector into
+a layered research platform capable of supporting an LLM-facing gameplay teacher
+("Shifu"). The response to that brief is a design package, not an
+implementation:
 
-### What Phase 1 delivers
+| Document | Contents |
+| --- | --- |
+| [`SHIFU_ARCHITECTURE_PLAN.md`](SHIFU_ARCHITECTURE_PLAN.md) | layering, component dispositions, explicit limits, sample-size reality |
+| [`ANALYTICAL_DATA_MODEL.md`](ANALYTICAL_DATA_MODEL.md) | schemas for builds, actions, archetypes, state, cohorts, projection |
+| [`SCL_EXPERIMENT_PLAN.md`](SCL_EXPERIMENT_PLAN.md) | compression candidates, metrics, comprehension benchmark, gate |
+| [`IMPLEMENTATION_PHASES.md`](IMPLEMENTATION_PHASES.md) | ordering, acceptance gates, effort, dependencies |
+| [`CURRENT_STATE_ARCHITECTURE_AUDIT.md`](CURRENT_STATE_ARCHITECTURE_AUDIT.md) | 40-part inspection of the code as it stands |
+
+Per the brief's §68, no large architectural work begins until that package is
+reviewed.
+
+---
+
+## What exists and works
 
 | Piece | State |
 | --- | --- |
-| SQLite schema + migrations | 14 tables, schema version 1, built against **observed** event fields |
-| Ingestion | report → run → pulls → NPC instances → roster → events |
+| Auth, redaction, raw cache | credentials never leave the operator's machine; a cache write containing one is refused |
+| GraphQL client | retry classification, introspection-driven queries, no asserted field names |
+| Pagination | cursor-exclusive, checkpointed in `event_pages`, exact resume |
+| Normalization | **lossless** — unpromoted fields go to `events.extra`; raw payloads retained |
 | Pull assignment | WCL boundaries authoritative; unassigned events kept and counted |
-| Resume | Checkpoint is the `event_pages` table, written in the same transaction as its events |
-| Idempotent re-ingest | Re-running a job changes no row counts |
-| Duplicate detection | Multi-field fingerprint, transitive grouping, **nothing deleted** |
-| Validation report | JSON + Markdown, with a reconstructed per-NPC-copy timeline as evidence |
-| CLI | `collect`, `dedupe`, `validate`, `stats` added |
+| NPC instance identity | `sourceInstance` never defaulted; a NULL stays unknown |
+| Stream coverage | `run_stream_coverage` distinguishes "asked, none" from "never asked" |
+| Collection profiles | seven, config-driven, from `metadata` to `forensic_full` |
+| Cross-log pack identity | `species_signature` + `composition_signature`, both indexed |
+| Focus-player collection | **fixed** — see below |
+| Identity scheme | versioned and pinned; a mismatched corpus is refused |
+| Duplicate detection | multi-field fingerprint, transitive grouping, **nothing deleted** |
+| Validation | coverage, cost, pairing, dedupe state, per-copy timelines, limitations |
 
-### Design decisions the live data forced
+## Measured facts
 
-1. **Events are fetched per hostility.** An unfiltered cast sample returned 50
-   player casts and zero NPC casts. `Casts@Enemies` and `Casts@Friendlies` are
-   separate streams in the mechanics profile, because unfiltered would have
-   made NPC mechanic timelines invisible.
-2. **`source_instance` is never defaulted.** A NULL means the API did not say.
-   Resolving it to "copy 1" at ingestion would assert a fact about the pull
-   that only the pull's instance range can establish.
-3. **Re-ingest identity is `(page_id, seq_in_page)`, not a content hash.** Two
-   genuinely identical events can occur at one millisecond; a content hash
-   would silently merge them.
-4. **`instance_count` carries a confidence.** It is derived from an ID range,
-   and a derived multiplicity must never be mistaken for a reported one.
+Numbers, not estimates. Each was measured against the live API or the corpus.
 
----
-
-## Blockers
-
-### B1 — Pilot runs needed (open, requires user action)
-
-The pipeline has never ingested a real report. It needs 5–10 Murder Row runs
-across key levels to prove the same on live data.
-
-```
-.venv\Scripts\wclmplus.exe collect --report-list reports.txt --dungeon "Murder Row"
-.venv\Scripts\wclmplus.exe validate
-```
-
-### B2 — Season dungeon list — **RESOLVED**
-
-Zone 55, all eight dungeons, persisted to `config/dungeons.discovered.yml`.
-
-### B3 — Live verification cannot be done in this environment (permanent)
-
-No credentials, and egress to `warcraftlogs.com` is denied by the build
-environment's proxy. All live evidence comes from the user's machine, by
-design — their Client Secret never leaves it.
+| Fact | Value |
+| --- | --- |
+| API cost per run | **13.19 points** of 3,600/hour |
+| Storage per run | ~23 MB |
+| Bytes per event | 437 |
+| `hostilityType` default | **Friendlies** — it never means "both" (verified on Casts, Buffs, DamageDone, Healing, Threat) |
+| `Resources@Enemies` | returns zero rows; removed from the profiles |
+| `Threat` | carries no threat value |
+| `CombatantInfo` | ignores hostility; 5 events/fight, ~36 KB, 2 points — the best value in the API |
+| `DamageDone` | 89,703 events/run — 1.65× the entire corpus, per run |
+| `Buffs@Enemies` | 30,863 events that had never been collected before the split |
 
 ---
 
-## Completed
+## Recent changes
 
-- Repository scaffold, packaging, git hygiene (`.env` ignored, data ignored).
-- Secret redaction layer: exact-value and pattern-based, applied to logs,
-  exceptions and cache writes. 13 tests.
-- OAuth2 client-credentials authentication with in-memory token caching,
-  early-refresh margin, and every failure mode mapped to an actionable error.
-  18 tests.
-- Rate-limit awareness: defensive field parsing, hourly budget guard with a
-  reserve, `Retry-After` handling, exponential backoff with jitter.
-- GraphQL client: retry classification (transient vs. permanently invalid),
-  401-triggered single token refresh, cache-backed idempotent execution. 26 tests.
-- Raw cache: versioned identity, atomic gzip writes, corruption tolerance, and
-  a hard refusal to write any payload containing a registered credential. 22 tests.
-- **Event paginator**: correct under inclusive *or* exclusive cursor semantics,
-  multiset boundary matching, progress verification, page ceiling, resumable
-  checkpoints, gap diagnostics. 22 tests.
-- Schema introspection and field verification; queries generated only from
-  fields confirmed to exist.
-- Recon engine writing `RECON_REPORT.md` + `recon_findings.json`, including
-  empirical pagination-semantics measurement. 22 tests.
-- Report discovery abstraction with `ManualReportSource`, URL/code parsing, and
-  provenance records. API-backed sources refuse to run unverified. 21 tests.
-- Config layer: dungeon registry with a generated discovery overlay, sampling
-  profiles, hotfix epochs with overlap rejection. 27 tests.
-- Fixture sanitizer: player names pseudonymized, NPC names preserved.
-- CLI with 10 commands, 5 of which need no credentials. 23 tests.
-- **216 tests, all passing, none requiring credentials or network.**
+**`--focus-player` could never match.** `normalize_actors` stores players as
+`pseudonym(name)`, and resolution compared the typed character name against
+that. Every `reference_player` collection reported success and collected no
+focus stream. Fixed: the name goes through the same function before matching;
+absence in one run stays a warning, matching nothing anywhere is now an error
+with a non-zero exit; and the diagnostic records the pseudonym rather than
+writing a real character name into the database.
+
+**Identity is versioned.** Pseudonyms are the only handle the corpus has on a
+person, so the pseudonym function is part of the data format. A database now
+records the scheme its names were written under and refuses a job under a
+different one.
 
 ---
 
-## Active work
+## Open items
 
-None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
+| # | Item | Owner |
+| --- | --- | --- |
+| O1 | `wclmplus dedupe` has **never been run** on the live corpus — `analysable: 94` is an upper bound | user |
+| O2 | Regenerate `validate` after O1, with the corrected worked-seconds metric | user |
+| O3 | `config/hotfix_epochs.yml` is empty — needs real Blizzard patch dates, which will not be invented | user |
+| O4 | Two `overlapping_pulls` warnings unexplained | coordinator |
+| O5 | Review the design package and choose the first reference spec/dungeon | user |
+
+---
+
+## The limit that no engineering removes
+
+94 runs is roughly 470 player-slots spread across every spec and every dungeon
+collected, over 1.5 days. **No cohort question in the expanded brief is
+answerable from it.** The architecture can be built and tested now; the numbers
+cannot be produced yet. Collection is the long pole and should run in parallel
+with every phase from here.
 
 ---
 
@@ -115,15 +119,16 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 | # | Decision | Reason |
 | --- | --- | --- |
-| D1 | No schema field is asserted anywhere. Queries are generated from introspected fields. | The brief requires the live schema to win. A missing field must be a recorded absence, not a mid-run crash. |
-| D2 | Paginator is correct under both inclusive and exclusive cursor semantics. | Cursor semantics were unverifiable. Handling both removes the guess entirely. |
-| D3 | Boundary de-duplication uses **multiset** matching, not a set. | Two byte-identical events can occur at one millisecond. A set would silently delete real observations. |
-| D4 | Dungeon IDs live in a generated overlay file, not written back into `dungeons.yml`. | Round-tripping YAML would strip the authored comments and validation targets. |
-| D5 | No database schema in Phase 0. | Phase 0 is reconnaissance. Storage design belongs to Phase 1, informed by the real event shapes. |
-| D6 | Synthetic API simulator for tests, clearly separated from `tests/fixtures/`. | Offline tests need something to run against, but synthetic data must never be mistaken for API evidence. |
-| D7 | Raw cache blocks writes containing credentials, rather than relying on redaction alone. | Defence in depth: turns a possible leak into a loud failure. |
-| D8 | No worker subagents were used for Phase 0. | The brief says not to over-orchestrate. Once live verification was blocked, Phase 0 reduced to one coherent scaffold task, and no worker could have unblocked the network. |
-| D9 | Report-code parsing errs toward acceptance. | Code length is not pinned. A wrong code fails loudly at the API; rejecting by a guessed length would silently drop valid runs. `report-list-check` catches typos first. |
+| D1 | No schema field is asserted anywhere; queries are generated from introspection | the live schema wins; a missing field must be a recorded absence, not a crash |
+| D2 | Paginator correct under inclusive *and* exclusive cursor semantics | removes the guess entirely |
+| D3 | Boundary de-duplication uses multiset matching | two byte-identical events can occur in one millisecond |
+| D7 | Raw cache refuses writes containing credentials | turns a possible leak into a loud failure |
+| D10 | Events fetched per hostility | an unfiltered cast sample returned 50 player casts and zero NPC casts |
+| D11 | `source_instance` never defaulted | resolving NULL to "copy 1" asserts a fact only the instance range can establish |
+| D12 | `instance_count` carries a confidence | a derived multiplicity must not be mistaken for a reported one |
+| D13 | `DamageDone` collected party-wide, not focus-only | collecting one player of five means every question about the other four needs the run fetched again |
+| D14 | Identity scheme versioned and pinned by test | changing the salt renames every player in every corpus |
+| D15 | Analytical projection designed now, built on a measured trigger | at 4.97 M events SQLite is not the bottleneck; tuning for the wrong shape is worse than waiting |
 
 ---
 
@@ -131,23 +136,21 @@ None. Awaiting the user's `wclmplus recon` run to unblock Gate A.
 
 | Case | Status |
 | --- | --- |
-| V1 NPC instance identity | **PASSED against the API** (pull level: 18 copies in one pull; event level: enemy casts, debuffs, damage, interrupts, deaths all carry instance markers). **Reconstructed from the database** in the validation report, so the claim is demonstrated end to end — but only on synthetic data so far. |
-| V2 Pagination completeness | **PASSED live.** Exclusive cursor; 316 pages, 7,920 in, 7,920 out. Plus 22 offline tests over both cursor semantics, and a resume test that interrupts mid-stream and lands on identical data. |
-| V3-V6 Mechanic timelines | Not started. Needs real pilot runs. |
-| V7 Priority interrupt | Reconstructible: `interrupt` carries `extra_ability_game_id` and `target_instance`. Untested on real data. |
-| V8 CC stop inference | Not started; needs the confidence-scored inference rules. |
-| V9 Event-to-pull assignment | **Implemented and tested offline.** Unassigned events retained and reported. Real assignment rate unknown. |
-| V10 Credential safety | **PASSED** across five live runs and the whole Phase 1 pipeline. No credential or player name reaches the database, reports or exports. |
+| V1 NPC instance identity | **PASSED on real data.** Twelve independent copies converged on 2.97-4.93 s intervals |
+| V2 Pagination completeness | **PASSED live.** Exclusive cursor; 316 pages, 7,920 in, 7,920 out |
+| V9 Event-to-pull assignment | **PASSED.** 97.83% assigned; the remainder retained and counted |
+| V10 Credential safety | **PASSED.** No credential or player name reaches the database, reports or exports |
+| V3-V6 Mechanic timelines | reconstructible; **blocked on sample size**, not on code |
+| V7 Priority interrupt | reconstructible — `interrupt` carries `extra_ability_game_id` and `target_instance` |
+| V8 CC stop inference | not started; needs the confidence-scored inference rules |
+
+---
 
 ## Next actions
 
-1. **User:** assemble a list of 5-10 public Murder Row report URLs across key
-   levels, then run `collect` and `validate`. Send back the validation report.
-2. **Coordinator:** review Gate C questions against real data — is
-   normalization stable, is resume reliable on a real report, are known
-   mechanics visible, is deduplication plausible, is data volume manageable?
-3. **Then Phase 2:** expand to 50-100 runs across brackets, measure per-run
-   cost and growth, and produce the first empirical mechanic-frequency analysis.
-
-Gate C must pass before Phase 2. The pipeline is proven against synthetic data
-only; a real report is the thing that has never been ingested.
+1. **User:** run `dedupe`, then `validate` (O1, O2).
+2. **User:** review the design package; answer the three questions at the end of
+   `IMPLEMENTATION_PHASES.md`.
+3. **User:** keep collecting. Everything from Phase 5 onward is gated on N.
+4. **Coordinator:** on approval, begin Phase 2 (the repository layer), since
+   every other analytical module is a client of it.
