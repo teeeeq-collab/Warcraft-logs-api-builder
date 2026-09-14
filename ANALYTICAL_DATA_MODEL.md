@@ -1,381 +1,664 @@
 # Analytical Data Model
 
-**Status:** proposal for review. No migration beyond `004` has been written.
+**Status:** proposal, revision 2. Incorporates the architecture review; see
+[`ARCHITECTURE_REVIEW_RESPONSES.md`](ARCHITECTURE_REVIEW_RESPONSES.md) for the
+reasoning behind each change. No migration beyond `004` has been written.
 
-Schemas for the analysis layer described in
-[`SHIFU_ARCHITECTURE_PLAN.md`](SHIFU_ARCHITECTURE_PLAN.md). Ordering and
-acceptance are in [`IMPLEMENTATION_PHASES.md`](IMPLEMENTATION_PHASES.md).
-
----
-
-## 0. Rules that every table below obeys
-
-1. **Nothing here is a source of truth.** Every table is derived from the ingest
-   store or from the raw cache, and every one can be dropped and rebuilt. If a
-   fact exists only in a derived table, that is a bug.
-2. **Every derived table carries its deriver's version.** A row produced by
-   build-parser v1 must be distinguishable from one produced by v2, because they
-   can mean different things. Never reinterpret an old row under new semantics.
-3. **Every derived row carries provenance** back to run, pull and time window,
-   or to an efficient reference to the set of runs it came from.
-4. **Coverage is checked before a stream is read**, not after. `run_stream_coverage`
-   already distinguishes "asked, none" from "never asked"; a derived statistic
-   that ignores it is wrong in the direction of "this never happens", which is
-   the most believable kind of wrong.
-5. **Canonical runs only, by default.** `is_canonical = 1 OR is_canonical IS NULL`.
-   `NULL` means dedupe has not run and is reported as such, never treated as
-   confirmed-unique.
-6. **`unknown` is a value.** Not `NULL`-meaning-zero, not a default, not omitted.
+Companion documents: [`SHIFU_ARCHITECTURE_PLAN.md`](SHIFU_ARCHITECTURE_PLAN.md),
+[`SCL_EXPERIMENT_PLAN.md`](SCL_EXPERIMENT_PLAN.md),
+[`IMPLEMENTATION_PHASES.md`](IMPLEMENTATION_PHASES.md).
 
 ---
 
-## 1. Player build snapshots (brief §6)
+## 0. Two stores, one boundary
 
-### Migration `005_player_builds.sql`
+Revision 1 said "Layer 2 never writes to Layer 1" and then put four derived
+tables in the ingest database. Revision 2 separates them physically.
+
+```
+data/db/<corpus>.sqlite                 INGEST — collection truth
+    migrations/                          schema_version 4
+    reports, dungeon_runs, pulls, pull_npcs, actors, abilities,
+    events, event_pages, run_stream_coverage, run_players,
+    combatant_info (NEW, migration 005), corpus_identity
+                       │
+                       │  read-only ATTACH; derivation only
+                       ▼
+data/analytics/<corpus>.analysis.sqlite  ANALYSIS — disposable
+    migrations/analytics/                analytics_schema_version 1
+    build dimensions, canonical actions, archetypes,
+    gameplay states, outcomes, cohorts, evaluations
+                       │
+                       ▼
+data/analytics/parquet/                  PROJECTION — disposable
+```
+
+**The rule for which store anything belongs in:**
+
+> Could a future version of this code change what an existing row *means*,
+> without any new data from the API?
+
+No → it is transcription → ingest store. Yes → it is a model → analysis store.
+
+Mapping CombatantInfo's fields into columns is transcription. Deciding what
+constitutes "a build" is a model. That line runs through the middle of the
+build work and §1 below splits it accordingly.
+
+### The foreign key that cannot exist
+
+SQLite does not enforce foreign keys across attached databases. An analytical
+`run_id` cannot reference `dungeon_runs.run_id`.
+
+The replacement is stronger for this purpose. Every analytical table records the
+**corpus fingerprint** it was derived from (§6), and `wclmplus analytics verify`
+checks referential integrity on demand. A foreign key proves *this run exists*.
+A fingerprint proves *this run exists and has not been recollected or
+renormalized since this row was derived* — which is the failure that would
+actually invalidate a conclusion, and the one an FK would not catch.
+
+---
+
+## 1. Rules every table below obeys
+
+1. **Nothing in the analysis store is a source of truth.** Delete it; rebuild it.
+   A fact that exists only there is a bug.
+2. **Every derived row carries its deriver's version.** Never reinterpret an old
+   row under new semantics.
+3. **Every derived row carries provenance** to run, pull and time window, or to
+   an immutable source-set reference.
+4. **Coverage is checked before a stream is read.** `run_stream_coverage`
+   distinguishes "asked, none" from "never asked"; a statistic that ignores it is
+   wrong in the direction of "this never happens".
+5. **Dedupe policy is explicit** (§7). No analytical entry point has a default.
+6. **`unknown` is a value**, and so is `stale`. Not `NULL`-meaning-zero.
+7. **Every statistic reports evidence depth at every level** (§6), never a single
+   `N`.
+
+---
+
+## 2. CombatantInfo: normalization, then derivation
+
+### 2a. Ingest store — migration `005_combatant_info.sql`
+
+Transcription only. One row per player per run, columns mapped directly from the
+payload, raw JSON retained. No hashes, no identity decisions, no interpretation.
 
 ```sql
--- One row per DISTINCT player configuration ever observed. A player who never
--- changes talents contributes one row across a hundred runs; one who respecs
--- contributes two, and the two stay separable -- which is the whole point.
-CREATE TABLE player_build_snapshots (
-    build_id            TEXT PRIMARY KEY,   -- deterministic hash, see below
-    class               TEXT,
-    spec                TEXT,
-    spec_id             INTEGER,
-    hero_talent         TEXT,               -- NULL until semantics are established
-    hero_talent_status  TEXT NOT NULL,      -- unknown|derived|external  (never 'observed')
-    talent_payload      TEXT,               -- JSON: talents as WCL reports them
-    talent_tree_payload TEXT,               -- JSON: talentTree as WCL reports it
-    gear_payload        TEXT,               -- JSON: full gear array, unmodified
-    item_level          REAL,
-    primary_stats       TEXT,               -- JSON
-    secondary_stats     TEXT,               -- JSON
-    trinket_1_item_id   INTEGER,
-    trinket_2_item_id   INTEGER,
-    raw_combatant_info  TEXT NOT NULL,      -- the source payload, retained whole
-    parser_version      INTEGER NOT NULL,
-    first_seen          REAL NOT NULL,
-    last_seen           REAL NOT NULL
-);
-CREATE INDEX idx_builds_spec    ON player_build_snapshots (spec, hero_talent);
-CREATE INDEX idx_builds_trinket ON player_build_snapshots (trinket_1_item_id, trinket_2_item_id);
-
--- Which build each player brought to each run. The join that makes
--- "compare Apex Mistweavers against non-Apex" one query instead of a scan.
-CREATE TABLE run_player_builds (
-    run_id       TEXT NOT NULL REFERENCES dungeon_runs (run_id),
-    actor_id     INTEGER NOT NULL,
-    build_id     TEXT NOT NULL REFERENCES player_build_snapshots (build_id),
+CREATE TABLE combatant_info (
+    run_id          TEXT NOT NULL REFERENCES dungeon_runs (run_id),
+    actor_id        INTEGER NOT NULL,
+    spec_id         INTEGER,
+    item_level      REAL,
+    talents         TEXT,              -- JSON, as WCL reports it
+    talent_tree     TEXT,              -- JSON, as WCL reports it
+    gear            TEXT,              -- JSON array, unmodified
+    stats           TEXT,              -- JSON
+    auras           TEXT,              -- JSON: state at snapshot, not configuration
+    raw             TEXT NOT NULL,     -- the whole event payload
     source_event_id INTEGER REFERENCES events (event_id),
+    normalizer_version INTEGER NOT NULL,
     PRIMARY KEY (run_id, actor_id)
 );
-CREATE INDEX idx_run_player_builds_build ON run_player_builds (build_id);
+CREATE INDEX idx_combatant_spec ON combatant_info (spec_id);
 ```
-
-### `build_id` construction
-
-```
-build_id = sha256(
-    parser_version || spec_id || canonical_json(talents)
-                   || canonical_json(talentTree)
-                   || canonical_json([{slot, id, itemLevel, gems, enchant} for gear])
-)[:16]
-```
-
-Deterministic by construction: keys sorted, no whitespace, no floats that
-round differently across runs. Two identical configurations collapse to one row;
-a single changed talent produces a different row and stays distinct.
-
-**Deliberately excluded from the hash:** current stats (they vary with buffs at
-the instant of the snapshot), and `auras` (state, not configuration).
-
-### What is *not* claimed
-
-`hero_talent_status` exists because hero-talent identity cannot be read reliably
-out of the talent payload without knowing the tree structure, and that structure
-is external game metadata. The column stays `unknown` until a knowledge source
-supplies it. **A cohort filtered on `hero_talent` must refuse to run while the
-status is `unknown`** rather than silently returning the subset that happens to
-be populated.
 
 > **Backfill:** offline, zero API cost. The 460 CombatantInfo events in the
-> current corpus are already stored. Re-parsing is a local pass.
+> current corpus are already stored in `events.extra`.
+
+**A limitation the schema states rather than implies:** CombatantInfo is a
+snapshot at fight start. Gear swapped mid-dungeon is invisible. Every equipment
+and stat row below therefore means "as at the start of the run", never
+"throughout it".
+
+### 2b. Analysis store — separable build dimensions
+
+Revision 1 hashed talents and gear into one `build_id`. That made **item level a
+talent variable**: two Mistweavers with identical talents and hero talents at
+ilvl 681 and 684 became different builds. Over a few hundred runs a cohort query
+for "Apex Mistweavers" would have returned a scatter of one-member builds and
+reported `N=1` for a configuration dozens of players ran — a confident statistic
+with the wrong denominator.
+
+Five independent dimensions, plus an optional composite.
+
+```sql
+-- Talents alone. Nothing about gear enters this hash.
+CREATE TABLE talent_loadouts (
+    talent_hash    TEXT PRIMARY KEY,
+    spec_id        INTEGER,
+    class          TEXT,
+    spec           TEXT,
+    talents        TEXT NOT NULL,      -- canonical JSON
+    talent_tree    TEXT,
+    model_version  INTEGER NOT NULL
+);
+
+-- Hero talent identity. EXTERNAL: cannot be read out of the payload without
+-- knowing the tree structure, which is game metadata this project does not have.
+CREATE TABLE hero_talents (
+    hero_talent_id TEXT PRIMARY KEY,
+    display_name   TEXT,
+    spec_id        INTEGER,
+    status         TEXT NOT NULL,      -- unknown|external   (never 'observed')
+    source         TEXT,               -- citation when status = 'external'
+    model_version  INTEGER NOT NULL
+);
+
+-- Equipment. item_level is a COLUMN, never part of the hash: it is continuous
+-- and would fragment equipment identity the way it would have fragmented builds.
+CREATE TABLE equipment_snapshots (
+    equipment_hash TEXT PRIMARY KEY,
+    items          TEXT NOT NULL,      -- canonical JSON: slot, id, enchant, gems
+    item_level     REAL,
+    model_version  INTEGER NOT NULL
+);
+
+-- Trinkets as an UNORDERED pair. Which one sits in slot 13 is arbitrary;
+-- treating it as meaningful would split one configuration into two.
+CREATE TABLE trinket_configs (
+    trinket_config_id TEXT PRIMARY KEY,
+    item_id_low       INTEGER,         -- sorted, so order cannot vary
+    item_id_high      INTEGER,
+    model_version     INTEGER NOT NULL
+);
+
+-- Secondaries, bucketed. Raw values never repeat across players, so an exact
+-- hash would make every stat snapshot unique and useless for matching.
+CREATE TABLE stat_snapshots (
+    stat_hash      TEXT PRIMARY KEY,
+    stats          TEXT NOT NULL,      -- canonical JSON, bucketed
+    bucket_scheme  TEXT NOT NULL,
+    model_version  INTEGER NOT NULL
+);
+
+-- The composite, for "this exact configuration". Available, never mandatory.
+CREATE TABLE run_player_config (
+    run_id            TEXT NOT NULL,
+    actor_id          INTEGER NOT NULL,
+    config_id         TEXT NOT NULL,
+    talent_hash       TEXT REFERENCES talent_loadouts (talent_hash),
+    hero_talent_id    TEXT REFERENCES hero_talents (hero_talent_id),
+    equipment_hash    TEXT REFERENCES equipment_snapshots (equipment_hash),
+    trinket_config_id TEXT REFERENCES trinket_configs (trinket_config_id),
+    stat_hash         TEXT REFERENCES stat_snapshots (stat_hash),
+    item_level        REAL,
+    corpus_fingerprint TEXT NOT NULL,
+    model_version     INTEGER NOT NULL,
+    PRIMARY KEY (run_id, actor_id)
+);
+CREATE INDEX idx_config_talent  ON run_player_config (talent_hash);
+CREATE INDEX idx_config_hero    ON run_player_config (hero_talent_id);
+CREATE INDEX idx_config_trinket ON run_player_config (trinket_config_id);
+CREATE INDEX idx_config_equip   ON run_player_config (equipment_hash);
+```
+
+Each question in the review is one join on one dimension:
+
+| Question | Dimension |
+|---|---|
+| Apex vs no-Apex | `hero_talent_id` |
+| talent build A vs B | `talent_hash` |
+| trinket X vs Y | `trinket_config_id` |
+| similar gear | `equipment_hash`, or `item_level` as a range |
+| same talents regardless of equipment | `talent_hash` alone |
+
+**Hero talents stay `unknown` until an external source establishes them.** A
+cohort filtered on `hero_talent_id` while the status is `unknown` **refuses to
+run** rather than returning whichever rows happen to be populated — a silently
+partial cohort is worse than no cohort.
 
 ---
 
-## 2. Canonical action mapping (brief §28)
+## 3. Canonical action mapping
 
-### Migration `006_canonical_actions.sql`
+Analysis store. Unchanged from revision 1 except for its location.
 
 ```sql
--- One real game action, which may surface as several ability IDs.
 CREATE TABLE canonical_actions (
-    action_id       TEXT PRIMARY KEY,
-    display_name    TEXT NOT NULL,
-    actor_side      TEXT NOT NULL,      -- enemy|player
-    model_version   INTEGER NOT NULL,
-    notes           TEXT
+    action_id     TEXT PRIMARY KEY,
+    display_name  TEXT NOT NULL,
+    actor_side    TEXT NOT NULL,        -- enemy|player
+    model_version INTEGER NOT NULL,
+    notes         TEXT
 );
 
--- The mapping, with its evidence. Never populated from name similarity alone.
 CREATE TABLE action_ability_map (
-    action_id     TEXT NOT NULL REFERENCES canonical_actions (action_id),
+    action_id       TEXT NOT NULL REFERENCES canonical_actions (action_id),
     ability_game_id INTEGER NOT NULL,
-    role          TEXT NOT NULL,        -- cast|impact|aura|tick|summon
-    confidence    TEXT NOT NULL,        -- measured|inferred|manual
-    evidence      TEXT,                 -- JSON: co-occurrence rate, N, run IDs
-    model_version INTEGER NOT NULL,
+    role            TEXT NOT NULL,      -- cast|impact|aura|tick|summon
+    confidence      TEXT NOT NULL,      -- measured|inferred|manual
+    evidence        TEXT,               -- JSON: co-occurrence rate, N, run IDs
+    model_version   INTEGER NOT NULL,
     PRIMARY KEY (action_id, ability_game_id)
 );
 ```
 
-`validate.py::paired_abilities` already measures co-occurrence and reports
-`rate_a`, `rate_b` and `inseparable`. That is the evidence that populates
-`action_ability_map`; it is not automatically promoted. A 4:1 pair is *not*
-one-for-one and the mapping must say so.
-
-The default is **separate**. An unmapped ability is its own action. Merging is a
-claim and requires evidence recorded next to it.
+`validate.py::paired_abilities` supplies the evidence — it already reports
+`rate_a`, `rate_b` and `inseparable`. Evidence is not automatically promoted: a
+4:1 pair is not one-for-one and the mapping must say so. The default is
+**separate**; merging is a claim and carries its evidence.
 
 ---
 
-## 3. Pull archetypes (brief §29)
-
-### Migration `007_pull_archetypes.sql`
+## 4. Pull archetypes
 
 ```sql
 CREATE TABLE pull_archetypes (
-    archetype_id      TEXT PRIMARY KEY,
-    dungeon_key       TEXT NOT NULL,
-    label             TEXT,             -- human name, optional, never load-bearing
-    core_species      TEXT NOT NULL,    -- the species set that defines membership
-    typical_position  INTEGER,          -- median pull_index
-    centroid          TEXT,             -- JSON: interpretable feature centroid
-    member_count      INTEGER NOT NULL,
-    model_version     INTEGER NOT NULL
+    archetype_id     TEXT PRIMARY KEY,
+    dungeon_key      TEXT NOT NULL,
+    label            TEXT,
+    core_species     TEXT NOT NULL,
+    typical_position INTEGER,
+    centroid         TEXT,             -- JSON: interpretable feature centroid
+    -- Reserved for pack decomposition (review amendment 14). Populated later,
+    -- present now so decomposition never needs a migration.
+    components       TEXT,             -- JSON: inferred latent packs, or NULL
+    component_status TEXT NOT NULL,    -- unknown|inferred
+    member_count     INTEGER NOT NULL,
+    model_version    INTEGER NOT NULL
 );
 
 CREATE TABLE pull_archetype_members (
-    pull_id       TEXT NOT NULL REFERENCES pulls (pull_id),
+    pull_id       TEXT NOT NULL,
     archetype_id  TEXT NOT NULL REFERENCES pull_archetypes (archetype_id),
-    match_kind    TEXT NOT NULL,   -- exact|species|fuzzy
-    distance      REAL,            -- NULL for exact and species matches
+    match_kind    TEXT NOT NULL,       -- exact|species|fuzzy
+    distance      REAL,
     model_version INTEGER NOT NULL,
     PRIMARY KEY (pull_id, archetype_id, model_version)
 );
 ```
 
-Three levels, in increasing looseness and decreasing confidence:
+Three levels; the first two already exist and are indexed in the ingest store.
 
-| Level | Basis | Already exists |
+| Level | Basis | Exists |
 |---|---|---|
-| exact | `composition_signature` — same species, same counts | yes, indexed |
-| species | `species_signature` — same species, any counts | yes, indexed |
-| fuzzy | interpretable feature distance | no — this is the new work |
+| exact | `composition_signature` | yes |
+| species | `species_signature` | yes |
+| fuzzy | interpretable feature distance | new |
 
-Fuzzy features, all interpretable, none learned: species overlap (Jaccard),
-count difference, map-coordinate distance, `pull_index` offset, neighbour
-identity, duration ratio, boss flag. Weights are configuration, not constants in
-code, so they can be argued with.
+Fuzzy features, all interpretable: species overlap (Jaccard), count difference,
+map-coordinate distance, `pull_index` offset, neighbour identity, duration ratio,
+boss flag. Weights are configuration. Clustering is evaluated only after these
+are measured.
 
-Clustering is evaluated *after* these are measured and only adopted if it beats
-them on something they cannot express.
+**Pack decomposition** (amendment 14) is the eventual goal: representing an
+observed pull as `Pack A + Pack B (+ stray C)` rather than as a fuzzy variant.
+It is a latent-structure problem — observed pulls are unions of unobserved packs
+— and recovering the parts requires the *combinations* to vary across many
+routes and many groups. It is the most N-hungry item in this package. Designed
+for, not scheduled.
 
 ---
 
-## 4. Gameplay state (brief §§30-32)
+## 5. Gameplay state
 
-### Migration `008_gameplay_state.sql`
+### 5a. States, with per-field observability
 
 ```sql
--- A reconstructed state at one instant. Not one row per event: one row per
--- moment an analysis cares about (an action, a death, a damage window).
 CREATE TABLE gameplay_states (
-    state_id        TEXT PRIMARY KEY,
-    run_id          TEXT NOT NULL REFERENCES dungeon_runs (run_id),
-    pull_id         TEXT REFERENCES pulls (pull_id),
-    archetype_id    TEXT,
-    rel_ms          INTEGER NOT NULL,
-    pull_rel_ms     INTEGER,
-    key_level       INTEGER,
-    key_bracket     TEXT,
-    hotfix_epoch    TEXT,
-    subject_actor_id INTEGER,          -- whose state this is
-    subject_build_id TEXT REFERENCES player_build_snapshots (build_id),
-    payload         TEXT NOT NULL,     -- JSON: the state itself, see below
-    observability   TEXT NOT NULL,     -- JSON: tag per field
-    source_event_id INTEGER REFERENCES events (event_id),
-    model_version   INTEGER NOT NULL
+    state_id         TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    pull_id          TEXT,
+    archetype_id     TEXT,
+    rel_ms           INTEGER NOT NULL,
+    pull_rel_ms      INTEGER,
+    key_level        INTEGER,
+    key_bracket      TEXT,
+    hotfix_epoch     TEXT,
+    subject_actor_id INTEGER,
+    subject_config_id TEXT,
+    payload          TEXT NOT NULL,    -- JSON: field -> value
+    field_meta       TEXT NOT NULL,    -- JSON: field -> metadata record, see below
+    block_meta       TEXT NOT NULL,    -- JSON: tags for run-constant fields
+    source_event_id  INTEGER,
+    corpus_fingerprint TEXT NOT NULL,
+    model_version    INTEGER NOT NULL
 );
 CREATE INDEX idx_states_pull    ON gameplay_states (pull_id, rel_ms);
 CREATE INDEX idx_states_subject ON gameplay_states (run_id, subject_actor_id, rel_ms);
-
--- What the subject did from that state.
-CREATE TABLE state_actions (
-    state_id      TEXT NOT NULL REFERENCES gameplay_states (state_id),
-    seq           INTEGER NOT NULL,
-    action_id     TEXT,                -- canonical action where mapped
-    ability_game_id INTEGER,
-    target_actor_id INTEGER,
-    target_instance INTEGER,
-    rel_ms        INTEGER NOT NULL,
-    source_event_id INTEGER REFERENCES events (event_id),
-    PRIMARY KEY (state_id, seq)
-);
-
--- What followed, in a defined window. Components, never a score.
-CREATE TABLE state_outcomes (
-    state_id      TEXT PRIMARY KEY REFERENCES gameplay_states (state_id),
-    window_ms     INTEGER NOT NULL,
-    deaths        INTEGER,
-    party_hp_delta TEXT,               -- JSON per player
-    damage_taken  INTEGER,
-    healing_done  INTEGER,
-    enemies_died  INTEGER,
-    components    TEXT NOT NULL,       -- JSON: raw components, unaggregated
-    coverage      TEXT NOT NULL,       -- JSON: which streams backed each component
-    model_version INTEGER NOT NULL
-);
 ```
 
-### The `observability` column is the load-bearing one
+Revision 1 tagged each field `observed | derived | inferred | unknown`. That is
+necessary and insufficient: HP last seen 40 ms ago and HP last seen 8 s ago were
+both "observed", and only one is worth anything.
+
+Each field in `field_meta`:
 
 ```json
 {
-  "party_hp":        "derived",
-  "subject_mana":    "observed",
-  "cooldowns":       "unknown",
-  "subject_target":  "inferred",
-  "enemy_positions": "unknown"
+  "value": 44,
+  "status": "stale",
+  "observed_at_ms": 184920,
+  "age_ms": 8300,
+  "method": "last_hit_points_on_target",
+  "model_version": 1,
+  "confidence": null
 }
 ```
 
-Every consumer — the exporter, the comparison layer, the LLM context — reads
-this before reading `payload`. A field tagged `unknown` is rendered as unknown,
-never dropped and never defaulted. This is what stops a state with six holes in
-it from being presented as a complete picture.
+| Status | Meaning |
+|---|---|
+| `observed` | read from an event, within its staleness horizon |
+| `stale` | read from an event, past its horizon; `age_ms` says how far |
+| `derived` | computed from observed values by a documented rule |
+| `inferred` | a model, with `method` naming it and `confidence` where probabilistic |
+| `unknown` | not establishable from this corpus |
 
-### Cooldown availability (brief §31)
+### 5b. Staleness horizons
 
-Modelled as `unknown` today, with a defined upgrade path:
+Recording age is not enough — a consumer handed `age_ms: 8300` can ignore it,
+and eventually one will. Horizons live in configuration, not in code, and the
+degradation to `stale` is automatic:
 
-| Evidence available | Best claim |
+```yaml
+# config/state_horizons.yml
+hp:            2000     # moves constantly
+resource:      3000
+position:      1500
+aura_active:   null     # explicit apply/remove events: exact between them
+enemies_alive: null     # derived from deaths: exact between them
+build:         null     # constant within a run
+```
+
+`null` is a real category, not a missing value. An aura's state is known exactly
+between its apply and remove events; calling it stale after two seconds would be
+wrong in the other direction.
+
+### 5c. Payload cost
+
+Seven metadata keys across ~30 fields is roughly 200 extra JSON keys per state.
+Acceptable in a table; ruinous in an LLM export, where it would dwarf the data.
+Two mitigations, both structural:
+
+- **`block_meta`** carries one tag for fields constant within a run — spec,
+  config, key level, dungeon, hotfix epoch — instead of repeating a record per
+  field per state.
+- **The exporter emits `field_meta` only for fields that are not
+  `observed`-and-fresh.** Exceptions get described; the ordinary case stays
+  quiet. This is the same principle as default suppression in the SCL plan, and
+  it is lossless for the same reason: the rule is documented and the default is
+  recoverable.
+
+### 5d. Cooldown availability
+
+| Evidence | Best claim |
 |---|---|
 | nothing | `unknown` |
-| casts + charges observed in this run | `probable`, with the assumption stated |
-| + external ability metadata (§40) | `derived`, with the source cited |
+| casts + charges observed in this run | `inferred`, `method` stated, `confidence` set |
+| + external ability metadata | `derived`, source cited |
 
-Never `observed` — the API reports no cooldown timer. And never from a tooltip
-value held in memory: the empirical corpus alone cannot establish recast rules,
-and an NPC's observed recast interval is not its cooldown.
+Never `observed` — the API reports no cooldown timer. Never from a tooltip held
+in memory. An NPC's observed recast interval is not its cooldown.
 
----
-
-## 5. Cohorts (brief §35)
-
-### Migration `009_cohorts.sql`
+### 5e. Actions
 
 ```sql
--- The filter set and its version. NOT the members: membership is a query,
--- and materialising it would let a cohort silently go stale as runs arrive.
-CREATE TABLE cohort_definitions (
-    cohort_id     TEXT PRIMARY KEY,
-    label         TEXT,
-    filters       TEXT NOT NULL,   -- JSON: spec, dungeon, bracket, build, epoch, ...
-    required_streams TEXT NOT NULL,-- JSON: streams a run MUST have collected
-    model_version INTEGER NOT NULL,
-    created_at    REAL NOT NULL
+CREATE TABLE state_actions (
+    state_id        TEXT NOT NULL REFERENCES gameplay_states (state_id),
+    seq             INTEGER NOT NULL,
+    action_id       TEXT,
+    ability_game_id INTEGER,
+    target_actor_id INTEGER,
+    target_instance INTEGER,
+    rel_ms          INTEGER NOT NULL,
+    source_event_id INTEGER,
+    PRIMARY KEY (state_id, seq)
 );
 ```
 
-`required_streams` is mandatory and has no default. A cohort that needs Healing
-excludes every run that never requested it, **reports the exclusion count**, and
-never quietly averages over a mixed-fidelity population. A corpus assembled from
-`mechanics_research` and `user_coaching` profiles is exactly such a population,
-and `validate` already detects that mixing.
+### 5f. Outcomes at multiple horizons
 
-No performance score is stored anywhere in this schema. §36 is explicit: the
-definition of "high-performing" is a research judgement, and baking it into a
-column makes it unrevisable and invisible.
+`state_id` alone as a primary key forced a single window to be chosen before
+anyone knew which window answered the question. "Did the player survive" has
+different answers at +1 s and +10 s.
+
+```sql
+CREATE TABLE state_outcomes (
+    state_id         TEXT NOT NULL REFERENCES gameplay_states (state_id),
+    horizon_id       TEXT NOT NULL,    -- +1s|+3s|+5s|+10s|mechanic_window|pull_end
+    requested_window_ms INTEGER,       -- NULL for semantic horizons
+    actual_window_ms INTEGER NOT NULL,
+    -- TRUE when the horizon ran past the end of available data. A state 2s
+    -- before the pull ends has no +10s outcome -- it has a TRUNCATED one, and
+    -- the difference decides whether it belongs in a distribution.
+    truncated        INTEGER NOT NULL DEFAULT 0,
+    deaths           INTEGER,
+    party_hp_delta   TEXT,             -- JSON per player
+    damage_taken     INTEGER,
+    healing_done     INTEGER,
+    enemies_died     INTEGER,
+    components       TEXT NOT NULL,    -- JSON: raw components, unaggregated
+    coverage         TEXT NOT NULL,    -- JSON: which streams backed each component
+    model_version    INTEGER NOT NULL,
+    PRIMARY KEY (state_id, horizon_id)
+);
+```
+
+**Any aggregate over a horizon must report how many members were truncated.**
+Without it, "deaths within 10 s" is systematically understated for every state
+near a pull boundary — and the bias points the same direction every time, which
+is the kind that survives review.
+
+No performance score exists in this schema. Components only.
 
 ---
 
-## 6. Analytical projection (brief §§7, 55, 57)
+## 6. Cohorts: definitions and evaluations
 
-**Not a migration. Files, not tables.**
+A definition answers *who matches now*. An evaluation answers *exactly who
+produced this published number*. Both are needed and only the second is
+reproducible.
+
+```sql
+-- Dynamic. Re-evaluates as the corpus grows.
+CREATE TABLE cohort_definitions (
+    cohort_id        TEXT PRIMARY KEY,
+    label            TEXT,
+    filters          TEXT NOT NULL,     -- JSON: spec, dungeon, bracket, dimensions, epoch
+    required_streams TEXT NOT NULL,     -- JSON: no default; a cohort must say
+    dedupe_policy    TEXT NOT NULL,     -- permissive|strict
+    model_version    INTEGER NOT NULL,
+    created_at       REAL NOT NULL
+);
+
+-- Immutable. One row per published result.
+CREATE TABLE cohort_evaluations (
+    evaluation_id      TEXT PRIMARY KEY,
+    cohort_id          TEXT NOT NULL REFERENCES cohort_definitions (cohort_id),
+    definition_version INTEGER NOT NULL,
+    corpus_fingerprint TEXT NOT NULL,
+    model_versions     TEXT NOT NULL,   -- JSON: every analytical version in force
+    evaluated_at       REAL NOT NULL,
+    dedupe_policy      TEXT NOT NULL,
+    provisional        INTEGER NOT NULL DEFAULT 0,
+    exclusions         TEXT NOT NULL,   -- JSON: run_id -> reason
+    evidence           TEXT NOT NULL    -- JSON: the block in section 7
+);
+
+-- The SOURCE set, not the derived set.
+CREATE TABLE cohort_evaluation_members (
+    evaluation_id TEXT NOT NULL REFERENCES cohort_evaluations (evaluation_id),
+    run_id        TEXT NOT NULL,
+    actor_id      INTEGER,
+    PRIMARY KEY (evaluation_id, run_id, actor_id)
+);
+```
+
+**Why members are runs and players, never states.** A cohort spanning millions
+of states would produce a member list larger than the analysis it documents, and
+it would be redundant: states are deterministically re-derivable from the source
+set given the model versions the evaluation already records. The source set plus
+the versions *is* the reproducible identity.
+
+**Corpus fingerprint:** a hash over the sorted `(run_id, normalizer_version,
+coverage_status)` triples of every included run. It changes exactly when a run is
+recollected or renormalized — which is exactly when an old number stops being
+reproducible.
+
+---
+
+## 7. Evidence depth and pseudoreplication
+
+Every statistic carries this block. Not a single `N`.
+
+```json
+{
+  "n_events": 104812,
+  "n_states": 3120,
+  "n_pulls": 412,
+  "n_runs": 88,
+  "n_players": 31,
+  "n_reports": 10,
+  "n_parties": 12,
+  "independent_unit": "player",
+  "n_independent": 31,
+  "concentration": { "top_player_share": 0.18, "top_run_share": 0.04 },
+  "coverage": { "required": ["Healing@Friendlies"], "runs_excluded": 6 },
+  "dedupe_policy": "strict",
+  "provisional": false
+}
+```
+
+`independent_unit` is declared per claim class and `n_independent` is the count
+of *that* unit — the number any interpretation should use.
+
+| Claim class | Independent unit |
+|---|---|
+| does this NPC cast X | observation |
+| recast interval of X | NPC instance |
+| target distribution of X | cast |
+| pack occurrence and position | pull |
+| player behaviour in a window | **player** |
+| cohort comparison | **player**, matched |
+
+**`concentration` is what stops `N=100,000` being a lie of composition.** A
+distribution where one player supplies 60% of observations is not a population
+distribution, however large the event count. There is no global minimum run
+count anywhere in this design; each claim reports its own depth and the reader
+judges.
+
+---
+
+## 8. Dedupe policy
+
+| Policy | `is_canonical IS NULL` | Use |
+|---|---|---|
+| `permissive` | allowed, reported | browsing, retrieval, debugging |
+| `strict` | **refused** — result marked `provisional`, export blocked | statistics, publication |
+
+**No default at the research boundary.** Every analytical entry point takes the
+policy as a required argument. A default of `permissive` means a statistics path
+silently gets the lax rule; a default of `strict` means an interactive query
+fails for no reason. Making the caller state which kind of question they are
+asking is cheap. Guessing is how an undeduplicated corpus ends up underneath a
+published number — which is the live corpus's current state.
+
+---
+
+## 9. Analytical projection
+
+Files, not tables.
 
 ```
-data/analytics/
-  _manifest.json                       projection version, source DB, run set, built_at
+data/analytics/parquet/
+  _manifest.json                       version, source fingerprint, run set, built_at
   events/dungeon=<key>/epoch=<id>/stream=<type>/part-*.parquet
   pulls/dungeon=<key>/part-*.parquet
   states/dungeon=<key>/spec=<spec>/part-*.parquet
-  dict/{actors,npcs,abilities,items,builds,archetypes}.parquet
+  dict/{actors,npcs,abilities,items,talents,archetypes}.parquet
 ```
 
-Partitioning by dungeon, hotfix epoch and stream is chosen because those are the
-three filters nearly every question applies first, and partition pruning is where
-columnar storage actually pays. Spec partitions the state tables because cohort
-questions are spec-first.
+Partitioned by dungeon, hotfix epoch and stream because those are the three
+filters nearly every question applies first. States partition by spec as well,
+because cohort questions are spec-first. Dictionary encoding throughout: stable
+numeric IDs in fact tables, display names only in `dict/`.
 
-**Dictionary encoding** (§57): stable numeric IDs inside the fact tables; display
-names live only in `dict/`. An NPC name repeated across ten million damage rows
-is ten million copies of a string that means one thing.
+### Determinism is semantic, not byte-level
 
-Rules, restated because they are easy to erode:
+Revision 1 required byte-identical rebuilds. That was brittle and wrong: Parquet
+embeds writer version, codec settings, row-group boundaries and dictionary page
+layout, so a routine `pyarrow` bump would fail a correctness gate with no row
+changed — which trains people to ignore the gate.
 
-- derived from canonical ingest data only;
-- rebuildable from scratch, deterministically — same input, same bytes;
-- versioned, with the version in `_manifest.json`;
-- incremental where practical, but a full rebuild must always work;
-- **no information exists only here**;
-- SQLite and the raw cache remain the provenance authorities;
-- regenerable after any normalizer improvement.
+Required instead:
 
-`pyarrow` is an optional extra today. DuckDB would be a second. The offline test
-suite must pass with neither installed, and collection must never require either.
+- identical logical rows;
+- identical ordering under a declared total order;
+- identical partitioning;
+- identical source manifest;
+- identical **logical fingerprint** — a hash over canonically serialised, sorted,
+  explicitly-typed rows, computed without reference to the file format.
 
----
-
-## 7. Version registry (brief §47)
-
-Every derived model gets a version, and every derived row records the version
-that produced it.
-
-| Model | Constant | Starts at | Bump when |
-|---|---|---|---|
-| Build parser | `BUILD_PARSER_VERSION` | 1 | CombatantInfo → snapshot mapping changes |
-| Canonical actions | `ACTION_MODEL_VERSION` | 1 | a mapping or its confidence rule changes |
-| Pull archetypes | `ARCHETYPE_MODEL_VERSION` | 1 | features or weights change |
-| Gameplay state | `STATE_SCHEMA_VERSION` | 1 | a state field is added, removed or retagged |
-| Cohorts | `COHORT_MODEL_VERSION` | 1 | a filter's meaning changes |
-| Similarity | `SIMILARITY_MODEL_VERSION` | 1 | features or weighting change |
-| Projection | `PROJECTION_VERSION` | 1 | partition layout or column set changes |
-| SCL | `SCL_VERSION` | `experimental-1` | any encoding change; see the experiment plan |
-
-These join the existing four (`SOFTWARE_VERSION`, `NORMALIZER_VERSION`,
-`QUERY_VERSION`, `SCHEMA_VERSION`) and the identity scheme version added in
-migration 004, all already carried by `version.py::provenance()`.
+The fingerprint is what the test asserts, and it is stable across writer versions
+because it never sees the writer. Byte-identity under a pinned environment stays
+a **warning**: worth noticing, not worth failing.
 
 ---
 
-## 8. Migration sequence
+## 10. Export-scoped identity
 
-| # | File | Adds | Backfillable offline |
+No implementation now; the interface is reserved.
+
+Internal pseudonyms are stable by design so longitudinal analysis works — and
+that same stability makes them unsafe to publish, since two snapshots sharing an
+ID are trivially correlated.
+
+An export pseudonym **cannot** derive from `IDENTITY_SALT`: that salt is public
+in this repository, so anyone could recompute the mapping. It must be
+`HMAC(random_per_export_salt, internal_pseudonym)`, with the salt generated at
+export time and **not included in the export**. Whether the operator keeps the
+salt privately is a real choice with a real consequence — keep it and you can
+re-identify your own snapshot later; discard it and the mapping is gone for
+everyone, including you. The export manifest records which was done, never the
+salt.
+
+---
+
+## 11. Version registry
+
+| Model | Constant | Store |
+|---|---|---|
+| Ingest schema | `SCHEMA_VERSION` = 4 | ingest |
+| Normalizer | `NORMALIZER_VERSION` = 2 | ingest |
+| Query set | `QUERY_VERSION` = 5 | ingest |
+| Identity scheme | `IDENTITY_SCHEME_VERSION` = 1 | ingest |
+| Analytics schema | `ANALYTICS_SCHEMA_VERSION` | analysis |
+| Build model | `BUILD_MODEL_VERSION` | analysis |
+| Canonical actions | `ACTION_MODEL_VERSION` | analysis |
+| Pull archetypes | `ARCHETYPE_MODEL_VERSION` | analysis |
+| Gameplay state | `STATE_SCHEMA_VERSION` | analysis |
+| Cohorts | `COHORT_MODEL_VERSION` | analysis |
+| Similarity | `SIMILARITY_MODEL_VERSION` | analysis |
+| Projection | `PROJECTION_VERSION` | projection |
+| SCL | `SCL_VERSION` = `experimental-1` | export |
+
+---
+
+## 12. Migration sequence
+
+**Ingest store** — additive only; the existing 94 runs need no re-collection.
+
+| # | File | Adds | Backfill |
 |---|---|---|---|
-| 004 | `identity_scheme.sql` | **applied** — `corpus_identity`, `idx_actors_name` | n/a |
-| 005 | `player_builds.sql` | build snapshots, run→build link | **yes** |
-| 006 | `canonical_actions.sql` | action mapping + evidence | yes |
-| 007 | `pull_archetypes.sql` | archetypes + membership | yes |
-| 008 | `gameplay_state.sql` | states, actions, outcomes | partly — bounded by stream coverage |
-| 009 | `cohorts.sql` | cohort definitions | yes |
+| 004 | `identity_scheme.sql` | **applied** | n/a |
+| 005 | `combatant_info.sql` | normalized CombatantInfo | **offline, free** |
 
-Every one is additive: new tables, no column dropped, no meaning changed. The
-existing 94 runs need no re-collection for any of them. That is a direct
-consequence of the collector keeping raw payloads and routing unpromoted fields
-to `events.extra`, and it is worth naming as the dividend of that decision.
+**Analysis store** — `migrations/analytics/`, its own sequence from 001.
 
-The one thing **no** migration can backfill: a stream that was never requested.
-`run_stream_coverage` is what tells you which those are, per run, and it is why
-a state reconstructed from a `mechanics_research` run will carry more `unknown`
-tags than one from `forensic_full`.
+| # | Adds |
+|---|---|
+| 001 | build dimensions, `run_player_config` |
+| 002 | canonical actions |
+| 003 | pull archetypes |
+| 004 | gameplay states, actions, outcomes |
+| 005 | cohort definitions, evaluations, members |
+
+Only one migration now touches the canonical corpus, and it is transcription of
+data already stored. Everything interpretive lives in a database that can be
+deleted without consequence — which is what the layer boundary was supposed to
+mean in the first place.
+
+The one thing no migration can backfill: a stream that was never requested.
+`run_stream_coverage` names those, per run, and it is why a state reconstructed
+from a `mechanics_research` run carries more `unknown` tags than one from
+`forensic_full`.

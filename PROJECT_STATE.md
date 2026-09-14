@@ -2,7 +2,7 @@
 
 Authoritative summary of where this project is. Updated at every gate.
 
-- **Last updated:** 2026-09-14 (design package delivered; awaiting review)
+- **Last updated:** 2026-09-14 (design package revision 2; awaiting second review)
 - **Software version:** 0.3.0
 - **Database schema version:** 4 (`migrations/004_identity_scheme.sql`)
 - **Normalizer version:** 2
@@ -33,6 +33,7 @@ implementation:
 | [`ANALYTICAL_DATA_MODEL.md`](ANALYTICAL_DATA_MODEL.md) | schemas for builds, actions, archetypes, state, cohorts, projection |
 | [`SCL_EXPERIMENT_PLAN.md`](SCL_EXPERIMENT_PLAN.md) | compression candidates, metrics, comprehension benchmark, gate |
 | [`IMPLEMENTATION_PHASES.md`](IMPLEMENTATION_PHASES.md) | ordering, acceptance gates, effort, dependencies |
+| [`ARCHITECTURE_REVIEW_RESPONSES.md`](ARCHITECTURE_REVIEW_RESPONSES.md) | per-amendment responses to the first review: 16 agree, 3 corrections to my own errors |
 | [`CURRENT_STATE_ARCHITECTURE_AUDIT.md`](CURRENT_STATE_ARCHITECTURE_AUDIT.md) | 40-part inspection of the code as it stands |
 
 Per the brief's §68, no large architectural work begins until that package is
@@ -101,17 +102,28 @@ different one.
 | O2 | Regenerate `validate` after O1, with the corrected worked-seconds metric | user |
 | O3 | `config/hotfix_epochs.yml` is empty — needs real Blizzard patch dates, which will not be invented | user |
 | O4 | Two `overlapping_pulls` warnings unexplained | coordinator |
-| O5 | Review the design package and choose the first reference spec/dungeon | user |
+| O5 | Review design package revision 2 and choose the first reference spec/dungeon | user |
+| O6 | `reference_player` collects party-wide DamageDone/Healing while calling itself a focus profile — **not recommended for a large corpus** until the focus-filter benchmark runs | coordinator |
 
 ---
 
-## The limit that no engineering removes
+## What the current corpus can and cannot support
 
-94 runs is roughly 470 player-slots spread across every spec and every dungeon
-collected, over 1.5 days. **No cohort question in the expanded brief is
-answerable from it.** The architecture can be built and tested now; the numbers
-cannot be produced yet. Collection is the long pole and should run in parallel
-with every phase from here.
+Not a single threshold — it depends on which unit is independent for the claim.
+
+| Claim | Independent unit | 94-run corpus |
+| --- | --- | --- |
+| this NPC casts ability X | observation | **supported** |
+| its recast interval is 2.97-4.93 s | NPC instance | **supported** — 12 copies |
+| this pack sits at this route position | pull | likely supported |
+| this mechanic targets non-tanks ~30% | cast | supported for common abilities |
+| Holy Priests press Apotheosis here | **player** | not supported |
+| Apex outperforms non-Apex | player, matched | not supported |
+
+Enemy-behaviour claims are cheap — hundreds of independent NPC instances per
+run. Player-behaviour claims are expensive: at most five people per run, often
+the same people across a report. Collection is the long pole for the second kind
+only, and it should run in parallel with every phase from here.
 
 ---
 
@@ -129,6 +141,12 @@ with every phase from here.
 | D13 | `DamageDone` collected party-wide, not focus-only | collecting one player of five means every question about the other four needs the run fetched again |
 | D14 | Identity scheme versioned and pinned by test | changing the salt renames every player in every corpus |
 | D15 | Analytical projection designed now, built on a measured trigger | at 4.97 M events SQLite is not the bottleneck; tuning for the wrong shape is worse than waiting |
+| D16 | Derived analysis lives in a **separate, disposable database** | "Layer 2 never writes to Layer 1" has to be physical or it is not true |
+| D17 | Build identity is **five separable dimensions**, not one hash | a composite hash made item level a talent variable and would have reported N=1 for configurations dozens of players ran |
+| D18 | State fields carry age and a staleness horizon, not just a tag | HP seen 40 ms ago and 8 s ago must not look equally trustworthy |
+| D19 | Cohorts have both dynamic definitions and **immutable evaluations** | "who matches now" and "who produced this number" are different questions; only the second is reproducible |
+| D20 | Every statistic reports **seven counts plus concentration** | N=100,000 states from ten players is a lie of composition |
+| D21 | Projection determinism asserted on a **logical fingerprint**, not bytes | byte-identity pins pyarrow forever and fails on dependency bumps with no row changed |
 
 ---
 

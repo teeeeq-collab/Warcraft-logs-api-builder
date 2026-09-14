@@ -51,6 +51,33 @@ the largest dimension table.
 
 ### Documentation
 
+**Design package revision 2**, reconciling the four documents against the
+architecture review's 17 amendments. `ARCHITECTURE_REVIEW_RESPONSES.md` records
+a response to each: 16 agree, 0 disagree, and three corrections to errors of
+mine that the review caught.
+
+The three that were defects rather than refinements:
+
+- **The layer boundary was a convention, not a fact.** Revision 1 said Layer 2
+  never writes to Layer 1 and then put four derived tables in the ingest
+  database. The analytical store is now a separate database file with its own
+  migration sequence and version, attached read-only for derivation.
+- **Build identity hashed talents and gear together**, which made item level a
+  talent variable. Two players with identical talents at ilvl 681 and 684 became
+  different builds, so a cohort query would have reported N=1 for a
+  configuration dozens of players ran. Replaced by five separable dimensions.
+- **Byte-identical Parquet was required.** Parquet embeds writer version and
+  row-group layout, so that would have pinned pyarrow forever and failed a
+  correctness gate on a dependency bump with no row changed. Determinism is now
+  asserted on a logical fingerprint computed without reference to the file
+  format.
+
+Also retracted: the claim that numbers from the 94-run corpus would be
+"statistically meaningless". Evidence quality depends on the claim. Recast
+intervals have NPC instances as their independent unit and are supported today;
+player-behaviour claims have people as theirs and are not. Every statistic now
+reports seven counts plus concentration rather than a single N.
+
 Four design documents answering the expanded architecture brief:
 `SHIFU_ARCHITECTURE_PLAN.md`, `ANALYTICAL_DATA_MODEL.md`,
 `SCL_EXPERIMENT_PLAN.md`, `IMPLEMENTATION_PHASES.md`. All are proposals; none

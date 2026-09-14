@@ -1,8 +1,13 @@
 # Shifu Architecture Plan
 
-**Status:** proposal for review. Nothing in this document has been built except
-the two items marked **DONE**, which were small enough that the master brief
-authorised them as immediate work (§68).
+**Status:** proposal, **revision 2** — incorporates the architecture review.
+Nothing here has been built except the items marked **DONE**, which the master
+brief authorised as immediate work (§68).
+
+Per-amendment responses, with the reasoning for each change, are in
+[`ARCHITECTURE_REVIEW_RESPONSES.md`](ARCHITECTURE_REVIEW_RESPONSES.md). Six
+amendments found real defects; three of those were mine and are corrected here
+rather than quietly patched.
 
 **Companion documents:**
 [`ANALYTICAL_DATA_MODEL.md`](ANALYTICAL_DATA_MODEL.md) (schemas),
@@ -29,18 +34,25 @@ anything. Everything else is additive.
 ║ LAYER 1 — COLLECTION          EXISTS, PRESERVED             ║
 ║ auth · rawcache · client · ratelimit · paginate · schema    ║
 ║ normalize · pullassign · collect · dedupe · validate        ║
-║ SQLite (migrations 001-004) · run_stream_coverage           ║
+║                                                             ║
+║ STORE: data/db/<corpus>.sqlite      schema_version 4        ║
+║ runs · pulls · events · coverage · actors · abilities       ║
+║ + combatant_info  (NEW, migration 005 — transcription only) ║
 ╚══════════════════════════════╪══════════════════════════════╝
-                               │  canonical runs only
+                               │  read-only ATTACH
+                               │  derivation only, never writes back
 ╔══════════════════════════════╪══════════════════════════════╗
 ║ LAYER 2 — ANALYSIS            NEW                           ║
-║ repository/  query boundary over SQLite                    ║
-║ builds/      CombatantInfo → player_build_snapshots         ║
-║ actions/     canonical action mapping (paired abilities)    ║
-║ archetypes/  pull identity beyond the two signatures        ║
-║ state/       State(t) reconstruction, observability-tagged  ║
-║ cohorts/     matched comparison sets                        ║
-║ projection/  Parquet + DuckDB, derived and rebuildable      ║
+║ repository/  query boundary, coverage- and dedupe-aware     ║
+║ builds/      separable build dimensions                     ║
+║ actions/     canonical action mapping                       ║
+║ archetypes/  pull identity, later pack decomposition        ║
+║ state/       State(t), per-field observability + staleness  ║
+║ cohorts/     definitions AND immutable evaluations          ║
+║                                                             ║
+║ STORE: data/analytics/<corpus>.analysis.sqlite              ║
+║        analytics_schema_version 1 — DISPOSABLE              ║
+║ then:  data/analytics/parquet/  — DISPOSABLE                ║
 ╚══════════════════════════════╪══════════════════════════════╝
                                │
 ╔══════════════════════════════╪══════════════════════════════╗
@@ -51,9 +63,35 @@ anything. Everything else is additive.
 ╚═════════════════════════════════════════════════════════════╝
 ```
 
-The one-way arrow matters. Layer 2 reads Layer 1 and never writes to it. Layer 3
-reads Layer 2 and never queries SQLite directly. That is what makes the whole
-derived stack disposable: delete `data/analytics/` and it rebuilds.
+### The boundary is physical, not a convention
+
+Revision 1 asserted that Layer 2 never writes to Layer 1 and then put four
+derived tables in the ingest database. Both could not be true. **The analytical
+store is now a separate database file** with its own migration directory
+(`migrations/analytics/`), its own version constant, and its own lifecycle.
+Delete it and you lose compute, nothing else.
+
+The test for which store anything belongs in:
+
+> Could a future version of this code change what an existing row *means*,
+> without any new data from the API?
+
+No → transcription → ingest store. Yes → a model → analysis store.
+
+That line runs straight through the build work, which is why it is split:
+mapping CombatantInfo's fields into columns is transcription and stays in Layer
+1; deciding what constitutes "a build" is a model and moves to Layer 2. Keeping
+the whole thing in Layer 1 would mean every build-model revision needed a
+migration against the canonical corpus — exactly the coupling the boundary
+exists to prevent.
+
+**A constraint worth naming:** SQLite cannot enforce foreign keys across attached
+databases, so an analytical `run_id` cannot reference `dungeon_runs`. The
+replacement is stronger for this purpose — every analytical row records the
+**corpus fingerprint** it was derived from, and a `verify` pass checks integrity
+on demand. An FK proves the run exists; a fingerprint proves the run exists *and
+has not been recollected since this row was derived*, which is the failure that
+would actually corrupt a conclusion.
 
 ---
 
@@ -191,106 +229,178 @@ being a stylistic preference:
 Streaming matters: `get_pull_events` on a large corpus must yield batches, never
 materialise millions of rows. SQLite cursors do this natively.
 
-### 4.2 Player build snapshots (brief §6)
+### 4.2 CombatantInfo: normalization, then build dimensions (brief §6)
 
-> **Component** new `builds/`; `normalize.py` unchanged
+> **Component** `normalize.py` (extend), new `builds/` in Layer 2
 > **Disposition** extend
-> **Schema** `player_build_snapshots`, `run_player_builds`; raw JSON retained
-> **Migration** `005_player_builds.sql`
-> **Tests** known CombatantInfo fixture → expected snapshot; identical builds dedupe; changed build stays distinct
+> **Schema** `combatant_info` (ingest, migration 005); five build dimension tables + `run_player_config` (analysis)
+> **Migration** ingest 005; analytics 001
+> **Tests** known fixture → known columns; identical talents dedupe regardless of gear; a respec stays distinct
 > **Compatibility** additive; `events.extra` keeps the raw payload
 > **Existing corpus** 460 CombatantInfo events across 94 runs, parseable now
-> **Backfill** **yes, offline, zero API cost** — the events are already stored
+> **Backfill** **yes, offline, zero API cost**
 
-This is the highest-value schema extension and the cheapest. CombatantInfo is
-five events per fight, ~36 KB, 2 points — the best value in the API — and it
-carries `talents`, `talentTree`, `gear`, `specID`, `auras`, `itemLevel` and every
-stat. It is currently collected and then left entirely inside `events.extra` as
-JSON: no columns, no build table, no index. "Every Mistweaver running Apex"
-means a JSON extraction across millions of rows.
+The highest-value schema extension and the cheapest: CombatantInfo is five events
+per fight, ~36 KB, 2 points — the best value in the API — carrying `talents`,
+`talentTree`, `gear`, `specID`, `auras`, `itemLevel` and every stat. It is
+currently collected and left entirely inside `events.extra` as JSON.
 
-The parser is a derived layer with its own version, so reinterpreting a field
-whose meaning was not understood at ingest costs a re-derivation, not a
-re-collection. **Hero-talent semantics stay explicitly unknown** until an
-external source establishes them (§6 below).
+**Revision 2 splits it in two, and splits the build itself into dimensions.**
+
+Revision 1 hashed talents and gear into one `build_id`. That made **item level a
+talent variable**: two Mistweavers with identical talents and hero talents at
+ilvl 681 and 684 became different builds. Over a few hundred runs, a cohort query
+for "Apex Mistweavers" would have returned a scatter of one-member builds and
+reported `N=1` for a configuration dozens of players ran. Not a performance
+problem — a confident statistic with the wrong denominator.
+
+Five independent dimensions now, plus an optional composite: talent loadout,
+hero talent, equipment snapshot, trinket configuration, stat snapshot. Each
+question becomes one join on one dimension — Apex vs no-Apex on `hero_talent_id`,
+same talents regardless of gear on `talent_hash` alone. Item level is a column,
+never part of the equipment hash. Trinkets are an unordered pair, because which
+one occupies slot 13 is arbitrary.
+
+**Hero talents stay `unknown`** until external metadata establishes them, and a
+cohort filtered on one refuses to run while that is true rather than returning
+whichever rows happen to be populated.
+
+**A limitation stated rather than implied:** CombatantInfo is a snapshot at fight
+start, so gear swapped mid-dungeon is invisible. Every equipment and stat row
+means "as at the start of the run".
 
 ### 4.3 Canonical action mapping (brief §28)
 
-> **Component** new `actions/`; `validate.py::paired_abilities` is the evidence source
+> **Component** new `actions/` in Layer 2; `validate.py::paired_abilities` is the evidence source
 > **Disposition** extend; raw events untouched
-> **Schema** `canonical_actions`, `action_ability_map`
-> **Migration** `006_canonical_actions.sql`
+> **Schema** `canonical_actions`, `action_ability_map` (analysis, migration 002)
+> **Migration** analytics 002 — **no ingest migration**
 > **Tests** a 4:1 paired ability counts once as an action and four times as events
-> **Compatibility** additive; nothing reads it until analysis does
-> **Existing corpus** mapping rows are derived; no run changes
-> **Backfill** n/a — derived from events already present
+> **Compatibility** additive
+> **Existing corpus** derived; no run changes
+> **Backfill** yes, offline
 
-The project already detects ability pairs that fire together and are plausibly
-one game action. Nothing stops a future analysis double-counting them. The
-mapping layer is versioned, records provenance and confidence per mapping,
-allows manual override, and **never merges on name alone**. Unmapped abilities
-stay separate — the default is "these are two things" and merging requires
-evidence.
+The project already detects ability pairs that fire together. Nothing stops a
+future analysis double-counting them. The mapping is versioned, records
+provenance and confidence, allows manual override, and **never merges on name
+alone**. Default is separate; merging is a claim carrying its evidence.
 
-### 4.4 Pull archetypes (brief §29)
+### 4.4 Pull archetypes, and later pack decomposition (brief §29)
 
-> **Component** new `archetypes/`; `pulls.species_signature` / `composition_signature` preserved
+> **Component** new `archetypes/` in Layer 2; the two existing signatures preserved
 > **Disposition** extend
-> **Schema** `pull_archetypes`, `pull_archetype_members`
-> **Migration** `007_pull_archetypes.sql`
-> **Tests** the two existing signatures keep their exact behaviour; an overpull joins the archetype its species match implies
+> **Schema** `pull_archetypes`, `pull_archetype_members` (analysis, migration 003)
+> **Migration** analytics 003
+> **Tests** the two existing signatures keep exact behaviour; an overpull joins the archetype its species imply
 > **Compatibility** additive
 > **Existing corpus** derivable now
 > **Backfill** yes, offline
 
-Both signatures exist and are indexed. What is missing is the third level: a
-pull a tank chained, overpulled or partly skipped is *semantically the same
-pull* with a different signature. **Interpretable features first** — species,
-counts, map coordinates, sequence position, neighbours, duration. Clustering is
-evaluated only after those are measured, and only if it adds something they
-cannot.
+`composition_signature` (exact) and `species_signature` (species-equivalent) exist
+and are indexed. The new work is the third level: a pull a tank chained,
+overpulled or partly skipped is semantically the same pull with a different
+signature. **Interpretable features first** — species overlap, count difference,
+map coordinates, sequence position, neighbours, duration. Clustering is evaluated
+only afterwards, and only if it beats them.
+
+**Pack decomposition** is the eventual target: `Pack A + Pack B (+ stray C)`
+rather than "a fuzzy variant of archetype X". It is what players actually ask
+about when they ask whether two packs can be combined. It is a latent-structure
+problem — observed pulls are unions of unobserved packs — and recovering the
+parts needs the *combinations* to vary across many routes and groups, which makes
+it the most sample-hungry item in this package. The archetype table carries a
+`components` column from the start so it never needs a migration, and it is
+scheduled for nothing.
 
 ### 4.5 Gameplay state reconstruction (brief §30)
 
-> **Component** new `state/`
+> **Component** new `state/` in Layer 2
 > **Disposition** extend
-> **Schema** `gameplay_states`, `state_actions`, `state_outcomes` (see data model)
-> **Migration** `008_gameplay_state.sql`
-> **Tests** a hand-authored 20-event timeline reconstructs a known state exactly
+> **Schema** `gameplay_states`, `state_actions`, `state_outcomes` (analysis, migration 004)
+> **Migration** analytics 004
+> **Tests** a hand-authored 20-event timeline reconstructs a known state exactly; a stale field degrades on its horizon; a truncated horizon is marked
 > **Compatibility** additive
-> **Existing corpus** partially reconstructible — depends per-field on which streams each run collected
+> **Existing corpus** partially reconstructible; bounded per-field by stream coverage
 > **Backfill** yes for collected streams; **no** for streams never requested
 
-This is the centre of Shifu and the place where honesty about observability
-decides whether the whole thing is trustworthy. Every field in a reconstructed
-state carries one of four tags:
+The centre of Shifu, and where honesty about observability decides whether any of
+it is trustworthy.
 
-| Tag | Meaning | Example |
-|---|---|---|
-| `observed` | present in an event | `amount` on a damage event |
-| `derived` | computed from observed values by a documented rule | party HP distribution at *t* from the last HP seen per player |
-| `inferred` | a model, with stated assumptions | which enemy a player is attacking |
-| `unknown` | not establishable from this corpus | cooldown remaining without ability metadata |
+**Revision 2 replaces the four-way tag with a per-field record.** Four tags were
+necessary and insufficient: HP last seen 40 ms ago and HP last seen 8 s ago were
+both "observed", and only one is worth anything. Each field now carries value,
+status, `observed_at_ms`, `age_ms`, method, model version and confidence.
 
-`unknown` must be a first-class value that survives into exports. A state with
-six unknowns is useful; a state with six silently-defaulted zeros is poison.
+| Status | Meaning |
+|---|---|
+| `observed` | read from an event, within its staleness horizon |
+| `stale` | read from an event, past its horizon; `age_ms` says how far |
+| `derived` | computed from observed values by a documented rule |
+| `inferred` | a model; `method` names it, `confidence` where probabilistic |
+| `unknown` | not establishable from this corpus |
 
-### 4.6 Cohorts (brief §§35-36)
+Horizons live in configuration, per field kind, and degradation to `stale` is
+automatic — recording an age is not enough, because a consumer handed
+`age_ms: 8300` can ignore it and eventually one will. `null` horizons are a real
+category: an aura's state is known exactly between its apply and remove events,
+and calling that stale after two seconds would be wrong in the other direction.
 
-> **Component** new `cohorts/`
+**Outcomes support multiple horizons.** `state_id` alone as a primary key forced
+one window to be chosen before anyone knew which window answered the question;
+"did the player survive" differs at +1 s and +10 s. The key is now
+`(state_id, horizon_id)`, with fixed and semantic windows, and a horizon running
+past the end of available data is marked **truncated** rather than silently
+shortened. Every aggregate reports its truncation count — without it, "deaths
+within 10 s" is understated for every state near a pull boundary, and the bias
+points the same way every time.
+
+### 4.6 Cohorts, evaluations, and evidence depth (brief §§35-36)
+
+> **Component** new `cohorts/` in Layer 2
 > **Disposition** extend
-> **Schema** `cohort_definitions` (the filter set + version, not the members)
-> **Migration** `009_cohorts.sql`
-> **Tests** a cohort excludes runs lacking a required stream and says how many it excluded
+> **Schema** `cohort_definitions`, `cohort_evaluations`, `cohort_evaluation_members` (analysis, migration 005)
+> **Migration** analytics 005
+> **Tests** a cohort excludes runs lacking a required stream and says how many; an evaluation reproduces from its manifest; a concentrated distribution reports its concentration
 > **Compatibility** additive
-> **Existing corpus** definable; **not yet populatable at useful N** (see §7)
+> **Existing corpus** definable; populatable at useful N only for some claim classes (§7)
 > **Backfill** yes
 
-Cohort infrastructure is built now; the *definition* of "high-performing" is
-deliberately left out of the schema (§36). Storing a performance score as a
-column would bake a research judgement into the data format and make it
-un-revisable. Cohorts store their filters and their version; the judgement stays
-in the research layer where it can be argued with.
+**Definitions and evaluations are different objects.** A definition answers *who
+matches now*; an evaluation answers *exactly who produced this published number*.
+Only the second is reproducible, and revision 1 had only the first. An evaluation
+records the definition version, corpus fingerprint, model versions, timestamp,
+exclusions with reasons, and the **source set** — runs and players, never states,
+which are re-derivable from it and would otherwise produce a member list larger
+than the analysis it documents.
+
+**Every statistic reports evidence depth at every level**, never a single `N`:
+events, states, pulls, runs, players, reports, parties — plus which unit is
+independent for that claim class, and a **concentration** measure. A distribution
+where one player supplies 60% of observations is not a population distribution
+however large the event count, and printing `N=100,000` beside it would be a lie
+of composition rather than of arithmetic.
+
+No performance score exists anywhere in the schema. §36 is explicit: the
+definition of "high-performing" is a research judgement, and a column would make
+it unrevisable and invisible.
+
+### 4.6a Dedupe policy
+
+> **Component** `repository/`
+> **Disposition** extend
+> **Schema** none
+
+| Policy | `is_canonical IS NULL` | Use |
+|---|---|---|
+| `permissive` | allowed, reported | browsing, retrieval, debugging |
+| `strict` | **refused** — result marked `provisional`, export blocked | statistics, publication |
+
+**No default at the research boundary.** Every analytical entry point takes the
+policy as a required argument. Defaulting to `permissive` silently gives a
+statistics path the lax rule; defaulting to `strict` fails interactive queries for
+no reason. Making the caller state which kind of question they are asking is
+cheap, and guessing is how an undeduplicated corpus ends up underneath a
+published number — which is the live corpus's current state.
 
 ### 4.7 Analytical projection: Parquet + DuckDB (brief §7)
 
@@ -298,7 +408,7 @@ in the research layer where it can be argued with.
 > **Disposition** extend
 > **Schema** none in SQLite; Parquet files under `data/analytics/`
 > **Migration** none
-> **Tests** deterministic rebuild — same SQLite in, byte-identical partition out; a dropped projection rebuilds
+> **Tests** deterministic rebuild — same source in, identical **logical fingerprint** out; a dropped projection rebuilds
 > **Compatibility** additive; nothing depends on it existing
 > **Existing corpus** projectable
 > **Backfill** yes — it is by definition derived
@@ -322,6 +432,20 @@ and the raw cache remain the authoritative provenance. `pyarrow` is already an
 optional extra; DuckDB would be a second one. Neither may become a hard
 dependency of collection, and the offline test suite must keep passing without
 either installed.
+
+**Determinism is semantic, not byte-level.** Revision 1 required byte-identical
+rebuilds, which was brittle and would have caused real damage: Parquet embeds
+writer version, codec settings, row-group boundaries and dictionary page layout,
+so a routine `pyarrow` bump would fail a correctness gate with no row changed —
+and a gate that fails for non-reasons is a gate people learn to ignore.
+
+Required instead: identical logical rows, identical ordering under a declared
+total order, identical partitioning, identical source manifest, and an identical
+**logical fingerprint** — a hash over canonically serialised, sorted,
+explicitly-typed rows, computed without reference to the file format. The
+fingerprint is what the test asserts, and it is stable across writer versions
+because it never sees the writer. Byte-identity under a pinned environment stays
+a warning: worth noticing, not worth failing.
 
 ---
 
@@ -411,7 +535,21 @@ consistently refused to do and this plan does not start.
 - **ML clustering of pull archetypes** (§29) before interpretable features are
   measured. Same for embeddings in similarity search (§37).
 
-### 6.4 Premature
+### 6.4 Reserved, no implementation now
+
+**Export-scoped pseudonyms** (review amendment 16). Internal pseudonyms are
+stable by design so longitudinal analysis works, and that same stability makes
+them unsafe to publish: two snapshots sharing an ID are trivially correlated.
+
+An export pseudonym **cannot** derive from `IDENTITY_SALT` — that salt is public
+in this repository, so anyone could recompute the mapping. It must be
+`HMAC(random_per_export_salt, internal_pseudonym)`, with the salt generated at
+export time and **not included in the export**. Whether the operator retains it
+privately is a real choice with a real consequence: keep it and you can
+re-identify your own snapshot later; discard it and the mapping is gone for
+everyone, including you. The manifest records which was done, never the salt.
+
+### 6.5 Premature
 
 - **MCP, HTTP API, hosting, accounts, payments** — §62 already rules these out.
 - **Standardizing `SCL/1`** — §23's gate is not met. Everything stays
@@ -422,22 +560,40 @@ consistently refused to do and this plan does not start.
 
 ---
 
-## 7. The sample-size problem, stated plainly
+## 7. Evidence depth, and a retraction
 
-This is the most important limitation in the document and it is not a
-software problem.
+Revision 1 said numbers from the current 94-run corpus would be "statistically
+meaningless". **That was wrong, and wrong in a way that would have hidden real
+evidence.** Evidence quality depends on the claim and on which unit is
+independent for it — not on a single corpus-wide threshold.
 
-The corpus is **94 runs from 10 reports spanning 1.5 days**, never deduplicated,
-so the analysable count is an upper bound. The brief's north star (§64) is
-"hundreds of Holy Priest Murder Row runs across low, medium and high keys".
+Some claims are well supported by the corpus that exists today:
 
-94 runs contain, at most, 94 × 5 = 470 player-slots spread across every spec and
-every dungeon collected. One spec in one dungeon in one key bracket is a handful
-of observations. **No cohort comparison in this brief is answerable from the
-current corpus**, and the architecture cannot fix that — only collection can.
+| Claim | Independent unit | Current corpus |
+|---|---|---|
+| "This NPC casts ability X" | one observation | **supported now** |
+| "Its recast interval is 2.97-4.93 s" | NPC instance | **supported now** — 12 independent copies |
+| "This pack appears at this route position" | pull | **likely supported** |
+| "This mechanic targets non-tanks ~30% of the time" | cast | supported for common abilities |
+| "Holy Priests press Apotheosis in this window" | **player** | not supported — too few distinct players |
+| "Apex outperforms non-Apex" | player, matched | not supported |
 
-What the measurements say about closing the gap, using the corpus's own numbers
-(13.19 points/run measured; 3,600 points/hour documented; ~23 MB/run):
+The pattern: **enemy-behaviour claims are cheap and player-behaviour claims are
+expensive.** The independent unit for the first is an NPC instance — hundreds per
+run. For the second it is a person, of whom there are at most five per run, often
+the same people across a report. 94 runs is at most 470 player-slots spread over
+every spec and dungeon collected, and the effective number of distinct players is
+smaller still.
+
+So there is **no global minimum run count** anywhere in this design. Each claim
+declares its independent unit, reports the count of that unit, and reports
+concentration — the largest share contributed by one player and by one run — so
+that a distribution dominated by one person is visible as such.
+
+### What it costs to close the gap
+
+Using the corpus's own measurements (13.19 points/run; 3,600 points/hour
+documented; ~23 MB/run):
 
 | Corpus | Points | Quota-limited time | Storage |
 |---|---|---|---|
@@ -450,13 +606,60 @@ Quota is not the binding constraint — wall clock is, and the per-run worked
 seconds should be read from a fresh `validate` rather than estimated here.
 Storage is not a constraint; the operator has confirmed capacity.
 
-**The implication for sequencing:** Phases 0-4 are worth doing now because they
-are infrastructure and they are testable against the simulator and the existing
-94 runs. Phases 5-7 produce *numbers*, and numbers from 94 runs would be
-statistically meaningless while looking authoritative — which is the single
-worst outcome this project could produce. Collection should run in parallel with
-Phases 1-4, so that when the analytical engine is ready there is something for
-it to be right about.
+**Implication for sequencing.** Phases 0-4 are infrastructure and are testable
+today against the simulator and the existing corpus. Phase 5 onward produces
+numbers, and which of those numbers are trustworthy is decided per claim by the
+evidence block — not by waiting for a threshold. Collection should run in
+parallel throughout, because player-behaviour claims are the ones that need it
+and they are the ones the product is built on.
+
+---
+
+## 7a. `reference_player` contradicts its own purpose
+
+> **Component** `config/sampling.yml`
+> **Disposition** replace (the profile's stream list)
+> **Schema** none — `run_stream_coverage` already keys on `(run_id, data_type, hostility, source_id, target_id)`
+> **Migration** none
+> **Tests** the benchmark's measurements, then profile tests
+> **Existing corpus** unaffected; it was collected under `mechanics`
+> **Backfill** n/a
+
+The profile as configured **is not a focus-player profile.** It collects
+`DamageDone` and `Healing` party-wide *and* defines focus streams, so the focus
+narrowing saves nothing on the two most expensive streams in the API.
+`DamageDone` alone is 89,703 events/run — 1.65× the entire current corpus, per
+run.
+
+The reasoning behind that choice (decision D13: collecting one player of five
+means any question about the other four needs the run re-fetched) is sound, but
+it is the reasoning for a *different profile*. Applied inside `reference_player`
+it produced `mechanics_research` plus everything, under a name promising the
+opposite. The reasoning splits into two profiles instead of contradicting itself
+inside one:
+
+- `mechanics_research` — party-wide, ask-anything-later, expensive per run.
+- `reference_player` — rich environment and party context, maximal telemetry for
+  **one** player. Party-wide `DamageDone`/`Healing` leave it.
+
+**Measurement before the profile is finalised.** The benchmark must answer,
+against the live API:
+
+| Question | Why it is not answerable from here |
+|---|---|
+| Does `sourceID` narrowing reduce *points*, or only rows? | Cost is per page; a narrowed stream may cost the same if the server filters after paging |
+| Does the API accept `sourceID` and `targetID` together? | Unverified — the template carries both, no live request has used both |
+| What does `Buffs` + `sourceID` return? | **Buffs the focus player applied** — not buffs *on* them, which need `targetID`. Different data; the profile currently assumes one word covers both |
+| What does `Healing` + `targetID` return? | Healing *received* — needed to tell "this player was being kept alive" from "this player was fine" |
+| Is `DamageTaken` + `targetID` equivalent to `DamageDone` + `targetID`? | Unverified; different `EventDataType` values that may overlap |
+
+That last group is why `focus_event_types` cannot remain a flat list: a focus
+stream must say *which* narrowing it wants, and a healer's useful focus set is
+not a DPS's. **Role-specific focus sets** are proposed, gated on the benchmark.
+
+Bookkeeping cost: zero. The coverage manifest's unique index already
+distinguishes a source-narrowed stream from a target-narrowed one. It was built
+for this.
 
 ---
 
@@ -486,14 +689,15 @@ No phase is complete until its gate closes. Gates are properties, not opinions.
 | Gate | Phase | Closes when |
 |---|---|---|
 | **P0** | 0 | Focus resolution proven by test · identity scheme pinned · `dedupe` run on the live corpus · fresh `validate` · stale docs corrected |
-| **P1** | 1 | Encode→decode round-trips a real pull exactly · token costs measured with a named tokenizer, never estimated |
-| **P2** | 2 | Every analytical read goes through the repository · a coverage-missing stream cannot produce a zero · `packs` unchanged in output |
-| **P3** | 3 | A known CombatantInfo fixture produces a known build · identical builds dedupe · hero-talent semantics still `unknown` |
-| **P4** | 4 | Projection rebuilds deterministically · deleting it loses nothing · offline tests pass without pyarrow or DuckDB |
-| **P5** | 5 | Every statistic carries N, coverage and provenance · a paired ability is not double-counted |
-| **P6** | 6 | A hand-authored timeline reconstructs a known state · every field carries observability · `unknown` survives export |
-| **P7** | 7 | Every cohort reports what it excluded and why |
+| **P1** | 1 | Track A encode→decode round-trips a real pull exactly · a retrieved chunk decodes standalone · token costs measured with a named tokenizer, never estimated · Track B evaluated on its own metrics |
+| **P2** | 2 | Every analytical read goes through the repository · a coverage-missing stream cannot produce a zero · dedupe policy is a required argument · `packs` unchanged in output |
+| **P3** | 3 | A known CombatantInfo fixture produces known columns · identical talents dedupe regardless of gear · hero-talent status still `unknown` |
+| **P4** | 4 | Projection rebuilds to an identical logical fingerprint · deleting it loses nothing · offline tests pass without pyarrow or DuckDB |
+| **P5** | 5 | Every statistic carries its evidence block and concentration · a paired ability is not double-counted · no statistic from runs lacking its stream |
+| **P6** | 6 | A hand-authored timeline reconstructs a known state · every field carries status and age · a stale field degrades on its horizon · a truncated outcome horizon is marked |
+| **P7** | 7 | Every cohort reports what it excluded and why · an evaluation reproduces from its manifest alone |
 | **P8** | 8 | An export is reproducible from its manifest alone |
+| **PB** | any | The analytical store can be deleted and rebuilt with no change to the ingest database |
 
 ---
 

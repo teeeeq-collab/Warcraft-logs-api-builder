@@ -293,8 +293,9 @@ in `tests/fixtures/` when you run `wclmplus recon`.
 | `ANALYTICAL_DATA_MODEL.md` | Schemas for builds, canonical actions, archetypes, state, cohorts, projection |
 | `SCL_EXPERIMENT_PLAN.md` | Compression candidates, metrics, comprehension benchmark, standardization gate |
 | `IMPLEMENTATION_PHASES.md` | Ordering, acceptance gates, effort, dependencies |
+| `ARCHITECTURE_REVIEW_RESPONSES.md` | Per-amendment responses from the first review round |
 
-These four are **proposals awaiting review**. Nothing in them is built.
+These are **proposals awaiting review** at revision 2. Nothing in them is built.
 
 ---
 

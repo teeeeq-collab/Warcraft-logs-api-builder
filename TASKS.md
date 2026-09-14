@@ -81,7 +81,11 @@ expanded brief; the breakdown lives in
 | --- | --- | --- | --- | --- |
 | P3-1 | Current-state technical audit | coordinator | DONE | 40 parts, evidence-classed, inspection only |
 | P3-2 | Design package | coordinator | DONE | four documents, every change mapped to an existing component |
-| P3-3 | **Review the design package** | user | **TODO** | the three questions at the end of `IMPLEMENTATION_PHASES.md` answered |
+| P3-3 | Review the design package (round 1) | user | DONE | 17 amendments returned |
+| P3-3b | Reconcile the package against the amendments | coordinator | DONE | per-amendment response; four documents revised to revision 2 |
+| P3-3c | **Review revision 2** | user | **TODO** | the four questions at the end of `IMPLEMENTATION_PHASES.md` answered |
+| P3-7 | Benchmark focus filtering (sourceID/targetID) | coordinator | TODO | points vs rows; both filters together; applied-by vs active-on for Buffs; per-role focus sets |
+| P3-8 | Split `reference_player` from `mechanics_research` | coordinator | BLOCKED | depends on P3-7 |
 | P3-4 | Repository/query layer | coordinator | TODO | canonical by default; coverage-checked; `packs` SQL relocated |
 | P3-5 | Build snapshots from CombatantInfo | coordinator | TODO | known fixture → known build; identical builds dedupe |
 | P3-6 | Compression experiment framework | coordinator | TODO | encoders **and** decoders; measured tokens, never estimated |

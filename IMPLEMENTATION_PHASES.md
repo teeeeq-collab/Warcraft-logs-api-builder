@@ -5,9 +5,11 @@ Ordering, acceptance and effort for the work proposed in
 [`ANALYTICAL_DATA_MODEL.md`](ANALYTICAL_DATA_MODEL.md) and
 [`SCL_EXPERIMENT_PLAN.md`](SCL_EXPERIMENT_PLAN.md).
 
-Per brief §68 the design package stops here and waits for review before any
-large architectural work begins. Phase 0 items marked **DONE** were authorised
-as small critical fixes.
+**Revision 2** — incorporates the architecture review; per-amendment reasoning is
+in [`ARCHITECTURE_REVIEW_RESPONSES.md`](ARCHITECTURE_REVIEW_RESPONSES.md).
+
+The package stops here and waits for review again before large implementation
+begins. Phase 0 items marked **DONE** were authorised as small critical fixes.
 
 ---
 
@@ -37,121 +39,181 @@ fresh validation report · no doc asserting a number the corpus contradicts.
 
 ---
 
-## Phase 1 — compression experiment framework
+## Phases 1 and 2 — run in parallel
 
-Independent of every other phase. It reads the corpus and writes nothing to it,
-so it can run in parallel with collection and with Phase 2.
+They share no files and no schema. P1 reads the corpus and writes only to
+`data/exports/scl/`; P2 builds a read boundary over it. Collection runs
+alongside both.
 
-1.1 Select and freeze 20-50 fixture pulls covering the §20 case list, grouped by
-stream coverage so format comparisons are not secretly coverage comparisons.
+### Phase 1 — compression experiments
+
+1.1 Select and freeze 20-50 fixture pulls covering the §20 case list, **grouped
+by stream coverage** so format comparisons are not secretly coverage
+comparisons.
 1.2 Measure redundancy: `P(enemy melee target = tank)` by dungeon, species, pull
-and bracket; ability-vocabulary size per spec and per species; event-type
-distribution.
-1.3 Implement candidates A-F, each with an encoder **and** a decoder.
-1.4 Measure size and tokens with a named tokenizer; label proxy counts as proxy.
-1.5 Build comprehension fixtures with expected answers computed from the
-database.
-1.6 Write `SCL_BENCHMARK.md` + `scl_benchmark.json`.
+and bracket; ability vocabulary per spec and per species; event-type
+distribution. These feed the suppression gate; they are not themselves the gate.
+1.3 Build **three dictionary scopes** — dungeon/spec, run, pull — and test
+`P1-P5` against `T/H/D1/D2/D3`.
+1.4 Implement Track A candidates (A-E, G) with encoders **and** decoders, and
+Track B (F).
+1.5 Test legend placement: once, every N, block-local, chunk-local. **A retrieved
+chunk must decode standalone** — this is a retrieval requirement, not a size
+preference, and it excludes repeat opcodes that cross chunk boundaries.
+1.6 Measure size and tokens with a named tokenizer; label proxy counts as proxy.
+1.7 Comprehension fixtures with expected answers computed from the database,
+tested at 10, 100 and 1,000 events.
+1.8 Write `SCL_BENCHMARK.md` + `scl_benchmark.json` — **two tables, one per
+track**.
 
-**Do not standardize.** Output is a table and a recommendation.
+**Do not standardize.** Output is two tables and a recommendation.
 
-**Gate P1:** every candidate round-trips a real pull exactly (or documents its
-loss exactly) · no token count is an estimate.
+**Gate P1:** every Track A candidate round-trips a real pull exactly (or
+documents its loss exactly) · a retrieved chunk decodes standalone · no token
+count is an estimate · Track B judged on its own metrics, not tokens per event.
 
----
+### Phase 2 — query / repository layer
 
-## Phase 2 — query / repository layer
+Everything in Layer 2 is a client of this, and the audit found SQL spread across
+four modules. Adding six analytical modules onto that pattern would make the
+corpus's access rules unenforceable.
 
-Build this before anything else in Layer 2. Everything downstream is a client of
-it, and adding six analytical modules onto scattered SQL would make the corpus's
-access rules unenforceable.
-
-2.1 `repository/` with run, pull, event, player, build and mechanic access.
+2.1 `repository/` over the **ingest** store: runs, pulls, events, players,
+CombatantInfo, packs.
 2.2 **Canonical-by-default** filtering, with an explicit `include_duplicates`.
-2.3 **Coverage-checked reads**: a stream query takes the stream it needs and
-excludes runs that never requested it, returning the exclusion count.
-2.4 Streaming/batched iteration — never materialise millions of rows.
-2.5 Move `packs` SQL out of `cli.py`; output stays identical.
+2.3 **Dedupe policy as a required argument** on every analytical entry point —
+no default, so neither laxity nor strictness is acquired by accident.
+2.4 **Coverage-checked reads**: a stream query names the stream it needs,
+excludes runs that never requested it, and returns the exclusion count.
+2.5 Streaming/batched iteration — never materialise millions of rows.
+2.6 The **evidence block** (events/states/pulls/runs/players/reports/parties +
+independent unit + concentration) produced by the repository, so no analytical
+module has to remember to compute it.
+2.7 Analytical store scaffolding: `data/analytics/<corpus>.analysis.sqlite`, its
+own migration runner and version constant, read-only ATTACH to the ingest store,
+corpus fingerprinting, and `analytics verify`.
+2.8 Move `packs` SQL out of `cli.py`; output stays identical.
 
 **Gate P2:** no analytical read touches SQLite directly · a missing stream cannot
-produce a zero · `packs` byte-identical before and after.
+produce a zero · policy is never defaulted · the analytical store can be deleted
+and rebuilt with no change to the ingest database · `packs` byte-identical
+before and after.
 
 ---
 
-## Phase 3 — normalized build model
+## Phase 3 — CombatantInfo normalization and build dimensions
 
-Cheapest high-value schema work in the package: the data is already collected,
-the backfill is offline, and it unblocks every cohort question.
+Cheapest high-value work in the package: the data is already collected, the
+backfill is offline, and it unblocks every cohort question.
 
-3.1 CombatantInfo parser with its own version.
-3.2 Migration 005; deterministic `build_id`.
-3.3 Backfill the 460 existing CombatantInfo events — no API calls.
-3.4 `run_player_builds` linkage.
-3.5 Keep `hero_talent_status = 'unknown'`; a cohort filtered on hero talent
-refuses to run rather than returning the populated subset.
+3.1 **Ingest migration 005** — `combatant_info`, transcription only: columns
+mapped directly from the payload, raw JSON retained, no identity decisions.
+3.2 Backfill the 460 existing CombatantInfo events — **no API calls**.
+3.3 **Analytics migration 001** — the five separable dimensions (talent loadout,
+hero talent, equipment snapshot, trinket config, stat snapshot) plus
+`run_player_config`.
+3.4 Item level is a **column**, never part of the equipment hash. Trinkets are an
+**unordered** pair.
+3.5 `hero_talent.status` stays `unknown`; a cohort filtered on it **refuses to
+run** rather than returning the populated subset.
+3.6 Document that CombatantInfo is a fight-start snapshot, so gear swapped
+mid-run is invisible and every equipment row means "as at the start".
 
-**Gate P3:** known fixture → known build · identical builds dedupe · a respec
-stays two builds · raw payload retained.
+**Gate P3:** known fixture → known columns · identical talents dedupe regardless
+of gear · a respec stays two loadouts · raw payload retained · hero-talent status
+still `unknown`.
 
 ---
 
 ## Phase 4 — analytical projection
 
-**Build on the measured trigger, not on schedule** (architecture plan §4.7): a
-representative cross-run query exceeding ~30 s on SQLite, or ~50 M events.
-Neither holds today at 4.97 M events.
+**Build on the measured trigger, not on schedule:** a representative cross-run
+query exceeding ~30 s on SQLite, or ~50 M events. Neither holds today at 4.97 M.
 
-4.1 Parquet writer with the §6 partition layout.
+4.1 Parquet writer with the dungeon/epoch/stream partition layout.
 4.2 DuckDB query surface behind the same repository interface.
-4.3 Incremental projection, plus a full deterministic rebuild.
-4.4 Dictionary tables for actors, NPCs, abilities, items, builds, archetypes.
+4.3 Incremental projection, plus a full rebuild.
+4.4 Dictionary tables for actors, NPCs, abilities, items, talents, archetypes.
+4.5 **Logical fingerprint** — a hash over canonically serialised, sorted, typed
+rows, computed without reference to the file format.
 
-**Gate P4:** same input, same bytes · deleting `data/analytics/` loses nothing ·
-the offline suite passes with neither pyarrow nor DuckDB installed.
+**Gate P4:** same source in, identical logical fingerprint out · deleting
+`data/analytics/parquet/` loses nothing · the offline suite passes with neither
+pyarrow nor DuckDB installed.
+
+Byte-identity is **not** required. Parquet embeds writer version, codec settings
+and row-group boundaries, so pinning bytes would pin `pyarrow` forever and fail
+the gate on a dependency bump with no row changed. Byte-identity under a pinned
+environment stays a warning.
 
 ---
 
 ## Phase 5 — first empirical analysis
 
-**Blocked on corpus size, not on code.** See architecture plan §7: 94 runs cannot
-support a cohort claim about any spec in any dungeon. Building the machinery is
-fine; publishing numbers from it is not.
+**Not blocked wholesale on corpus size.** Which claims are supportable is decided
+per claim by the evidence block, not by a global threshold. Enemy-behaviour
+claims — recast intervals, target distributions, pack occurrence — have NPC
+instances and casts as their independent unit and are supportable now.
+Player-behaviour claims have *people* as their unit and are not.
 
-5.1 Mechanic model: first-cast timing, recast intervals and distributions,
-target distribution, per-pull and per-instance counts, damage distributions,
-interrupt and dispel relationships.
-5.2 Canonical action mapping (migration 006), from `paired_abilities` evidence.
-5.3 Pull archetypes (migration 007), interpretable features first.
-5.4 Every output carries N, coverage, run provenance, hotfix epoch, key bracket.
+5.1 Mechanic model: first-cast timing, recast intervals and distributions, target
+distribution, per-pull and per-instance counts, damage distributions, interrupt
+and dispel relationships.
+5.2 Canonical action mapping (**analytics migration 002**) from
+`paired_abilities` evidence. Default separate; merging carries its evidence.
+5.3 Pull archetypes (**analytics migration 003**), interpretable features first.
+The `components` column is present from the start so pack decomposition never
+needs a migration.
+5.4 Every output carries the **evidence block** — all seven counts, the declared
+independent unit, and concentration — plus coverage, provenance, hotfix epoch and
+key bracket.
 
-**Gate P5:** no statistic without N and coverage · a 4:1 paired ability is not
-counted as four actions · no statistic drawn from runs that never collected the
-stream it needs.
+**Gate P5:** no statistic without its evidence block · a 4:1 paired ability is not
+counted as four actions · no statistic from runs that never collected the stream
+it needs · a distribution dominated by one player says so.
 
 ---
 
 ## Phase 6 — gameplay state engine
 
-6.1 State schema (migration 008) with the four-way observability tag.
-6.2 Reconstruction from events, per player, per moment of interest.
-6.3 Action extraction and outcome windows — components, never a score.
-6.4 Cooldown availability stays `unknown` until external metadata exists.
+6.1 State schema (**analytics migration 004**) with the per-field metadata
+record: value, status, `observed_at_ms`, `age_ms`, method, model version,
+confidence.
+6.2 Staleness horizons in `config/state_horizons.yml`; degradation to `stale` is
+automatic. `null` horizons are a real category, not a missing value.
+6.3 `block_meta` for run-constant fields, so 30 fields do not carry 200 metadata
+keys per state.
+6.4 Reconstruction from events, per player, per moment of interest.
+6.5 Action extraction; outcomes keyed `(state_id, horizon_id)` across fixed and
+semantic windows, with `truncated` and `actual_window_ms`.
+6.6 Cooldown availability stays `unknown`; `inferred` with a stated method once
+casts and charges support it; `derived` only with external metadata.
 
 **Gate P6:** a hand-authored timeline reconstructs a known state exactly · every
-field carries observability · `unknown` survives into every export.
+field carries status and age · a field past its horizon degrades to `stale` · a
+horizon running past the data is marked truncated and counted in aggregates ·
+`unknown` survives into every export.
 
 ---
 
 ## Phase 7 — cohorts, sequences, similarity
 
-7.1 Cohort definitions (migration 009) with mandatory `required_streams`.
-7.2 Action sequences with their initial state and outcome.
-7.3 Interpretable similarity features with configurable weights; evaluate
-nearest-neighbour methods only after exact and feature matching are measured.
-7.4 Representative example retrieval with run/pull/time provenance.
+7.1 Cohort definitions **and immutable evaluations** (**analytics migration
+005**). A definition answers "who matches now"; an evaluation answers "who
+produced this published number".
+7.2 Evaluations store the **source set** — runs and players, never states, which
+are re-derivable and would otherwise exceed the analysis in size.
+7.3 `required_streams` is mandatory with no default; exclusions are recorded with
+reasons and counted.
+7.4 Action sequences with their initial state and outcome.
+7.5 Interpretable similarity features with configurable weights. Nearest-neighbour
+and clustering evaluated only after exact and feature matching are measured;
+embeddings only if they beat them.
+7.6 Representative example retrieval with run/pull/time provenance.
 
-**Gate P7:** every cohort reports what it excluded and why · no "user vs top
-parse" comparison exists anywhere in the code.
+**Gate P7:** every cohort reports what it excluded and why · an evaluation
+reproduces from its manifest alone · no "user vs top parse" comparison exists
+anywhere in the code.
 
 ---
 
@@ -179,19 +241,22 @@ rewriting the analysis.
 ## Dependencies
 
 ```
-P0 ──┬─> P2 ──> P3 ──> P5 ──> P6 ──> P7 ──> P8
-     │          │                      ^
-     ├─> P1 ────┴──────────────────────┘   (SCL feeds P8's timeline export)
-     │
-     └─> P4  (triggered by measurement, consumed by P5-P7)
+P0 ─┬──> P2 ──> P3 ──> P5 ──> P6 ──> P7 ──> P8
+    │           │                      ^
+    ├──> P1 ────┴──────────────────────┘   (Track A feeds P8's timeline export,
+    │      (parallel with P2)                Track B is downstream of P6)
+    │
+    └──> P4  (triggered by measurement, consumed by P5-P7)
 
-COLLECTION ──────────────────────────────> gates P5 onward on sample size
+COLLECTION ─────────────────────────────>  decides which P5+ claims are supportable
 ```
 
-P1 is genuinely independent — it can start today.
+P1 and P2 **run in parallel** — no shared files, no shared schema.
 P4 is triggered by a measurement, not by a predecessor.
-**Collection is the long pole for everything from P5 on, and no amount of
-engineering shortens it.** It should run in parallel from now.
+Nothing waits on an SCL standard: Track B's representation is downstream of the
+state engine, so freezing an event notation was never on the critical path.
+**Collection runs throughout.** It does not gate phases wholesale — it decides,
+per claim, which conclusions the evidence block will support.
 
 ---
 
@@ -201,27 +266,50 @@ Rough, and deliberately so. Each is one focused work session unless noted.
 
 | Phase | Size | Risk | Note |
 |---|---|---|---|
-| 0 | done, plus two operator commands | low | 0.7 blocked on external dates |
+| 0 | done, plus two operator commands | low | `hotfix_epochs` blocked on external dates |
 | 1 | large — 3-4 sessions | medium | the benchmark may reject the hypothesis, which is a result |
-| 2 | medium | low | mostly relocation of existing SQL |
+| 2 | medium-large | low | mostly relocation, plus the analytical store scaffolding |
 | 3 | medium | low | parser shape depends on live CombatantInfo, which is stored |
 | 4 | large | medium | new dependencies; must stay optional |
-| 5 | medium | **high** | risk is statistical, not technical: N |
-| 6 | large | high | observability tagging is where correctness lives |
+| 5 | medium | medium | risk is per-claim evidence depth, reported rather than assumed |
+| 6 | large | **high** | per-field observability and staleness are where correctness lives |
 | 7 | medium | high | cohort matching is easy to get subtly wrong |
 | 8 | medium | low | rendering over finished analysis |
+
+Phase 5's risk dropped from **high** in revision 1: the evidence block reports
+depth per claim instead of the design relying on a corpus-wide threshold that
+would have been wrong in both directions.
+
+---
+
+## Benchmark work that must precede the `reference_player` profile
+
+Not a phase — a prerequisite, and it needs the live API.
+
+| Measurement | Decides |
+|---|---|
+| Does `sourceID` narrowing reduce points or only rows? | whether focus narrowing saves anything at all |
+| Does the API accept `sourceID` and `targetID` together? | whether a focus set can ask for both directions |
+| `Buffs` + `sourceID` vs `Buffs` + `targetID` | applied-by vs active-on — different data under one word |
+| `Healing` + `targetID` | healing received, needed to separate "kept alive" from "fine" |
+| `DamageTaken` + `targetID` vs `DamageDone` + `targetID` | whether the two streams overlap |
+| Per-role focus sets | whether a healer's useful focus set differs from a DPS's |
+
+Until these land, `reference_player` keeps its current definition and is **not
+recommended for a large corpus**, because it collects party-wide `DamageDone`
+and `Healing` while calling itself a focus profile.
 
 ---
 
 ## What is being asked for at this gate
 
-Per §68, this package stops here. What would help most:
-
 1. **Which spec and dungeon does the reference corpus target first?** Depth beats
-   breadth for every question in the brief.
-2. **Phase 1 or Phase 2 first?** P1 is independent and answers a question nothing
-   else can. P2 unblocks the rest of the stack. Recommendation: **start P2**, run
-   collection alongside, and take P1 when there are enough fixtures to make the
-   benchmark representative.
-3. **Real patch dates for `hotfix_epochs.yml`** — five minutes of typing, large
-   effect on the correctness of every recurrence distribution.
+   breadth for every question in the brief, and player-behaviour claims need many
+   distinct *people*, not many runs.
+2. **P1 and P2 both start now?** They are independent. The alternative is P2
+   alone, which reaches a useful analytical layer sooner and leaves the format
+   question open longer.
+3. **Real patch dates for `hotfix_epochs.yml`** — minutes of typing, large effect
+   on the correctness of every recurrence distribution.
+4. **Does the benchmark run before more collection?** It is cheap (a handful of
+   reports) and it decides whether `reference_player` is worth collecting at all.
