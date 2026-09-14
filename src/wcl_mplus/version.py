@@ -10,6 +10,8 @@ import subprocess
 from functools import lru_cache
 from pathlib import Path
 
+from .sanitize import IDENTITY_SCHEME_VERSION, salt_fingerprint
+
 #: Software version. Bump on any behavioural change to collection.
 SOFTWARE_VERSION = "0.3.0"
 
@@ -21,7 +23,7 @@ NORMALIZER_VERSION = 2
 QUERY_VERSION = 5
 
 #: Database schema version; matches the highest applied migration.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @lru_cache(maxsize=1)
@@ -77,6 +79,8 @@ def provenance() -> dict[str, object]:
         "normalizer_version": NORMALIZER_VERSION,
         "query_version": QUERY_VERSION,
         "schema_version": SCHEMA_VERSION,
+        "identity_scheme_version": IDENTITY_SCHEME_VERSION,
+        "identity_salt_fingerprint": salt_fingerprint(),
         "git_commit": git_commit(),
         "git_dirty": git_dirty(),
     }

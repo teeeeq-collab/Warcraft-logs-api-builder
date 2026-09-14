@@ -33,7 +33,7 @@ from .settings import project_root
 logger = logging.getLogger(__name__)
 
 #: Schema version this code expects. Bumped by adding a migration file.
-EXPECTED_SCHEMA_VERSION = 3
+EXPECTED_SCHEMA_VERSION = 4
 
 
 class DatabaseError(RedactedError):

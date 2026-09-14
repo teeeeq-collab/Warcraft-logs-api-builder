@@ -20,6 +20,7 @@ from wcl_mplus.db import Database
 from wcl_mplus.ratelimit import RateLimiter
 from wcl_mplus.rawcache import RawCache
 from wcl_mplus.reportsource import ManualReportSource
+from wcl_mplus.sanitize import pseudonym
 
 
 class FakeTokens:
@@ -519,6 +520,70 @@ def test_focus_streams_are_skipped_when_the_player_is_absent(pipeline):
     assert focus_rows == [], "focus streams collected without a resolved actor"
     notes = db.query("SELECT detail FROM ingest_diagnostics WHERE kind = 'focus_player_absent'")
     assert notes, "an absent focus player must be recorded, not passed over"
+
+
+def test_focus_player_resolves_through_the_pseudonym(pipeline):
+    """A real character name must find the actor stored under its pseudonym.
+
+    This is the regression test for the defect the architecture audit found:
+    `actors.name` holds `pseudonym(name)`, so comparing the typed name against
+    it directly matched nothing, on every run, for every focus player. The
+    collection looked successful and contained no focus data at all.
+    """
+    collector, db, _ = pipeline()
+    collector.collect(candidates(), event_profile="reference_player", focus_player="Tankadin")
+
+    stored = pseudonym("Tankadin", "player")
+    actor = db.execute("SELECT actor_id FROM actors WHERE name = ?", (stored,)).fetchone()
+    assert actor is not None, "the simulator's player was not stored pseudonymized"
+
+    focus_rows = db.query(
+        "SELECT data_type, source_id, scope FROM run_stream_coverage WHERE scope = 'focus'"
+    )
+    assert focus_rows, "a resolvable focus player collected no focus stream"
+    assert all(r["source_id"] == actor["actor_id"] for r in focus_rows), (
+        "focus streams were narrowed to the wrong actor"
+    )
+    # The clear name must not have been written anywhere while resolving it.
+    leaked = db.query("SELECT detail FROM ingest_diagnostics WHERE detail LIKE '%Tankadin%'")
+    assert leaked == [], "a real character name reached the database"
+    assert collector.focus.runs_resolved > 0
+
+
+def test_focus_player_accepts_a_realm_suffix_and_a_pseudonym(pipeline):
+    """Both spellings a person actually has to hand must resolve identically."""
+    for spelling in ("Tankadin-Draenor", pseudonym("Tankadin", "player")):
+        collector, db, _ = pipeline(db_name=f"focus-{abs(hash(spelling))}.sqlite")
+        collector.collect(candidates(), event_profile="reference_player", focus_player=spelling)
+        assert collector.focus.runs_resolved > 0, f"{spelling!r} did not resolve"
+        assert not collector.focus.unresolved
+
+
+def test_an_unresolvable_focus_player_is_an_explicit_failure(pipeline):
+    """Never found anywhere is a failed request, not a run-by-run absence."""
+    collector, db, _ = pipeline()
+    result = collector.collect(candidates(), focus_player="NobodyHere")
+
+    assert result.focus.unresolved, "a name that matched nothing was reported as fine"
+    assert result.focus.runs_seen > 0
+    assert result.focus.runs_resolved == 0
+    assert result.errors, "an unresolvable focus player left no error on the result"
+    errors = db.query(
+        "SELECT detail FROM ingest_diagnostics WHERE kind = 'focus_player_unresolved'"
+    )
+    assert errors, "an unresolvable focus player was not recorded as an error"
+    assert all("NobodyHere" not in r["detail"] for r in errors), "clear name leaked"
+
+
+def test_absent_in_one_run_is_not_a_failed_request(pipeline):
+    """A player missing from a single run is normal and must not read as an error."""
+    collector, db, _ = pipeline()
+    collector.collect(candidates(), event_profile="reference_player", focus_player="Tankadin")
+
+    assert not collector.focus.unresolved
+    assert (
+        db.query("SELECT 1 FROM ingest_diagnostics WHERE kind = 'focus_player_unresolved'") == []
+    ), "a resolvable player was reported as unresolvable"
 
 
 def test_focus_requests_carry_the_actor_filter(pipeline):

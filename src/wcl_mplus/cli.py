@@ -742,6 +742,11 @@ def collect(
     )
     typer.echo(f"  Events written: {summary['events_written']:,}")
     typer.echo(f"  Pages fetched:  {summary['pages_fetched']:,}")
+    focus = summary["focus"]
+    if focus["requested"]:
+        typer.echo(
+            f"  Focus player:   resolved in {focus['runs_resolved']} of {focus['runs_seen']} run(s)"
+        )
     if summary["reports_failed"]:
         typer.secho(f"  Reports failed: {summary['reports_failed']}", fg=typer.colors.RED)
         for error in summary["errors"]:
@@ -756,6 +761,20 @@ def collect(
         + "  (writes data/exports/validation/)"
     )
     db.close()
+
+    # A focus player who matched nothing anywhere is a failed request, not a
+    # quiet absence: everything the profile promised for that player is
+    # missing. Exit non-zero so a scripted collection stops instead of
+    # building a corpus that looks complete and has no focus data in it.
+    if focus["unresolved"]:
+        typer.secho(
+            f"\nFocus player {focus_player!r} matched no actor in any of "
+            f"{focus['runs_seen']} run(s); no focus stream was collected. "
+            "Names are stored pseudonymized, so check the spelling, drop any "
+            "-Realm suffix, or pass the player- pseudonym from a validation report.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=2)
 
 
 @app.command()

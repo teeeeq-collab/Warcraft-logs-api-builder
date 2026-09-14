@@ -51,6 +51,7 @@ from .querybuild import (
 )
 from .redaction import RedactedError
 from .reportsource import ReportCandidate
+from .sanitize import IDENTITY_SCHEME_VERSION, player_name_candidates, salt_fingerprint
 from .schema import SchemaIntrospector
 from .version import (
     NORMALIZER_VERSION,
@@ -118,6 +119,38 @@ class RunOutcome:
 
 
 @dataclass
+class FocusResolution:
+    """Whether a requested focus player was ever found, and where.
+
+    A focus player legitimately misses individual runs -- nobody is in every
+    report on a list -- so per-run absence is not an error. Never being found
+    in *any* run is different in kind: it means the name was wrong, or the
+    corpus was written under a different identity scheme, and every focus
+    stream the profile promised was silently skipped. The two must not read
+    alike, so they are counted separately (brief section 3.1).
+    """
+
+    requested: str | None = None
+    runs_seen: int = 0
+    runs_resolved: int = 0
+    #: Pseudonyms tried on the most recent miss, for the operator's diagnosis.
+    last_missed: list[str] = field(default_factory=list)
+
+    @property
+    def unresolved(self) -> bool:
+        """True when a focus player was asked for and never matched anything."""
+        return bool(self.requested) and self.runs_seen > 0 and self.runs_resolved == 0
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "requested": bool(self.requested),
+            "runs_seen": self.runs_seen,
+            "runs_resolved": self.runs_resolved,
+            "unresolved": self.unresolved,
+        }
+
+
+@dataclass
 class CollectionResult:
     job_id: str
     reports_attempted: int = 0
@@ -125,6 +158,7 @@ class CollectionResult:
     reports_failed: int = 0
     runs: list[RunOutcome] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    focus: FocusResolution = field(default_factory=FocusResolution)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -136,6 +170,7 @@ class CollectionResult:
             "runs_complete": sum(1 for r in self.runs if r.status == "complete"),
             "events_written": sum(r.events_written for r in self.runs),
             "pages_fetched": sum(r.pages_fetched for r in self.runs),
+            "focus": self.focus.summary(),
             "errors": self.errors[:20],
         }
 
@@ -159,6 +194,10 @@ class Collector:
         self.job_id = job_id or uuid.uuid4().hex[:16]
         self.page_limit = page_limit
         self._selections: dict[str, str] = {}
+        #: Focus-player accounting for the current job. Lives on the collector
+        #: rather than in `_collect_run` because the question it answers --
+        #: "was this player ever found?" -- is only answerable across runs.
+        self.focus = FocusResolution()
 
     # -- schema-safe selections -------------------------------------------
 
@@ -179,7 +218,49 @@ class Collector:
 
     # -- job lifecycle ----------------------------------------------------
 
+    def assert_identity_scheme(self) -> None:
+        """Refuse to write pseudonyms into a corpus built under another scheme.
+
+        Player pseudonyms are the only handle the corpus has on a person, so
+        two schemes in one database do not merge -- they silently stop matching,
+        and the same player reads as two. The first job to touch a database
+        claims it for the scheme in force; a later job under a different one
+        stops here instead of appending names nothing will ever join to
+        (brief section 4).
+        """
+        fingerprint = salt_fingerprint()
+        row = self.db.execute(
+            "SELECT scheme_version, salt_fingerprint FROM corpus_identity LIMIT 1"
+        ).fetchone()
+        if row is None:
+            self.db.upsert(
+                "corpus_identity",
+                {
+                    "scheme_version": IDENTITY_SCHEME_VERSION,
+                    "salt_fingerprint": fingerprint,
+                    "first_written_at": time.time(),
+                    "software_version": SOFTWARE_VERSION,
+                    "notes": None,
+                },
+                replace=False,
+            )
+            self.db.conn.commit()
+            return
+        if (
+            int(row["scheme_version"]) != IDENTITY_SCHEME_VERSION
+            or str(row["salt_fingerprint"]) != fingerprint
+        ):
+            raise CollectionError(
+                f"This database was written under identity scheme "
+                f"v{row['scheme_version']} (salt {row['salt_fingerprint']}), but this "
+                f"code uses v{IDENTITY_SCHEME_VERSION} (salt {fingerprint}). Player "
+                "pseudonyms from the two schemes will never match each other. Collect "
+                "into a separate database, or re-derive the existing one from the raw "
+                "cache under the current scheme."
+            )
+
     def start_job(self, *, sample_profile: str | None, event_profile: str) -> None:
+        self.assert_identity_scheme()
         prov = provenance()
         self.db.upsert(
             "collection_jobs",
@@ -195,6 +276,7 @@ class Collector:
                 "normalizer_version": NORMALIZER_VERSION,
                 "query_version": QUERY_VERSION,
                 "schema_version": SCHEMA_VERSION,
+                "identity_scheme_version": IDENTITY_SCHEME_VERSION,
                 "git_commit": prov.get("git_commit"),
                 "git_dirty": 1 if prov.get("git_dirty") else 0,
             },
@@ -562,31 +644,84 @@ class Collector:
     ) -> int | None:
         """Find the actor ID for a named focus player in this run.
 
+        The corpus stores no clear character names -- `normalize_actors` writes
+        `pseudonym(name, "player")` -- so a name typed on the command line is
+        put through the same function before it is matched. Comparing the clear
+        name against `actors.name` directly, as this did until now, could never
+        match anything: every focus stream was skipped on every run, and the
+        only trace was a diagnostic that read like an ordinary absence.
+
         Returns None when no focus player was asked for, and also when one was
         asked for but is not in this run's roster -- a player does not appear in
         every report on a list. The diagnostic matters: without it the run would
         silently collect only its unnarrowed streams and look, later, exactly
         like a run where the focus streams returned nothing.
+
+        Whether an unmatched name is an absence or a mistake cannot be decided
+        from one run, so that verdict is deferred to the end of the job; see
+        `FocusResolution`.
         """
         if not focus_player:
             return None
-        row = self.db.execute(
-            "SELECT a.actor_id FROM actors a "
-            "  JOIN run_players rp ON rp.run_id = ? AND rp.actor_id = a.actor_id "
-            " WHERE a.report_code = ? AND LOWER(a.name) = LOWER(?) LIMIT 1",
-            (run_id, report_code, focus_player),
-        ).fetchone()
+        candidates = player_name_candidates(focus_player)
+        self.focus.requested = focus_player
+        self.focus.runs_seen += 1
+        row = None
+        for stored_name in candidates:
+            row = self.db.execute(
+                "SELECT a.actor_id FROM actors a "
+                "  JOIN run_players rp ON rp.run_id = ? AND rp.actor_id = a.actor_id "
+                " WHERE a.report_code = ? AND a.name = ? LIMIT 1",
+                (run_id, report_code, stored_name),
+            ).fetchone()
+            if row is not None:
+                break
         if row is None:
+            # The pseudonym, never the name the user typed: a diagnostic is a
+            # stored row, and putting a real character name in one would defeat
+            # the pseudonymization the rest of the pipeline maintains. The
+            # pseudonym is enough to check the lookup by hand.
+            self.focus.last_missed = candidates
             self.db.diagnostic(
                 "focus_player_absent",
-                f"{focus_player!r} is not in the roster of {run_id}; "
-                "focus streams were not collected for this run.",
+                f"Focus player {candidates[0] if candidates else '?'} is not in the roster "
+                f"of {run_id}; focus streams were not collected for this run.",
                 run_id=run_id,
                 job_id=self.job_id,
                 severity="warning",
             )
             return None
+        self.focus.runs_resolved += 1
         return int(row["actor_id"])
+
+    def _record_focus_resolution(self, result: CollectionResult) -> None:
+        """Fail loudly if a requested focus player matched nothing anywhere.
+
+        Every run that was asked for a focus player and did not find one has
+        already recorded its own absence. What no single run can say is that
+        *none* of them found the player, which is not an absence but a failed
+        request: a misspelling, a realm suffix WCL does not store, or a corpus
+        written under a different identity scheme. Left implicit it produces a
+        corpus that looks collected and contains no focus data at all.
+        """
+        result.focus = self.focus
+        if not self.focus.unresolved:
+            return
+        candidates = player_name_candidates(self.focus.requested or "")
+        message = (
+            f"Focus player was requested but matched no actor in any of "
+            f"{self.focus.runs_seen} run(s). Looked for pseudonym(s): "
+            f"{', '.join(candidates)}. No focus stream was collected. Check the "
+            "spelling against the run's roster, or pass the pseudonym itself."
+        )
+        result.errors.append(message)
+        self.db.diagnostic(
+            "focus_player_unresolved",
+            message,
+            job_id=self.job_id,
+            severity="error",
+        )
+        self.db.conn.commit()
 
     def _record_coverage(
         self,
@@ -926,6 +1061,7 @@ class Collector:
         focus_player: str | None = None,
     ) -> CollectionResult:
         result = CollectionResult(job_id=self.job_id)
+        self.focus = FocusResolution(requested=focus_player)
         self.start_job(sample_profile=None, event_profile=event_profile)
         status = "complete"
         # Read the budget before any work, not after. stats.points_spent_observed
@@ -972,6 +1108,7 @@ class Collector:
             logger.warning("Interrupted. Progress is saved; resume with the same job.")
             raise
         finally:
+            self._record_focus_resolution(result)
             self._record_api_cost(result, points_before, requests_before)
             self.finish_job(result, status=status)
         return result
