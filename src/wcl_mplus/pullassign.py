@@ -30,6 +30,38 @@ class PullInterval:
     index: int
 
 
+#: How two pull intervals can collide. The distinction matters because only one
+#: of these is a real ambiguity about what happened in the dungeon.
+#:
+#: * `touching`  -- the later pull starts on the exact millisecond the earlier
+#:   one ends. Intervals are closed at both ends, so exactly one millisecond is
+#:   claimed twice. This is a boundary convention, not an overlap: no event can
+#:   be in doubt beyond that single tick.
+#: * `nested`    -- the later pull lies entirely inside the earlier one.
+#: * `partial`   -- genuine temporal overlap, which is what a chained pull looks
+#:   like: the tank engaged the next pack while the previous one was alive.
+OVERLAP_KINDS = ("touching", "nested", "partial")
+
+
+def classify_overlap(earlier: PullInterval, later: PullInterval) -> dict[str, Any]:
+    """Describe how two intervals collide, and by how much."""
+    overlap_ms = min(earlier.end_ms, later.end_ms) - later.start_ms
+    if later.start_ms == earlier.end_ms:
+        kind = "touching"
+    elif later.end_ms <= earlier.end_ms:
+        kind = "nested"
+    else:
+        kind = "partial"
+    return {
+        "earlier_pull_id": earlier.pull_id,
+        "later_pull_id": later.pull_id,
+        "kind": kind,
+        "overlap_ms": max(overlap_ms, 0),
+        "window_start_ms": later.start_ms,
+        "window_end_ms": min(earlier.end_ms, later.end_ms),
+    }
+
+
 @dataclass
 class AssignmentStats:
     """Evidence about how well events mapped onto pulls."""
@@ -37,6 +69,8 @@ class AssignmentStats:
     assigned: int = 0
     unassigned: int = 0
     overlapping_pairs: list[tuple[str, str]] = field(default_factory=list)
+    #: Classified collisions: kind and magnitude, not just "these two touched".
+    overlaps: list[dict[str, Any]] = field(default_factory=list)
     unassigned_before_first: int = 0
     unassigned_after_last: int = 0
     unassigned_between: int = 0
@@ -61,6 +95,7 @@ class AssignmentStats:
             "unassigned_between_pulls": self.unassigned_between,
             "unassigned_after_last_pull": self.unassigned_after_last,
             "overlapping_pull_pairs": self.overlapping_pairs[:20],
+            "overlaps": self.overlaps[:20],
         }
 
 
@@ -78,6 +113,7 @@ class PullAssigner:
         self.stats = AssignmentStats()
         self.overlaps = self._find_overlaps()
         self.stats.overlapping_pairs = [(a.pull_id, b.pull_id) for a, b in self.overlaps]
+        self.stats.overlaps = [classify_overlap(a, b) for a, b in self.overlaps]
 
     def _find_overlaps(self) -> list[tuple[PullInterval, PullInterval]]:
         found: list[tuple[PullInterval, PullInterval]] = []

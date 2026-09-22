@@ -23,6 +23,7 @@ from wcl_mplus.reportsource import ManualReportSource
 from wcl_mplus.validate import (
     collect_validation,
     npc_instance_evidence,
+    overlapping_pulls,
     paired_abilities,
     render_markdown,
     write_reports,
@@ -630,3 +631,67 @@ def test_pair_rows_carry_the_cast_ratio(populated):
         assert "cast_ratio" in pair
         if pair["cast_ratio"] is not None:
             assert pair["cast_ratio"] >= 1.0, "ratio must be expressed larger-over-smaller"
+
+
+def test_a_touching_boundary_is_not_reported_as_a_real_overlap(populated):
+    """Consecutive pulls sharing one millisecond are a convention, not an ambiguity."""
+    db = populated()
+    run_id = db.scalar("SELECT run_id FROM pulls LIMIT 1")
+    rows = db.query(
+        "SELECT pull_id, rel_start_ms, rel_end_ms FROM pulls WHERE run_id = ? "
+        " ORDER BY rel_start_ms LIMIT 2",
+        (run_id,),
+    )
+    if len(rows) < 2:
+        pytest.skip("need two pulls in one run")
+
+    # Make the second pull start exactly where the first ends.
+    db.execute(
+        "UPDATE pulls SET rel_start_ms = ? WHERE pull_id = ?",
+        (rows[0]["rel_end_ms"], rows[1]["pull_id"]),
+    )
+    db.conn.commit()
+
+    report = overlapping_pulls(db)
+    assert report["total"] >= 1
+    assert set(report["kinds"]) == {"touching"}
+    # A touching pair contests nothing: only partial and nested overlaps put
+    # events in doubt, so the contested count must stay at zero.
+    assert report["events_in_contested_windows"] == 0
+    assert "boundary millisecond" in report["verdict"]
+
+
+def test_a_genuine_overlap_reports_the_events_it_puts_in_doubt(populated):
+    """A chained pull really does claim a window twice; say how much it costs."""
+    db = populated()
+    run_id = db.scalar("SELECT run_id FROM pulls LIMIT 1")
+    rows = db.query(
+        "SELECT pull_id, rel_start_ms, rel_end_ms FROM pulls WHERE run_id = ? "
+        " ORDER BY rel_start_ms LIMIT 2",
+        (run_id,),
+    )
+    if len(rows) < 2:
+        pytest.skip("need two pulls in one run")
+
+    # Start the second pull well before the first ends.
+    overlap_start = int(rows[0]["rel_start_ms"]) + 1
+    db.execute(
+        "UPDATE pulls SET rel_start_ms = ? WHERE pull_id = ?",
+        (overlap_start, rows[1]["pull_id"]),
+    )
+    db.conn.commit()
+
+    report = overlapping_pulls(db)
+    assert report["total"] >= 1
+    assert "touching" not in report["kinds"] or report["kinds"].get("touching", 0) == 0
+    detail = report["detail"][0]
+    assert detail["overlap_ms"] > 0
+    assert detail["kind"] in ("partial", "nested")
+    assert "assigned_to" in detail
+
+
+def test_no_overlaps_says_so_plainly(populated):
+    report = overlapping_pulls(populated())
+    if report["total"] == 0:
+        assert report["verdict"] == "no overlapping pull intervals"
+        assert report["kinds"] == {}

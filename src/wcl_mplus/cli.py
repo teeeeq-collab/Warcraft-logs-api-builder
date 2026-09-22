@@ -24,9 +24,13 @@ import typer
 
 from .analytics import AnalyticsStore, default_analytics_path
 from .benchmark import (
+    FocusComparison,
+    FocusFilterBenchmark,
     HostilityComparison,
     StreamBenchmark,
     StreamMeasurement,
+    render_focus_json,
+    render_focus_report,
     render_json,
     render_report,
 )
@@ -37,13 +41,14 @@ from .db import Database, DatabaseError
 from .dedupe import group_duplicates
 from .discover import discover_dungeons
 from .fingerprint import corpus_fingerprint
-from .normalize import is_mythic_plus
+from .normalize import is_mythic_plus, normalize_actors
 from .querybuild import WANTED_FIGHT_FIELDS, WANTED_REPORT_FIELDS, QueryError, render
 from .rawcache import RawCache
 from .recon import Recon
 from .redaction import RedactedError, install_logging_redaction
 from .reportsource import DiscoveryError, ManualReportSource
 from .repository import Repository
+from .sanitize import player_name_candidates
 from .schema import SchemaIntrospector
 from .settings import ConfigError, Settings
 from .validate import collect_validation, write_reports
@@ -872,6 +877,123 @@ def benchmark(
     js.write_text(render_json(measurements, comparisons, runs_probed=probed), encoding="utf-8")
     typer.secho(f"\nWrote {md}", fg=typer.colors.GREEN)
     typer.secho(f"Wrote {js}", fg=typer.colors.GREEN)
+    client.close()
+
+
+@app.command(name="focus-benchmark")
+def focus_benchmark(
+    report_list: Path = typer.Option(
+        ..., "--report-list", help="File with report codes or URLs. One is enough."
+    ),
+    focus_player: str = typer.Option(
+        ...,
+        "--focus-player",
+        help="Character name (or a player- pseudonym) to narrow the probes to.",
+    ),
+    max_pages: int = typer.Option(
+        3,
+        "--max-pages",
+        help="Page cap per request. Four requests across six streams, so a low cap "
+        "keeps the whole benchmark inside a few points. Capped totals are lower bounds.",
+    ),
+    out: Path = typer.Option(
+        Path("data/exports/benchmark"), "--out", help="Where the report is written."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Measure what narrowing a stream to one player costs, and what it selects.
+
+    The `reference_player` profile promises full telemetry for one player and
+    cheap context for the rest, and nothing has ever measured whether that is
+    what narrowing actually buys. Rate limiting is per page, so a server that
+    filters after paging would charge the same for a tenth of the data -- making
+    the profile a storage saving and not a quota one.
+
+    It also settles what the two filters mean. "Buffs the focus player cast" and
+    "buffs active on the focus player" are different data and the configuration
+    currently uses one word for both. Every verdict is read off the returned
+    events rather than inferred from a parameter name.
+
+    Writes nothing to the corpus.
+    """
+    _setup_logging(verbose)
+    settings = _load_settings()
+
+    try:
+        candidates = list(ManualReportSource.from_file(report_list).discover())
+    except DiscoveryError as exc:
+        _fail(exc, "Check the report list path.")
+        return
+    if not candidates:
+        _fail(DiscoveryError("The report list is empty."))
+        return
+
+    stored_names = player_name_candidates(focus_player)
+    if not stored_names:
+        _fail(DiscoveryError("--focus-player was empty."))
+        return
+
+    client = _client(settings)
+    db = _database(settings)
+    bench = FocusFilterBenchmark(client)
+    collector = Collector(client, db, ProjectConfig.load())
+
+    comparisons: list[FocusComparison] = []
+    actor_label = stored_names[0]
+    try:
+        candidate = candidates[0]
+        fights = [f for f in collector.fetch_fights(candidate.code) if is_mythic_plus(f)]
+        if not fights:
+            _fail(DiscoveryError(f"{candidate.code} holds no Mythic+ fight to probe."))
+            return
+        fight = fights[0]
+        fight_id = int(fight.get("id") or 0)
+
+        # The corpus stores pseudonyms, so the typed name goes through the same
+        # function before matching -- the defect that made --focus-player
+        # silently collect nothing on every run.
+        master = collector.fetch_master_data(candidate.code)
+        actor_id: int | None = None
+        for actor in normalize_actors(master, report_code=candidate.code):
+            if actor.get("name") in stored_names and actor.get("is_player"):
+                actor_id = actor.get("actor_id")
+                break
+        if actor_id is None:
+            _fail(
+                DiscoveryError(
+                    f"That player is not in the roster of {candidate.code}. "
+                    f"Looked for pseudonym(s): {', '.join(stored_names)}."
+                ),
+                "Pick a report this player appears in.",
+            )
+            return
+
+        typer.echo(f"Probing {candidate.code} fight {fight_id} for actor {actor_id}...")
+        comparisons = bench.compare(
+            report_code=candidate.code,
+            fight_id=fight_id,
+            rel_start_ms=int(fight.get("startTime") or 0),
+            rel_end_ms=int(fight.get("endTime") or 0),
+            actor_id=actor_id,
+            max_pages=max_pages,
+        )
+        for comparison in comparisons:
+            typer.echo(
+                f"  {comparison.label}: {comparison.unnarrowed.events:,} all, "
+                f"{comparison.by_source.events:,} by source, "
+                f"{comparison.by_target.events:,} by target"
+            )
+    except (ApiError, DiscoveryError) as exc:
+        _fail(exc, "The probe stopped; partial results are still written.")
+
+    out.mkdir(parents=True, exist_ok=True)
+    md = out / "FOCUS_BENCHMARK.md"
+    js = out / "focus_benchmark.json"
+    md.write_text(render_focus_report(comparisons, actor_label=actor_label), encoding="utf-8")
+    js.write_text(render_focus_json(comparisons, actor_label=actor_label), encoding="utf-8")
+    typer.secho(f"\nWrote {md}", fg=typer.colors.GREEN)
+    typer.secho(f"Wrote {js}", fg=typer.colors.GREEN)
+    db.close()
     client.close()
 
 

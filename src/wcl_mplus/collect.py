@@ -425,7 +425,7 @@ class Collector:
             self.db.conn.commit()
             return []
 
-        master = self._fetch_master_data(code)
+        master = self.fetch_master_data(code)
         outcomes: list[RunOutcome] = []
         for fight in runs:
             outcomes.append(
@@ -509,12 +509,27 @@ class Collector:
 
         assigner = PullAssigner.from_rows(pull_rows)
         if assigner.overlaps:
+            # Classified, because "overlapping pulls" covers two very different
+            # things: a one-millisecond shared boundary between consecutive
+            # pulls, and a tank genuinely chaining the next pack while the last
+            # one is alive. Only the second is an ambiguity about the dungeon.
+            kinds: dict[str, int] = {}
+            for overlap in assigner.stats.overlaps:
+                kinds[overlap["kind"]] = kinds.get(overlap["kind"], 0) + 1
             self.db.diagnostic(
                 "overlapping_pulls",
-                f"{len(assigner.overlaps)} overlapping pull interval(s) in {run_id}: "
-                f"{assigner.stats.overlapping_pairs[:5]}",
+                json_or_none(
+                    {
+                        "run_id": run_id,
+                        "count": len(assigner.overlaps),
+                        "kinds": kinds,
+                        "overlaps": assigner.stats.overlaps[:5],
+                    }
+                )
+                or "{}",
                 run_id=run_id,
                 job_id=self.job_id,
+                severity="info" if set(kinds) <= {"touching"} else "warning",
             )
 
         try:
@@ -626,7 +641,7 @@ class Collector:
         report = ((data.get("reportData") or {}).get("report")) or {}
         return [f for f in (report.get("fights") or []) if isinstance(f, dict)]
 
-    def _fetch_master_data(self, code: str) -> dict[str, Any]:
+    def fetch_master_data(self, code: str) -> dict[str, Any]:
         data = self.client.execute(
             load_query("report_master_data"),
             {"code": code},

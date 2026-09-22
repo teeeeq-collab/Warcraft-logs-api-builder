@@ -13,7 +13,15 @@ import pytest
 from wcl_simulator import REPORT_CODE, WclSimulator
 
 from wcl_mplus.auth import Token
-from wcl_mplus.benchmark import StreamBenchmark, render_json, render_report
+from wcl_mplus.benchmark import (
+    FocusFilterBenchmark,
+    StreamBenchmark,
+    overlap_check,
+    render_focus_json,
+    render_focus_report,
+    render_json,
+    render_report,
+)
 from wcl_mplus.client import GraphQLClient
 from wcl_mplus.ratelimit import RateLimiter
 from wcl_mplus.rawcache import RawCache
@@ -183,3 +191,141 @@ def test_benchmark_never_measures_the_cache(bench):
     # Same stream, same fight: the wire cost must reproduce, not collapse.
     assert second.bytes_received == first.bytes_received
     assert second.summary()["cost_is_measured"] is True
+
+
+# -- focus filtering -------------------------------------------------------
+
+
+def _focus_bench(settings, simulator=None):
+    sim = simulator or WclSimulator(event_page_limit=25)
+    client = GraphQLClient(
+        settings,
+        token_provider=FakeTokens(),
+        rate_limiter=RateLimiter(min_points_reserve=0),
+        cache=RawCache(settings.raw_cache_dir),
+        http_client=sim.client(),
+        sleep=lambda s: None,
+    )
+    return FocusFilterBenchmark(client), sim
+
+
+def test_focus_probes_request_all_four_narrowings(settings):
+    """Unnarrowed, by source, by target, and both -- four different questions."""
+    bench, _ = _focus_bench(settings)
+    comparisons = bench.compare(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=600_000,
+        actor_id=1,
+        streams=(("Casts", "Friendlies"),),
+        max_pages=2,
+    )
+    assert len(comparisons) == 1
+    c = comparisons[0]
+    assert c.unnarrowed.source_id is None and c.unnarrowed.target_id is None
+    assert c.by_source.source_id == 1 and c.by_source.target_id is None
+    assert c.by_target.target_id == 1 and c.by_target.source_id is None
+    assert c.by_both.source_id == 1 and c.by_both.target_id == 1
+    # The narrowing must show up in the label, so a report cannot confuse them.
+    assert "[source=1]" in c.by_source.label
+    assert "[target=1]" in c.by_target.label
+
+
+def test_a_narrowed_probe_never_reads_the_cache(settings):
+    """Cost figures must describe the API, not a cache hit."""
+    bench, _ = _focus_bench(settings)
+    for _ in range(2):
+        comparisons = bench.compare(
+            report_code=REPORT_CODE,
+            fight_id=7,
+            rel_start_ms=0,
+            rel_end_ms=600_000,
+            actor_id=1,
+            streams=(("Casts", "Friendlies"),),
+            max_pages=2,
+        )
+    for measurement in (
+        comparisons[0].unnarrowed,
+        comparisons[0].by_source,
+        comparisons[0].by_target,
+        comparisons[0].by_both,
+    ):
+        assert measurement.cache_hits == 0, "a probe measured the cache"
+
+
+def test_semantics_are_read_off_the_events_not_the_parameter_name(settings):
+    """What a filter selects is evidence, never an assumption from its name."""
+    bench, _ = _focus_bench(settings)
+    comparisons = bench.compare(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=600_000,
+        actor_id=1,
+        streams=(("Casts", "Friendlies"),),
+        max_pages=4,
+    )
+    verdict = comparisons[0].source_semantics()
+    assert verdict.split(":")[0] in ("CONFIRMED", "MIXED", "EMPTY", "UNKNOWN", "REFUSED")
+    # The simulator does not implement sourceID filtering, so the honest verdict
+    # is that the events do not all carry that source -- which is exactly the
+    # finding this probe exists to surface against the real API.
+    assert verdict.startswith(("MIXED", "CONFIRMED", "EMPTY"))
+
+
+def test_a_capped_stream_is_not_called_an_ignored_filter(settings):
+    """Identical counts under a page cap mean nothing; exhaustion is required."""
+    bench, _ = _focus_bench(settings)
+    comparisons = bench.compare(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=600_000,
+        actor_id=1,
+        streams=(("Casts", "Friendlies"),),
+        max_pages=1,
+    )
+    c = comparisons[0]
+    if not c.unnarrowed.exhausted:
+        assert not c.filter_ignored(c.by_source), (
+            "a page cap was mistaken for a filter that does nothing"
+        )
+
+
+def test_the_focus_report_names_what_it_could_not_measure(settings):
+    bench, _ = _focus_bench(settings)
+    comparisons = bench.compare(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=600_000,
+        actor_id=1,
+        streams=(("Casts", "Friendlies"), ("Buffs", "Friendlies")),
+        max_pages=1,
+    )
+    report = render_focus_report(comparisons, actor_label="player-abc")
+    assert "Focus-filter benchmark" in report
+    assert "sourceID selects" in report
+    assert "player-abc" in report
+    payload = json.loads(render_focus_json(comparisons, actor_label="player-abc"))
+    assert payload["focus_actor"] == "player-abc"
+    assert len(payload["comparisons"]) == 2
+    assert "source_semantics" in payload["comparisons"][0]
+
+
+def test_overlap_check_refuses_to_conclude_from_capped_streams(settings):
+    bench, _ = _focus_bench(settings)
+    comparisons = bench.compare(
+        report_code=REPORT_CODE,
+        fight_id=7,
+        rel_start_ms=0,
+        rel_end_ms=600_000,
+        actor_id=1,
+        streams=(("DamageTaken", None), ("DamageDone", "Friendlies")),
+        max_pages=1,
+    )
+    verdict = overlap_check(comparisons[0].by_target, comparisons[1].by_target)
+    assert "verdict" in verdict
+    if not verdict["both_exhausted"]:
+        assert "capped" in verdict["verdict"] or "differ" in verdict["verdict"]

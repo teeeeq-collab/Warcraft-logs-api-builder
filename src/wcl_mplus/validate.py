@@ -139,6 +139,7 @@ def collect_validation(db: Database, *, dungeon_key: str | None = None) -> dict[
         "dedupe": dedupe_coverage(db),
         "paired_abilities": paired_abilities(db),
         "stream_coverage": stream_coverage(db),
+        "overlapping_pulls": overlapping_pulls(db),
         "duplicates": {
             "groups": len(duplicate_groups),
             "runs_in_groups": sum(int(g["members"]) for g in duplicate_groups),
@@ -615,6 +616,117 @@ def _median_interval_ms(per_copy: list[dict[str, Any]]) -> float | None:
     return round(statistics.median(intervals)) if intervals else None
 
 
+def overlapping_pulls(db: Database, limit: int = 20) -> dict[str, Any]:
+    """Explain every overlapping pull interval in the corpus.
+
+    "Overlapping pulls" covers two very different situations and the warning
+    alone cannot tell them apart:
+
+    * **touching** -- the next pull starts on the exact millisecond the previous
+      one ends. Pull intervals are closed at both ends, so exactly one
+      millisecond belongs to two pulls. This is a boundary convention, not an
+      ambiguity: at most one tick of events is in question, and the assigner
+      resolves it deterministically to the later pull.
+    * **nested** -- one pull lies entirely inside another.
+    * **partial** -- genuine overlap, which is what chaining looks like: the
+      tank engaged the next pack while the previous one was still alive. Here
+      the overlap window really is claimed by two pulls, and pull-relative
+      timings inside it depend on which one an event was assigned to.
+
+    The impact number is what settles it: how many events actually fall in each
+    overlap window. A partial overlap spanning eight seconds with no events in
+    it changes nothing.
+    """
+    rows = db.query(
+        "SELECT a.run_id, a.pull_id AS earlier_id, a.pull_index AS earlier_index, "
+        "       a.rel_start_ms AS a_start, a.rel_end_ms AS a_end, a.name AS earlier_name, "
+        "       b.pull_id AS later_id, b.pull_index AS later_index, "
+        "       b.rel_start_ms AS b_start, b.rel_end_ms AS b_end, b.name AS later_name "
+        "  FROM pulls a JOIN pulls b "
+        "    ON b.run_id = a.run_id AND b.rel_start_ms >= a.rel_start_ms "
+        "   AND b.pull_id != a.pull_id "
+        " WHERE b.rel_start_ms <= a.rel_end_ms "
+        " ORDER BY a.run_id, a.rel_start_ms"
+    )
+
+    found: list[dict[str, Any]] = []
+    kinds: dict[str, int] = {}
+    for row in rows:
+        a_end, b_start, b_end = int(row["a_end"]), int(row["b_start"]), int(row["b_end"])
+        window_end = min(a_end, b_end)
+        overlap_ms = max(window_end - b_start, 0)
+        if b_start == a_end:
+            kind = "touching"
+        elif b_end <= a_end:
+            kind = "nested"
+        else:
+            kind = "partial"
+        kinds[kind] = kinds.get(kind, 0) + 1
+
+        # What it actually cost: events inside the contested window, and which
+        # pull each was assigned to.
+        assigned = db.query(
+            "SELECT IFNULL(pull_id, '<unassigned>') AS pull_id, COUNT(*) AS events "
+            "  FROM events WHERE run_id = ? AND rel_ms BETWEEN ? AND ? "
+            " GROUP BY 1 ORDER BY events DESC",
+            (row["run_id"], b_start, window_end),
+        )
+        found.append(
+            {
+                "run_id": row["run_id"],
+                "kind": kind,
+                "overlap_ms": overlap_ms,
+                "earlier": {
+                    "pull_id": row["earlier_id"],
+                    "index": row["earlier_index"],
+                    "name": row["earlier_name"],
+                },
+                "later": {
+                    "pull_id": row["later_id"],
+                    "index": row["later_index"],
+                    "name": row["later_name"],
+                },
+                "window": [b_start, window_end],
+                "events_in_window": sum(int(a["events"]) for a in assigned),
+                "assigned_to": {a["pull_id"]: int(a["events"]) for a in assigned},
+            }
+        )
+
+    contested = sum(f["events_in_window"] for f in found if f["kind"] in ("partial", "nested"))
+    return {
+        "total": len(found),
+        "kinds": kinds,
+        # Only partial and nested overlaps put a meaningful number of events in
+        # doubt; a touching pair contests a single millisecond.
+        "events_in_contested_windows": contested,
+        "verdict": _overlap_verdict(kinds, contested),
+        "detail": found[:limit],
+    }
+
+
+def _overlap_verdict(kinds: dict[str, int], contested: int) -> str:
+    if not kinds:
+        return "no overlapping pull intervals"
+    if set(kinds) <= {"touching"}:
+        return (
+            "every overlap is a shared boundary millisecond between consecutive "
+            "pulls. Pull intervals are closed at both ends, so this is a naming "
+            "convention rather than an ambiguity: no pull-relative timing is "
+            "affected beyond a single tick, and the assigner resolves it "
+            "deterministically to the later pull."
+        )
+    if contested == 0:
+        return (
+            "genuine overlaps exist but no event falls inside any contested "
+            "window, so no pull-relative timing is affected."
+        )
+    return (
+        f"{contested} event(s) fall inside genuinely contested windows. Their "
+        "pull_rel_ms depends on which pull the assigner chose, so any per-pull "
+        "timing statistic over those pulls should be read with that in mind."
+    )
+
+
 def known_limitations(db: Database) -> list[str]:
     """Everything the report should not be read as claiming."""
     limitations: list[str] = []
@@ -871,6 +983,37 @@ def render_markdown(report: dict[str, Any]) -> str:
         ]
     else:
         lines += [f"- Streams: {', '.join(coverage['streams_seen'])}"]
+
+    overlaps = report.get("overlapping_pulls") or {}
+    if overlaps.get("total"):
+        lines += [
+            "",
+            "## Overlapping pull intervals",
+            "",
+            f"- Colliding pairs: {overlaps['total']}",
+            "- By kind: " + ", ".join(f"{k} {v}" for k, v in sorted(overlaps["kinds"].items())),
+            f"- Events inside genuinely contested windows: "
+            f"{overlaps['events_in_contested_windows']:,}",
+            "",
+            overlaps["verdict"],
+        ]
+        if overlaps["detail"]:
+            lines += [
+                "",
+                "| Run | Kind | Overlap | Pulls | Events in window |",
+                "| --- | --- | ---: | --- | ---: |",
+            ]
+            lines += [
+                "| {} | {} | {} ms | {} → {} | {:,} |".format(
+                    d["run_id"],
+                    d["kind"],
+                    d["overlap_ms"],
+                    d["earlier"]["index"],
+                    d["later"]["index"],
+                    d["events_in_window"],
+                )
+                for d in overlaps["detail"]
+            ]
 
     pairs = report["paired_abilities"]
     if pairs:
