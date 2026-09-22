@@ -50,6 +50,10 @@ from .reportsource import DiscoveryError, ManualReportSource
 from .repository import Repository
 from .sanitize import player_name_candidates
 from .schema import SchemaIntrospector
+from .scl import dictionaries as scl_dicts
+from .scl import fixtures as scl_fixtures
+from .scl import measure as scl_measure
+from .scl.candidates import CANDIDATES
 from .settings import ConfigError, Settings
 from .validate import collect_validation, write_reports
 from .version import provenance
@@ -1163,6 +1167,95 @@ def analytics(
             typer.echo(f"        changed: {run_id}")
         for run_id in result["missing_runs"][:10]:
             typer.echo(f"        gone:    {run_id}")
+    db.close()
+
+
+@app.command(name="scl-benchmark")
+def scl_benchmark(
+    dungeon: str | None = typer.Option(None, "--dungeon", help='e.g. "Murder Row".'),
+    limit: int = typer.Option(30, "--fixtures", help="How many pulls to benchmark."),
+    player_scheme: str = typer.Option(
+        "group", "--player-scheme", help="Player aliases: 'group' (P1-P5) or 'role' (T/H/D1-D3)."
+    ),
+    database: Path | None = typer.Option(None, "--database", help="Corpus to read."),
+    out: Path = typer.Option(Path("data/exports/scl"), "--out"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Measure Track A encodings against real pulls.
+
+    Six candidates, each with an encoder and a decoder, measured on size and
+    token cost at several timeline lengths. A candidate whose decoder does not
+    reproduce the timeline is reported as not reversible rather than ranked on
+    its size.
+
+    Nothing here standardizes anything: the output is a table and a
+    recommendation, and the encoding stays `experimental` until the gate in
+    SCL_EXPERIMENT_PLAN.md closes.
+
+    If no tokenizer is installed the figures are labelled `symbols` and the
+    report says, loudly, that they are not token counts.
+    """
+    _setup_logging(verbose)
+    db = _database(_load_settings(), path=database)
+    repository = Repository(db)
+
+    fixtures = scl_fixtures.select(repository, dungeon_key=dungeon, limit=limit)
+    if not fixtures:
+        typer.secho("No pulls with events found. Collect a corpus first.", fg=typer.colors.YELLOW)
+        db.close()
+        return
+
+    grouped = scl_fixtures.group_by_coverage(fixtures)
+    typer.echo(f"Fixtures: {len(fixtures)} pull(s) in {len(grouped)} coverage group(s)")
+
+    # The widest coverage group. Comparing across groups would measure which
+    # streams were collected rather than anything about the encodings.
+    streams, chosen = max(grouped.items(), key=lambda kv: (len(kv[0]), len(kv[1])))
+    events = [e for fixture in chosen for e in fixture.events]
+    roles: dict[int, str] = {}
+    ability_names: dict[int, str] = {}
+    actor_names: dict[int, str] = {}
+    for fixture in chosen:
+        roles.update(fixture.player_roles)
+        ability_names.update(fixture.ability_names)
+        actor_names.update(fixture.actor_names)
+
+    tokenizer = scl_measure.resolve_tokenizer()
+    typer.echo(f"Tokenizer: {tokenizer.name}" + ("  (ESTIMATE)" if tokenizer.is_estimate else ""))
+
+    results = []
+    for candidate in sorted(CANDIDATES):
+        dictionaries = scl_dicts.build(
+            events,
+            player_roles=roles,
+            ability_names=ability_names,
+            actor_names=actor_names,
+            player_scheme=player_scheme,
+            frequency_ordered=(candidate == "G"),
+        )
+        results.append(scl_measure.measure_at_scales(events, dictionaries, candidate, tokenizer))
+        sizes = results[-1].by_size
+        row = sizes[max(sizes)] if sizes else None
+        if row is not None:
+            typer.echo(
+                f"  {candidate}: {row.bytes_total:,} bytes, "
+                f"{'reversible' if row.reversible else 'NOT REVERSIBLE'}"
+            )
+
+    label = f"{len(chosen)} pull(s), {len(events):,} events, streams: {', '.join(streams)}"
+    out.mkdir(parents=True, exist_ok=True)
+    md = out / "SCL_BENCHMARK.md"
+    js = out / "scl_benchmark.json"
+    md.write_text(
+        scl_measure.render_benchmark(results, tokenizer=tokenizer, fixture_label=label),
+        encoding="utf-8",
+    )
+    js.write_text(
+        scl_measure.render_benchmark_json(results, tokenizer=tokenizer, fixture_label=label),
+        encoding="utf-8",
+    )
+    typer.secho(f"\nWrote {md}", fg=typer.colors.GREEN)
+    typer.secho(f"Wrote {js}", fg=typer.colors.GREEN)
     db.close()
 
 
