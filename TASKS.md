@@ -70,7 +70,9 @@ expanded brief; the breakdown lives in
 | P2-9 | **Run `dedupe` on the live corpus** | user | **TODO** | `is_canonical` populated; `dedupe_coverage` reports `current` |
 | P2-10 | Regenerate `validate` after dedupe | user | TODO | report shows corrected worked-seconds and a real canonical count |
 | P2-11 | Fill `config/hotfix_epochs.yml` | user | **BLOCKED** | real patch dates; will not be invented |
-| P2-12 | Investigate 2 `overlapping_pulls` warnings | coordinator | TODO | either explained as legitimate WCL behaviour or fixed |
+| P2-12 | Investigate 2 `overlapping_pulls` warnings | coordinator | DONE | collisions classified touching/nested/partial with events-in-window; the live pair is reported by the next `validate` |
+| P2-14 | Fix `event_pages` stream identity | coordinator | DONE | a focus stream no longer shares checkpoints or coverage with its party-wide twin |
+| P2-15 | Record `raw_cache_path` on every page | coordinator | DONE | the provenance chain reaches the raw payload |
 | P2-13 | Grow the corpus | user | ONGOING | depth in one spec/dungeon/bracket before breadth |
 
 ---
@@ -86,9 +88,11 @@ expanded brief; the breakdown lives in
 | P3-3c | **Review revision 2** | user | **TODO** | the four questions at the end of `IMPLEMENTATION_PHASES.md` answered |
 | P3-7 | Benchmark focus filtering (sourceID/targetID) | coordinator | TODO | points vs rows; both filters together; applied-by vs active-on for Buffs; per-role focus sets |
 | P3-8 | Split `reference_player` from `mechanics_research` | coordinator | BLOCKED | depends on P3-7 |
-| P3-4 | Repository/query layer | coordinator | TODO | canonical by default; coverage-checked; `packs` SQL relocated |
-| P3-5 | Build snapshots from CombatantInfo | coordinator | TODO | known fixture → known build; identical builds dedupe |
-| P3-6 | Compression experiment framework | coordinator | TODO | encoders **and** decoders; measured tokens, never estimated |
+| P3-4 | Repository/query layer | coordinator | DONE | required dedupe policy; coverage-checked reads; evidence block; `packs` SQL relocated |
+| P3-4b | Analytical store + content fingerprint | coordinator | DONE | separate database, own migrations, `page`/`deep` grades, `analytics verify` |
+| P3-5 | Build snapshots from CombatantInfo | coordinator | TODO | known fixture → known build; identical talents dedupe regardless of gear |
+| P3-6 | Compression experiment framework | coordinator | **PARTLY DONE** | Track A candidates A-E,G with encoders and decoders, multi-level dictionaries, size/token measurement with a named instrument. Remaining: comprehension fixtures, legend-placement variants, Track B |
+| P3-7b | Run the focus-filter benchmark | user | **TODO** | `wclmplus focus-benchmark` against a live report |
 
 Phases 4-8 are specified in `IMPLEMENTATION_PHASES.md` and are not broken down
 here until P3-3 closes: their shape depends on what the review decides.

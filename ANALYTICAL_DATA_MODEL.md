@@ -735,18 +735,29 @@ salt.
 
 | # | File | Adds | Backfill |
 |---|---|---|---|
-| 004 | `identity_scheme.sql` | **applied** | n/a |
-| 005 | `combatant_info.sql` | normalized CombatantInfo | **offline, free** |
+| 004 | `identity_scheme.sql` | **applied** — `corpus_identity`, `idx_actors_name` | n/a |
+| 005 | `stream_narrowing.sql` | **applied** — `event_pages.source_id` / `target_id` | n/a |
+| 006 | `combatant_info.sql` | normalized CombatantInfo | **offline, free** |
+
+Migration 005 was not in the plan. `event_pages` identified a stream by
+`(run_id, data_type, hostility)` while `run_stream_coverage` identified it by
+that plus the actor narrowing, so a focus-narrowed stream and its party-wide
+twin were the same stream to the pagination layer: the focus stream would resume
+from the other's cursor, both coverage rows would report the sum of both, and no
+event row could be traced back to the request that fetched it. No shipped
+profile intersects those two lists today, and the planned `reference_player`
+redesign intersects them immediately.
 
 **Analysis store** — `migrations/analytics/`, its own sequence from 001.
 
 | # | Adds |
 |---|---|
-| 001 | build dimensions, `run_player_config` |
-| 002 | canonical actions |
-| 003 | pull archetypes |
-| 004 | gameplay states, actions, outcomes |
-| 005 | cohort definitions, evaluations, members |
+| 001 | **applied** — scaffolding: `analytics_source`, `derivations`, `derivation_runs`, `derivation_exclusions` |
+| 002 | build dimensions, `run_player_config` |
+| 003 | canonical actions |
+| 004 | pull archetypes |
+| 005 | gameplay states, actions, outcomes |
+| 006 | cohort definitions, evaluations, members |
 
 Only one migration now touches the canonical corpus, and it is transcription of
 data already stored. Everything interpretive lives in a database that can be

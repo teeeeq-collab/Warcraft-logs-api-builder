@@ -26,7 +26,7 @@ begins. Phase 0 items marked **DONE** were authorised as small critical fixes.
 | 0.5 | Regenerate `validate` | **operator** — after 0.4, with the corrected worked-seconds metric |
 | 0.6 | Correct stale docs | **DONE** — see below |
 | 0.7 | Fill `config/hotfix_epochs.yml` | **blocked** — needs real Blizzard patch dates; will not be invented |
-| 0.8 | Investigate 2 `overlapping_pulls` warnings | **open** — cheap; bears on pull-local timing |
+| 0.8 | Investigate 2 `overlapping_pulls` warnings | **DONE (code)** — classified as touching/nested/partial; `validate` now reports which, and how many events each puts in doubt. The live corpus's two are answered by the next validation run |
 
 **Doc corrections made in 0.6.** `API_NOTES.md` concluded "quota, not wall clock,
 is the binding constraint" from a ~37 points/run estimate. The measured cost is
