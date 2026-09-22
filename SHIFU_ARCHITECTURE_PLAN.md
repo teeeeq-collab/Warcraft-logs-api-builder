@@ -90,8 +90,17 @@ databases, so an analytical `run_id` cannot reference `dungeon_runs`. The
 replacement is stronger for this purpose — every analytical row records the
 **corpus fingerprint** it was derived from, and a `verify` pass checks integrity
 on demand. An FK proves the run exists; a fingerprint proves the run exists *and
-has not been recollected since this row was derived*, which is the failure that
-would actually corrupt a conclusion.
+its evidence is unchanged*, which is the failure that would actually corrupt a
+conclusion.
+
+**The fingerprint is content-derived.** An earlier draft hashed only run
+identity, normalizer version and coverage status. That is not sufficient: it
+proves the *labels* are unchanged while the underlying evidence could differ — a
+re-collection at the same normalizer version producing different rows, a
+repaired page, a partial stream completed later, a raw payload that changed
+under a stable cursor. The fingerprint now digests the evidence itself, per run,
+so **changing the evidence necessarily changes the fingerprint**. Construction
+is in the data model.
 
 ---
 
@@ -186,9 +195,18 @@ test ever fails, the scheme changed and the version must be bumped with it.
 twice. `validate`'s `dedupe_coverage` reports this as `never_run` rather than
 letting "0 duplicate groups" pass for "no duplicates".
 
-**Every downstream analytical query must default to canonical runs.** The
-repository layer enforces this (§4.1) rather than trusting each caller. Duplicate
-rows are never deleted — they are evidence about upload behaviour.
+**Analytical and research entry points take the dedupe policy as a required
+argument — they do not default** (§4.6a). Revision 1 said every downstream query
+defaults to canonical runs; that is superseded, and §4.6a is authoritative. The
+reason it changed: a default of `permissive` silently gives a statistics path
+the lax rule, and a default of `strict` fails an interactive query for no
+reason. Neither laxity nor strictness should be acquired by accident, so the
+caller states which kind of question it is asking.
+
+Browsing and retrieval entry points may default to `permissive`, because nothing
+downstream of them is published.
+
+Duplicate rows are never deleted — they are evidence about upload behaviour.
 
 ---
 
@@ -328,8 +346,13 @@ it is trustworthy.
 
 **Revision 2 replaces the four-way tag with a per-field record.** Four tags were
 necessary and insufficient: HP last seen 40 ms ago and HP last seen 8 s ago were
-both "observed", and only one is worth anything. Each field now carries value,
-status, `observed_at_ms`, `age_ms`, method, model version and confidence.
+both "observed", and only one is worth anything.
+
+`payload` remains the authoritative field→value mapping and is the **only** place
+a value lives. `field_meta` carries metadata under the same key and never repeats
+the value: status, `observed_at_ms`, `age_ms`, method, model version and
+confidence. Two copies of one value are two things to keep in agreement, and
+they would eventually disagree.
 
 | Status | Meaning |
 |---|---|

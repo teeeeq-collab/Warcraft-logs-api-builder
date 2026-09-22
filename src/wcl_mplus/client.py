@@ -122,6 +122,11 @@ class GraphQLClient:
         self._owns_http = http_client is None
         self._sleep = sleep
         self.stats = RequestStats()
+        #: Cache location of the most recent response, relative to the cache
+        #: root, or None if the response was not cached. Read immediately after
+        #: `execute` by callers that record provenance: it is the only link from
+        #: a stored row back to the exact payload it came from.
+        self.last_cache_path: str | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -177,10 +182,13 @@ class GraphQLClient:
             "query_sha": hashlib.sha256(query.encode("utf-8")).hexdigest()[:16],
         }
 
+        self.last_cache_path = None
+
         if use_cache:
             entry = self.cache.get(kind, cache_params, report_code=report_code)
             if entry is not None:
                 self.stats.cache_hits += 1
+                self.last_cache_path = self._cache_ref(kind, cache_params, report_code)
                 logger.debug("Cache hit for %s (%s)", kind, report_code or "-")
                 return entry.response if isinstance(entry.response, dict) else {}
 
@@ -188,7 +196,23 @@ class GraphQLClient:
 
         if write_cache:
             self.cache.put(kind, cache_params, data, report_code=report_code)
+            self.last_cache_path = self._cache_ref(kind, cache_params, report_code)
         return data
+
+    def _cache_ref(
+        self, kind: str, cache_params: dict[str, Any], report_code: str | None
+    ) -> str | None:
+        """Cache location relative to the cache root.
+
+        Relative, not absolute: the path is stored in the database and an
+        absolute one would be meaningless on any other machine, which is
+        precisely where a corpus gets audited.
+        """
+        try:
+            path = self.cache.path_for(kind, cache_params, report_code=report_code)
+            return str(path.relative_to(self.cache.root)).replace("\\", "/")
+        except (ValueError, OSError):  # pragma: no cover - defensive
+            return None
 
     def _execute_uncached(
         self,

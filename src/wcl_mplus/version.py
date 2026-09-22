@@ -23,7 +23,7 @@ NORMALIZER_VERSION = 2
 QUERY_VERSION = 5
 
 #: Database schema version; matches the highest applied migration.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @lru_cache(maxsize=1)

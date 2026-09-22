@@ -741,12 +741,14 @@ class Collector:
         stream paginated to exhaustion -- which is what licenses reading its
         zero as a real zero.
         """
+        stream = self._stream_key(run_id, request)
         row = self.db.execute(
             "SELECT COUNT(*) AS pages, IFNULL(SUM(event_count), 0) AS events, "
             "       SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS bad "
             "  FROM event_pages "
-            " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility, '') = ?",
-            (run_id, request.data_type, request.hostility or ""),
+            " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility, '') = ? "
+            "   AND IFNULL(source_id,-1) = ? AND IFNULL(target_id,-1) = ?",
+            stream,
         ).fetchone()
         # Exhaustion is a property of the LAST page only. Every earlier page
         # carries a forward cursor by definition, so counting pages with a
@@ -754,8 +756,9 @@ class Collector:
         last = self.db.execute(
             "SELECT next_cursor_ms FROM event_pages "
             " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility, '') = ? "
+            "   AND IFNULL(source_id,-1) = ? AND IFNULL(target_id,-1) = ? "
             " ORDER BY page_index DESC LIMIT 1",
-            (run_id, request.data_type, request.hostility or ""),
+            stream,
         ).fetchone()
 
         pages = int(row["pages"] or 0)
@@ -871,6 +874,25 @@ class Collector:
 
     # -- events -----------------------------------------------------------
 
+    @staticmethod
+    def _stream_key(run_id: str, request: EventRequest) -> tuple[Any, ...]:
+        """Bind parameters identifying one stream, narrowing included.
+
+        A stream narrowed to one actor answers a different question from the
+        same stream unnarrowed, so it is a different stream everywhere: in the
+        coverage manifest, in the page checkpoints, and in the provenance of
+        every event row. Sharing one key between them corrupts resume, doubles
+        the coverage counts, and makes a focus subset indistinguishable from the
+        party-wide superset it sits inside.
+        """
+        return (
+            run_id,
+            request.data_type,
+            request.hostility or "",
+            -1 if request.source_id is None else request.source_id,
+            -1 if request.target_id is None else request.target_id,
+        )
+
     def _resume_point(self, run_id: str, request: EventRequest) -> tuple[int | None, int]:
         """Where to resume this stream, and the next page index to use.
 
@@ -883,9 +905,11 @@ class Collector:
         """
         row = self.db.execute(
             "SELECT page_index, next_cursor_ms FROM event_pages "
-            "WHERE run_id = ? AND data_type = ? AND IFNULL(hostility,'') = ? AND status = 'ok' "
-            "ORDER BY page_index DESC LIMIT 1",
-            (run_id, request.data_type, request.hostility or ""),
+            " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility,'') = ? "
+            "   AND IFNULL(source_id,-1) = ? AND IFNULL(target_id,-1) = ? "
+            "   AND status = 'ok' "
+            " ORDER BY page_index DESC LIMIT 1",
+            (*self._stream_key(run_id, request),),
         ).fetchone()
         if row is None:
             return None, 0
@@ -954,28 +978,51 @@ class Collector:
                     "run_id": run_id,
                     "data_type": request.data_type,
                     "hostility": request.hostility,
+                    "source_id": request.source_id,
+                    "target_id": request.target_id,
                     "page_index": index,
                     "requested_start_ms": int(cursor),
                     "requested_end_ms": rel_end_ms,
                     "cursor_ms": int(cursor),
                     "next_cursor_ms": None if next_cursor is None else int(next_cursor),
                     "event_count": len(events),
-                    "raw_cache_path": None,
+                    # The link from a normalized row back to the exact payload
+                    # it came from. Written as None until now, which quietly
+                    # broke the provenance chain the whole corpus rests on:
+                    # the payloads were cached, but nothing recorded where.
+                    "raw_cache_path": self.client.last_cache_path,
                     "status": "ok",
                     "error": None,
                     "fetched_at": time.time(),
                 }
-                self.db.upsert("event_pages", cursor_row)
-                page_id = int(
-                    self.db.scalar(
-                        "SELECT page_id FROM event_pages WHERE run_id = ? AND data_type = ? "
-                        "AND IFNULL(hostility,'') = ? AND page_index = ?",
-                        (run_id, request.data_type, request.hostility or "", index),
+                # A re-fetched page replaces itself: its events first (a page
+                # row with events attached cannot be deleted while foreign keys
+                # are enforced), then the row. `event_pages` has no unique
+                # constraint on the natural key -- an unguarded insert would
+                # leave two rows claiming one page index, and the lookup that
+                # followed would pick between them arbitrarily.
+                prior = self.db.execute(
+                    "SELECT page_id FROM event_pages "
+                    " WHERE run_id = ? AND data_type = ? AND IFNULL(hostility,'') = ? "
+                    "   AND IFNULL(source_id,-1) = ? AND IFNULL(target_id,-1) = ? "
+                    "   AND page_index = ?",
+                    (*self._stream_key(run_id, request), index),
+                ).fetchall()
+                for old_page in prior:
+                    self.db.execute("DELETE FROM events WHERE page_id = ?", (old_page["page_id"],))
+                    self.db.execute(
+                        "DELETE FROM event_pages WHERE page_id = ?", (old_page["page_id"],)
                     )
-                )
-                # A re-fetched page replaces its own events rather than
-                # appending beside them.
-                self.db.execute("DELETE FROM events WHERE page_id = ?", (page_id,))
+
+                inserted = self.db.execute(
+                    "INSERT INTO event_pages "
+                    f"({', '.join(cursor_row)}) "
+                    f"VALUES ({', '.join('?' for _ in cursor_row)})",
+                    tuple(cursor_row.values()),
+                ).lastrowid
+                if inserted is None:  # pragma: no cover - sqlite always sets it
+                    raise CollectionError("event_pages insert returned no row id")
+                page_id = int(inserted)
 
                 rows = []
                 for seq, event in enumerate(events):

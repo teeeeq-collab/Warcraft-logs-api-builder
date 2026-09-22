@@ -91,13 +91,16 @@ independent unit + concentration) produced by the repository, so no analytical
 module has to remember to compute it.
 2.7 Analytical store scaffolding: `data/analytics/<corpus>.analysis.sqlite`, its
 own migration runner and version constant, read-only ATTACH to the ingest store,
-corpus fingerprinting, and `analytics verify`.
+**content-derived corpus fingerprinting** (`page` and `deep` grades), and
+`analytics verify`.
 2.8 Move `packs` SQL out of `cli.py`; output stays identical.
 
 **Gate P2:** no analytical read touches SQLite directly · a missing stream cannot
-produce a zero · policy is never defaulted · the analytical store can be deleted
-and rebuilt with no change to the ingest database · `packs` byte-identical
-before and after.
+produce a zero · **an analytical entry point without an explicit dedupe policy
+raises** · the analytical store can be deleted and rebuilt with no change to the
+ingest database · `packs` byte-identical before and after · **changing any
+page's cached content, count, status or cursor changes the fingerprint; a `deep`
+fingerprint additionally changes when a normalized event row changes.**
 
 ---
 
@@ -176,9 +179,10 @@ it needs · a distribution dominated by one player says so.
 
 ## Phase 6 — gameplay state engine
 
-6.1 State schema (**analytics migration 004**) with the per-field metadata
-record: value, status, `observed_at_ms`, `age_ms`, method, model version,
-confidence.
+6.1 State schema (**analytics migration 004**). `payload` is the authoritative
+field→value mapping; `field_meta` carries metadata only under the same keys —
+status, `observed_at_ms`, `age_ms`, method, model version, confidence — and
+never repeats the value.
 6.2 Staleness horizons in `config/state_horizons.yml`; degradation to `stale` is
 automatic. `null` horizons are a real category, not a missing value.
 6.3 `block_meta` for run-constant fields, so 30 fields do not carry 200 metadata
@@ -192,7 +196,8 @@ casts and charges support it; `derived` only with external metadata.
 **Gate P6:** a hand-authored timeline reconstructs a known state exactly · every
 field carries status and age · a field past its horizon degrades to `stale` · a
 horizon running past the data is marked truncated and counted in aggregates ·
-`unknown` survives into every export.
+`unknown` survives into every export · **`field_meta` carries no `value` key, and
+a key present in `field_meta` but absent from `payload` is a verify failure.**
 
 ---
 

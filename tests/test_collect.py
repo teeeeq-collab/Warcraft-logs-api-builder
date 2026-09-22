@@ -14,7 +14,7 @@ from wcl_simulator import DUPLICATE_NPC_GAME_ID, REPORT_CODE, WclSimulator
 
 from wcl_mplus.auth import Token
 from wcl_mplus.client import GraphQLClient
-from wcl_mplus.collect import Collector
+from wcl_mplus.collect import Collector, EventRequest
 from wcl_mplus.configs import ProjectConfig
 from wcl_mplus.db import Database
 from wcl_mplus.ratelimit import RateLimiter
@@ -613,3 +613,78 @@ def test_pulls_carry_cross_log_identity(pipeline):
         assert len(r["species_signature"].split("|")) == r["npc_species_count"]
         # Species signature is a strict simplification of the exact one.
         assert len(r["species_signature"]) <= len(r["composition_signature"])
+
+
+def test_a_narrowed_stream_is_a_separate_stream_end_to_end(pipeline):
+    """A focus stream must not share page checkpoints with its party-wide twin.
+
+    `run_stream_coverage` has always keyed a stream on its narrowing, but
+    `event_pages` did not carry one, so to the pagination layer a narrowed
+    stream and its unnarrowed twin were one stream. Resume would continue the
+    focus stream from the party-wide cursor, coverage would report the sum of
+    both, and no event row could be traced back to which request fetched it.
+    """
+    collector, db, _ = pipeline()
+    party = EventRequest(data_type="Casts", hostility="Friendlies")
+    focus = EventRequest(data_type="Casts", hostility="Friendlies", source_id=1, scope="focus")
+
+    # Distinct identities, before anything touches the database.
+    assert collector._stream_key("r", party) != collector._stream_key("r", focus)
+
+    collector.collect(candidates())
+    run_id = db.scalar("SELECT run_id FROM dungeon_runs LIMIT 1")
+
+    # A party-wide stream's pages must not be visible to the focus stream's
+    # resume point: it has fetched nothing and must start from the beginning.
+    cursor, index = collector._resume_point(run_id, focus)
+    assert (cursor, index) == (None, 0), "focus stream inherited the party-wide checkpoint"
+
+
+def test_refetching_a_page_leaves_one_page_row(pipeline):
+    """`event_pages` has no unique key; an unguarded insert would duplicate it."""
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    before = db.query(
+        "SELECT run_id, data_type, IFNULL(hostility,'') AS h, page_index, COUNT(*) AS n "
+        "  FROM event_pages GROUP BY 1,2,3,4 HAVING n > 1"
+    )
+    assert before == [], "duplicate page rows after a first collection"
+
+    run_id = db.scalar("SELECT run_id FROM dungeon_runs LIMIT 1")
+    collector.reset_run_events(run_id)
+    collector.collect(candidates())
+
+    after = db.query(
+        "SELECT run_id, data_type, IFNULL(hostility,'') AS h, page_index, COUNT(*) AS n "
+        "  FROM event_pages GROUP BY 1,2,3,4 HAVING n > 1"
+    )
+    assert after == [], "re-fetching a page appended a second page row"
+    orphans = db.scalar(
+        "SELECT COUNT(*) FROM event_pages p "
+        " WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.page_id = p.page_id) "
+        "   AND p.event_count > 0"
+    )
+    assert orphans == 0, "a page row was left behind with no events"
+
+
+def test_pages_record_where_their_payload_is_cached(pipeline):
+    """The provenance chain ends at the raw payload, so the link must exist.
+
+    `raw_cache_path` was written as None on every page since the first release.
+    The payloads were cached all along, but nothing recorded which file held
+    which page, so "normalized row -> raw payload" was a convention rather than
+    a recorded fact.
+    """
+    collector, db, _ = pipeline()
+    collector.collect(candidates())
+
+    rows = db.query(
+        "SELECT raw_cache_path FROM event_pages WHERE status = 'ok' AND event_count > 0"
+    )
+    assert rows, "no pages collected"
+    missing = [r for r in rows if not r["raw_cache_path"]]
+    assert missing == [], f"{len(missing)} page(s) recorded no cache location"
+    # Relative, so the corpus stays auditable on another machine.
+    assert all(not r["raw_cache_path"].startswith("/") for r in rows)
+    assert all(":" not in r["raw_cache_path"][:3] for r in rows), "an absolute Windows path"

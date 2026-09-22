@@ -33,7 +33,7 @@ from .settings import project_root
 logger = logging.getLogger(__name__)
 
 #: Schema version this code expects. Bumped by adding a migration file.
-EXPECTED_SCHEMA_VERSION = 4
+EXPECTED_SCHEMA_VERSION = 5
 
 
 class DatabaseError(RedactedError):
@@ -104,21 +104,31 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def applied_versions(conn: sqlite3.Connection) -> list[int]:
+def applied_versions(conn: sqlite3.Connection, *, table: str = "schema_migrations") -> list[int]:
     row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
     ).fetchone()
     if row is None:
         return []
-    return [
-        r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")
-    ]
+    return [r["version"] for r in conn.execute(f"SELECT version FROM {table} ORDER BY version")]
 
 
-def migrate(conn: sqlite3.Connection, *, directory: Path | None = None) -> list[int]:
-    """Apply any pending migrations. Returns the versions applied."""
+def migrate(
+    conn: sqlite3.Connection,
+    *,
+    directory: Path | None = None,
+    table: str = "schema_migrations",
+) -> list[int]:
+    """Apply any pending migrations. Returns the versions applied.
+
+    `table` exists because the analytical store keeps its own numbered sequence
+    in its own file. Sharing one ledger between two schemas that version
+    independently would make either one's version meaningless.
+    """
     pending = [
-        m for m in discover_migrations(directory) if m.version not in set(applied_versions(conn))
+        m
+        for m in discover_migrations(directory)
+        if m.version not in set(applied_versions(conn, table=table))
     ]
     applied: list[int] = []
     for migration in pending:
@@ -127,7 +137,7 @@ def migrate(conn: sqlite3.Connection, *, directory: Path | None = None) -> list[
             with conn:
                 conn.executescript(migration.sql)
                 conn.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                    f"INSERT INTO {table} (version, name, applied_at) VALUES (?, ?, ?)",
                     (migration.version, migration.name, time.time()),
                 )
         except sqlite3.Error as exc:
@@ -138,8 +148,8 @@ def migrate(conn: sqlite3.Connection, *, directory: Path | None = None) -> list[
     return applied
 
 
-def schema_version(conn: sqlite3.Connection) -> int:
-    versions = applied_versions(conn)
+def schema_version(conn: sqlite3.Connection, *, table: str = "schema_migrations") -> int:
+    versions = applied_versions(conn, table=table)
     return max(versions) if versions else 0
 
 

@@ -22,6 +22,7 @@ from typing import Any
 
 import typer
 
+from .analytics import AnalyticsStore, default_analytics_path
 from .benchmark import (
     HostilityComparison,
     StreamBenchmark,
@@ -35,12 +36,14 @@ from .configs import ConfigFileError, ProjectConfig
 from .db import Database, DatabaseError
 from .dedupe import group_duplicates
 from .discover import discover_dungeons
+from .fingerprint import corpus_fingerprint
 from .normalize import is_mythic_plus
 from .querybuild import WANTED_FIGHT_FIELDS, WANTED_REPORT_FIELDS, QueryError, render
 from .rawcache import RawCache
 from .recon import Recon
 from .redaction import RedactedError, install_logging_redaction
 from .reportsource import DiscoveryError, ManualReportSource
+from .repository import Repository
 from .schema import SchemaIntrospector
 from .settings import ConfigError, Settings
 from .validate import collect_validation, write_reports
@@ -927,45 +930,29 @@ def packs(
     """
     _setup_logging(verbose)
     db = _database(_load_settings(), path=database)
+    # The query lives in the repository. This command renders it -- a CLI that
+    # owns analysis is a CLI that the MCP server, the exporter and the tests
+    # each have to reimplement.
+    repository = Repository(db)
 
     if npc is not None:
-        rows = db.query(
-            "SELECT p.dungeon_key, p.pull_id, p.name, p.is_boss, p.duration_ms, "
-            "       n.instance_count, n.instance_count_confidence "
-            "  FROM pull_npcs n JOIN pulls p ON p.pull_id = n.pull_id "
-            " WHERE n.npc_game_id = ? ORDER BY p.dungeon_key, p.pull_id LIMIT ?",
-            (npc, limit),
-        )
+        rows = repository.npc_pulls(npc, limit=limit)
         if not rows:
             typer.secho(f"NPC {npc} appears in no collected pull.", fg=typer.colors.YELLOW)
         else:
             typer.echo(f"NPC {npc} appears in {len(rows)} pull(s) (showing up to {limit}):\n")
             for r in rows:
                 count = r["instance_count"]
-                conf = r["instance_count_confidence"]
                 shown = "?" if count is None else str(count)
                 typer.echo(
                     f"  {r['dungeon_key'] or '?':20} {r['pull_id']:26} "
-                    f"x{shown} ({conf})  {r['duration_ms'] / 1000:6.1f}s"
+                    f"x{shown} ({r['instance_count_confidence']})  {r['duration_ms'] / 1000:6.1f}s"
                     + ("  [boss]" if r["is_boss"] else "")
                 )
         db.close()
         return
 
-    column = "composition_signature" if exact else "species_signature"
-    where = "WHERE dungeon_key = ?" if dungeon else ""
-    params: tuple[Any, ...] = (dungeon,) if dungeon else ()
-    rows = db.query(
-        f"SELECT dungeon_key, {column} AS sig, COUNT(*) AS occurrences, "
-        "       COUNT(DISTINCT run_id) AS runs, "
-        "       ROUND(AVG(duration_ms) / 1000.0, 1) AS mean_s, "
-        "       MAX(is_boss) AS boss, MIN(name) AS a_name "
-        f"  FROM pulls {where} "
-        f" {'AND' if where else 'WHERE'} {column} IS NOT NULL AND {column} != '' "
-        f" GROUP BY dungeon_key, {column} "
-        " ORDER BY occurrences DESC LIMIT ?",
-        (*params, limit),
-    )
+    rows = repository.packs(dungeon_key=dungeon, exact=exact, limit=limit)
     if not rows:
         typer.secho(
             "No packs found. Runs collected before schema 3 carry no species "
@@ -985,6 +972,75 @@ def packs(
             + f"  {r['a_name'] or ''}"
         )
     typer.echo("\n  ids: use --npc <gameID> to list every pull containing one NPC.")
+    db.close()
+
+
+@app.command()
+def analytics(
+    action: str = typer.Argument(
+        "verify", help="verify: recompute each derivation's fingerprint and report drift."
+    ),
+    grade: str = typer.Option(
+        "page",
+        "--grade",
+        help="Fingerprint grade to report the corpus at: 'page' (cheap) or 'deep' "
+        "(hashes every normalized event row).",
+    ),
+    database: Path | None = typer.Option(None, "--database", help="Corpus to read."),
+    store: Path | None = typer.Option(
+        None, "--store", help="Analytical store. Defaults beside the corpus under data/analytics/."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Inspect the derived-data store.
+
+    The analytical store holds only derived rows: deleting it costs compute and
+    no information. `verify` answers whether each derivation still describes the
+    evidence it was computed from, naming the runs that drifted rather than only
+    reporting that something did.
+    """
+    _setup_logging(verbose)
+    db = _database(_load_settings(), path=database)
+    target = store if store is not None else default_analytics_path(db.path)
+
+    if action != "verify":
+        typer.secho(f"Unknown action {action!r}. Supported: verify.", fg=typer.colors.RED, err=True)
+        db.close()
+        raise typer.Exit(code=2)
+
+    with AnalyticsStore(target, db) as analysis:
+        fingerprint = corpus_fingerprint(db, grade=grade, include_runs=False)
+        results = [r.as_dict() for r in analysis.verify()]
+
+    payload = {
+        "corpus": fingerprint.as_dict(),
+        "store": str(target),
+        "derivations": results,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        db.close()
+        return
+
+    typer.echo(f"Corpus:  {db.path}")
+    typer.echo(f"Store:   {target}")
+    typer.echo(
+        f"Fingerprint ({fingerprint.grade}): {fingerprint.value[:16]}… "
+        f"over {fingerprint.run_count} run(s)"
+    )
+    if not results:
+        typer.echo("\nNo completed derivations yet.")
+    for result in results:
+        mark = "ok " if result["intact"] else "DRIFT"
+        typer.secho(
+            f"\n  [{mark}] {result['kind']} {result['derivation_id']} ({result['grade']})",
+            fg=typer.colors.GREEN if result["intact"] else typer.colors.RED,
+        )
+        for run_id in result["drifted_runs"][:10]:
+            typer.echo(f"        changed: {run_id}")
+        for run_id in result["missing_runs"][:10]:
+            typer.echo(f"        gone:    {run_id}")
     db.close()
 
 

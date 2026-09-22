@@ -44,3 +44,18 @@ def settings(tmp_path) -> Settings:
         max_retries=3,
         timeout_seconds=5,
     )
+
+
+class FakeTokens:
+    """Token provider for offline tests. Never touches the network."""
+
+    def auth_header(self) -> dict[str, str]:
+        return {"Authorization": "Bearer test-token"}
+
+    def token(self, force_refresh: bool = False):
+        from wcl_mplus.auth import Token
+
+        return Token(access_token="test-token", expires_at=9e9)
+
+    def close(self) -> None:
+        pass

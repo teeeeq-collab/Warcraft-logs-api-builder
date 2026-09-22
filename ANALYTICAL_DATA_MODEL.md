@@ -322,19 +322,31 @@ Revision 1 tagged each field `observed | derived | inferred | unknown`. That is
 necessary and insufficient: HP last seen 40 ms ago and HP last seen 8 s ago were
 both "observed", and only one is worth anything.
 
-Each field in `field_meta`:
+**`payload` owns the values. `field_meta` owns only the metadata**, keyed by the
+same field name. The value is never repeated in `field_meta`: two copies of one
+number are two things to keep in agreement, and they would eventually disagree —
+after which no reader could tell which one the analysis actually used.
 
 ```json
+// payload
+{ "subject_hp": 44, "subject_mana": 72, "enemies_alive": 3 }
+
+// field_meta — same keys, metadata only, no "value"
 {
-  "value": 44,
-  "status": "stale",
-  "observed_at_ms": 184920,
-  "age_ms": 8300,
-  "method": "last_hit_points_on_target",
-  "model_version": 1,
-  "confidence": null
+  "subject_hp": {
+    "status": "stale",
+    "observed_at_ms": 184920,
+    "age_ms": 8300,
+    "method": "last_hit_points_on_target",
+    "model_version": 1,
+    "confidence": null
+  }
 }
 ```
+
+A field present in `payload` with no `field_meta` entry is `observed` and fresh —
+the quiet default described in §5c. A field in `field_meta` with no `payload`
+entry is a contradiction and `analytics verify` reports it.
 
 | Status | Meaning |
 |---|---|
@@ -490,10 +502,93 @@ it would be redundant: states are deterministically re-derivable from the source
 set given the model versions the evaluation already records. The source set plus
 the versions *is* the reproducible identity.
 
-**Corpus fingerprint:** a hash over the sorted `(run_id, normalizer_version,
-coverage_status)` triples of every included run. It changes exactly when a run is
-recollected or renormalized — which is exactly when an old number stops being
-reproducible.
+**Corpus fingerprint:** see §6a. It is content-derived, so changing the evidence
+changes the fingerprint.
+
+---
+
+## 6a. The corpus fingerprint
+
+An earlier draft hashed `(run_id, normalizer_version, coverage_status)` per run.
+**That is not sufficient**, and the failure is not hypothetical: it proves the
+labels are unchanged while the evidence underneath them could differ. A run
+re-collected at the same normalizer version, a page repaired after a failure, a
+`partial` stream later completed, or a raw payload that changed under a stable
+cursor would all leave those three values identical and the events different.
+An evaluation pinned to such a fingerprint would claim reproducibility it does
+not have.
+
+The objective is exact: **changing the actual evidence must change the
+fingerprint.** So the fingerprint digests the evidence.
+
+### Per-run digest
+
+```
+run_digest(run_id) = sha256(
+    run_id
+    ⧺ NORMALIZER_VERSION ⧺ QUERY_VERSION ⧺ SCHEMA_VERSION
+    ⧺ IDENTITY_SCHEME_VERSION ⧺ identity_salt_fingerprint
+    ⧺ page_component(run_id)
+    ⧺ coverage_component(run_id)
+)
+```
+
+**`page_component`** — the content of the raw evidence, taken from `event_pages`
+in a declared order (`data_type`, `hostility`, `source_id`, `target_id`,
+`page_index`):
+
+```
+for each page:  raw_cache_key ⧺ event_count ⧺ status ⧺ next_cursor_ms
+```
+
+`raw_cache_key` is the raw cache's own versioned identity for that page, which
+already includes the query, its variables and the cursor. Two collections that
+produced byte-different payloads cannot share one.
+
+**`coverage_component`** — from `run_stream_coverage`, ordered by the manifest's
+own unique key:
+
+```
+for each stream:  data_type ⧺ hostility ⧺ source_id ⧺ target_id
+                  ⧺ scope ⧺ pages ⧺ events ⧺ status
+```
+
+This is what makes "asked, none" and "never asked" different fingerprints, which
+matters because they are different evidence for every statistic downstream.
+
+### Two grades, because they cost differently
+
+| Grade | Built from | Cost | Detects |
+|---|---|---|---|
+| `page` (default) | cache keys, counts, statuses, cursors | one indexed scan of `event_pages` | re-collection, repair, completion, any change in what was fetched |
+| `deep` | + SHA-256 of each normalized event row in `(page_id, seq_in_page)` order | a full scan of `events` | additionally: a normalizer producing different rows from identical payloads at an unchanged version |
+
+`page` is the default because it is cheap enough to compute on every derivation
+and catches every change that comes through the API. `deep` exists because the
+one thing `page` cannot see is a code change that alters normalization *without*
+a version bump — which should never happen, and is exactly the class of mistake a
+fingerprint is for. **A published evaluation must be pinned with `deep`.**
+
+Raw payload bytes are deliberately *not* hashed directly: the cache is gzipped
+and may legitimately be recompressed or re-fetched without the content changing.
+The cache key plus the normalized-row digest covers the same ground without
+making a compression detail look like an evidence change.
+
+### Corpus fingerprint
+
+```
+corpus_fingerprint = sha256( grade ⧺ concat(sorted(run_digest(r) for r in runs)) )
+```
+
+Sorted, so run ordering cannot affect it. Stored with its grade and its run
+count, because a fingerprint whose grade is unknown cannot be compared with
+another.
+
+### What every analytical row stores
+
+`corpus_fingerprint` on a derived row is the fingerprint of the run set that
+produced it. `analytics verify` recomputes and reports drift per run, so the
+answer to "is this analysis still valid" is a command rather than an assumption.
 
 ---
 

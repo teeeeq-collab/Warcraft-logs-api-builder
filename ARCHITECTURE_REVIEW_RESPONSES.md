@@ -198,10 +198,14 @@ states are deterministically re-derivable from the source set given the model
 versions the evaluation already records. The source set plus the versions *is*
 the reproducible identity.
 
-The corpus fingerprint is a hash over the sorted `(run_id, normalizer_version,
-coverage_status)` triples of every included run. It changes if a run is
-recollected or renormalized, which is precisely when an old number stops being
-reproducible.
+The corpus fingerprint is **content-derived**, per `ANALYTICAL_DATA_MODEL.md`
+§6a. An earlier draft of this response proposed hashing only
+`(run_id, normalizer_version, coverage_status)`; a follow-up review correctly
+rejected that as insufficient, since it proves the labels unchanged while the
+evidence underneath could differ. The digest now covers raw-cache page identity,
+page counts and statuses, cursors and the coverage manifest — with a `deep`
+grade adding a hash of every normalized event row. Changing the evidence
+necessarily changes the fingerprint.
 
 ---
 
